@@ -1,9 +1,9 @@
-# NijiN.EntropyRawDec
+# NijiN.WaveletRawDec
 
-**Clean-Room Multi-Threaded C++17 Decoder for Entropy-Compressed Camera & Cinema RAW Formats**  
+**Clean-Room Multi-Threaded C++17 Decoder for Wavelet-Compressed Camera & Cinema RAW Formats**  
 (`Apache-2.0` · `C++17` · `POSIX Threads` · `Zero External Dependencies`)
 
-`NijiN.EntropyRawDec` (library `nev2bayer_core` / CLI `nev2bayer`) provides an independent, dependency-free C++17 decoder for wavelet-entropy compressed Bayer RAW formats, converting container frames directly into **physical 14-bit linear RGGB Bayer buffers (`.raw`)** and **calibrated uncompressed CFA DNG 1.4 negatives (`.dng`)**.
+`NijiN.WaveletRawDec` (library `nev2bayer_core` / CLI `nev2bayer`) provides an independent, dependency-free C++17 decoder for wavelet-compressed Bayer RAW formats, converting container frames directly into **physical 14-bit linear RGGB Bayer buffers (`.raw`)** and **calibrated uncompressed CFA DNG 1.4 negatives (`.dng`)**.
 
 > **Documentation**: [**`docs/SPECIFICATION.md`** (Containers, Entropy/Wavelet Pipeline & DNG Calibration)](docs/SPECIFICATION.md) · [**`docs/CLI.md`** (CLI Reference & C++17 API)](docs/CLI.md) · [**`LICENSE`**](LICENSE) · [**`NOTICE`**](NOTICE)
 
@@ -18,8 +18,8 @@
   - Decodes Normal (`~1.5 bpp`) and High (`~2.3–2.5 bpp`) bitrates across arbitrary even sensor geometries (`8.3K`, `4.1K`, etc.).
 - **Nikon High Efficiency RAW (`.NEF` HE / HE\*)**:
   - Endian-aware TIFF `IFD0`, `SubIFDs` (`Compression=34713`, `PhotometricInterpretation=32803` with `0xFF10` TicoRAW `SOC`), Exif IFD, and `"Nikon\0"` embedded MakerNote parser (White Balance `0x000c`, Black Level `0x003d`, Active Crop `0x0045`, Color Temperature `0x004f`, Picture Control `0x0023`).
-- **Sony HQ RAW / ARW6 (`.ARW`)**:
-  - Endian-aware TIFF `IFD0`, `IFD1`, and `SubIFDs` parser targeting `Compression=32766` (`PhotometricInterpretation=32803`, `SonyRawFileType (0x7000) = 6`), extracting `0x7310` / `50714` `BlackLevel`, `0x7313` WB RGGB levels, `50717` `WhiteLevel`, `50719/50720` & `0x74c7/0x74c8` Active Crop, `ExifIFD` metadata, and embedded JPEG preview / thumbnail streams.
+- **Sony ARW6 — `Compressed (HQ)` & `Compressed` (`.ARW`)**:
+  - Endian-aware TIFF `IFD0`, `IFD1`, and `SubIFDs` parser targeting `Compression=32766` (`PhotometricInterpretation=32803`, `SonyRawFileType (0x7000) = 6`), covering both **Compressed (HQ)** and standard **Compressed** wavelet modes across Full-Frame (`7040x4688`) and APS-C (`4640x3088`) geometries, extracting `0x7310` / `50714` `BlackLevel`, `0x7313` WB RGGB levels, `50717` `WhiteLevel`, `50719/50720` & `0x74c7/0x74c8` Active Crop, `ExifIFD` metadata, and embedded JPEG preview / thumbnail streams.
   - Supports `0x68`-byte `1`-tile and `4`-tile strip directories with chunk-parallel `"A000"` wavelet entropy decoding and multi-tile Bayer stitching.
 - **Standalone TicoRAW R0 Codestreams (`.jxs`)**:
   - Header probing and multi-threaded direct decoding for bare ISO/IEC 21122 Bayer-extension codestreams.
@@ -54,11 +54,11 @@ Designed with clean separation between container demuxing, parallel entropy/wave
 
 | Test Sample / Boundary Case | Geometry (`W x H`) / Mode | Max Abs Diff | Mismatched Pixels | Bottom-64 Rows Max Diff |
 |---|---|---:|---:|---:|
-| Nikon N-RAW `.NEV` clip (first / mid / last frames) | `45.6 MP` (`1.50 bpp` N-RAW) | **`0`** | **`0`** | **`0`** |
-| Nikon Z 8 `.NEF` (`HE*`) | `8280 x 5520` (`5.00 bpp` HE\*) | **`0`** | **`0`** | **`0`** |
-| Nikon Z50 II `.NEF` (`HE*`) | `5600 x 3728` (`5.00 bpp` HE\*) | **`0`** | **`0`** | **`0`** |
-| Sony Alpha `.ARW` (`ARW6` / `HQ RAW`, 1-tile, full-tonal & highlight clips) | `7040 x 4688` (`33.0 MP`, 1 / 8 threads) | **`0`** | **`0`** | **`0`** |
-| Sony `.ARW` 4-tile synthetic stitch (`ARW6` quadrant strip) | `14080 x 9376` (`132.0 MP`, 8 threads) | **`0`** | **`0`** | **`0`** |
+| Nikon N-RAW `.NEV` clip (first / mid / last frames) | `45.6 MP` (`1.50 bpp` N-RAW, `1 / 8` threads) | **`0`** | **`0`** | **`0`** |
+| Nikon Z 8 `.NEF` burst corpus (`132` frames) | `8280 x 5520` (`5.00 bpp` `HE*`, all `132` frames) | **`0`** | **`0`** | **`0`** |
+| Nikon `Z 8` / `Z 9` / `Z6 III` / `Z5 II` / `Z50 II` multi-mode suite (`26` `.NEF` files) | `FX` / `DX` / `16:9` / `1:1` crops, `HE` (`~3 bpp`) & `HE*` (`~5 bpp`) | **`0`** | **`0`** | **`0`** |
+| Sony `ILCE-7M5` `.ARW` suite (`6` camera files) | `ARW6` `Compressed (HQ)` & `Compressed`, `7040 x 4688` FF & `4640 x 3088` APS-C | **`0`** | **`0`** | **`0`** |
+| Sony `.ARW` 4-tile quadrant stitch (`2` geometries) | `14080 x 9376` (`132.0 MP`) & `9280 x 6176` (`57.3 MP`), `8` threads | **`0`** | **`0`** | **`0`** |
 | Trailing-tile edge case (`H % 64 == 0`) | `512 x 512` synthetic stream | **`0`** | **`0`** | **`0`** |
 | Trailing-tile edge case (`H % 64 == 4`) | `512 x 516` synthetic stream | **`0`** | **`0`** | **`0`** |
 
@@ -139,7 +139,7 @@ See [**`docs/CLI.md`**](docs/CLI.md) for all flags, JSON fields, and C++17 `nev2
 | [`include/nev2bayer.h`](include/nev2bayer.h) | Public C++17 data structures and container, decode, crop, and DNG APIs |
 | [`src/tiff_internal.h`](src/tiff_internal.h) | Shared endian-aware TIFF IFD reader and Sony ARW dispatch helper |
 | [`src/nev_container.cpp`](src/nev_container.cpp) | 64-bit `.NEV` ISOBMFF/NCDT/NRFH/NRTH parser and `.NEF` HE/HE\* TIFF/MakerNote parser |
-| [`src/arw_container.cpp`](src/arw_container.cpp) | Sony `.ARW` (`ARW6` / `HQ RAW`) TIFF `SubIFDs`, calibration tags, and JPEG preview parser |
+| [`src/arw_container.cpp`](src/arw_container.cpp) | Sony `.ARW` (`ARW6` `Compressed HQ` / `Compressed`) TIFF `SubIFDs`, calibration tags, and JPEG preview parser |
 | [`src/ticoraw_dec.cpp`](src/ticoraw_dec.cpp) | Clean-room TicoRAW R0 parallel entropy decoder, 5/3 2D IDWT, Star-Tetrix RCT, and Fliproot NLT |
 | [`src/arw6_dec.cpp`](src/arw6_dec.cpp) | Clean-room Sony ARW6 (`"A000"`) multi-tile parser, chunk-parallel entropy decoder, vertical-first 5/3 IDWT, Quincunx synthesis, and NLT LUT |
 | [`src/dng_writer.cpp`](src/dng_writer.cpp) | Scalar `BlackLevel` DNG 1.4 writer, Nikon/Sony D65 `ColorMatrix1` lookup, and modulo CFA cropper |

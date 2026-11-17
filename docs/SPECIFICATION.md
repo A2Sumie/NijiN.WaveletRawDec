@@ -1,6 +1,6 @@
 # Format & Codec Specification
 
-This document specifies the **Nikon `.NEV` ISOBMFF/QuickTime container**, **Nikon `.NEF` (`HE` / `HE*`) TIFF SubIFD layout**, **TicoRAW R0 (ISO/IEC 21122 Bayer extension) decoding pipeline**, **Sony `.ARW` (`ARW6` / `HQ RAW`) multi-tile container and `"A000"` wavelet pipeline**, and **calibrated DNG 1.4 emission** implemented in `NijiN.EntropyRawDec` (`nev2bayer`).
+This document specifies the **Nikon `.NEV` ISOBMFF/QuickTime container**, **Nikon `.NEF` (`HE` / `HE*`) TIFF SubIFD layout**, **TicoRAW R0 (ISO/IEC 21122 Bayer extension) decoding pipeline**, **Sony `.ARW` (`ARW6` `Compressed HQ` / `Compressed`) multi-tile container and `"A000"` wavelet pipeline**, and **calibrated DNG 1.4 emission** implemented in `NijiN.WaveletRawDec` (`nev2bayer`).
 
 ---
 
@@ -117,13 +117,13 @@ Nikon N-RAW (`.NEV`) and HE / HE\* (`.NEF`) share the **wavelet-subband + block-
 
 ---
 
-## 5. Sony `.ARW` (`ARW6` / `HQ RAW`) Container & `"A000"` Wavelet Architecture
+## 5. Sony `.ARW` (`ARW6`: `Compressed HQ` & `Compressed`) Container & `"A000"` Wavelet Architecture
 
 ### 5.1 TIFF Container Selection & Calibration Tags (`src/arw_container.cpp`)
 
 When a TIFF input carries `Make` containing `"SONY"` or contains a Bayer `SubIFD` with `Compression (259) == 32766`, `parse_nev_clip` dispatches to `parse_sony_arw_tiff`:
 
-1. **`SubIFDs` & Compression Selection**: Scans `IFD0`, `SubIFDs`, and `IFD1` for a CFA image directory (`PhotometricInterpretation == 32803` or `0`) matching `Compression (259) == 32766` and `SonyRawFileType (0x7000) == 6`, verifying an embedded `"A000"` signature at the first tile's `rel_offset`. Legacy Sony ARW modes (such as `Compression=32767`) return an explicit unsupported-format error.
+1. **`SubIFDs` & Compression Selection**: Scans `IFD0`, `SubIFDs`, and `IFD1` for a CFA image directory (`PhotometricInterpretation == 32803` or `0`) matching `Compression (259) == 32766` and `SonyRawFileType (0x7000) == 6` (covering both **Compressed (HQ)** and **Compressed** wavelet modes across Full-Frame and APS-C geometries), verifying an embedded `"A000"` signature at the first tile's `rel_offset`. Legacy Sony ARW modes (such as `Compression=32767`) return an explicit unsupported-format error.
 2. **Sony Sensor Calibration & Crop Tags**:
    - `BlackLevel`: Reads Sony tag `0x7310` or DNG `50714` (`uint16[4]`), defaulting to `[512, 512, 512, 512]` when absent.
    - `WhiteLevel (50717)`: Captured alongside `CFAPattern (33422)`.
@@ -156,7 +156,7 @@ Each tile points to a big-endian `"A000"` wavelet codestream:
 +0x30  [var]   5 group records (16 B or 32 B each): per-component stream lengths for
                resolutions 0..3 of (G_L, R, B) in groups 0..3 and raw G_H in group 4
 [res streams]  For each resolution stream:
-                 └─ 16B directory header (dir_blocks, payload_blocks, magic=4, n_bands, chunk_count)
+                 └─ 16B directory header (dir_blocks, payload_blocks, magic=4, n_bands, chunk_count <= 8192)
                  └─ chunk descriptors (u16 clen + n_bands x 4-bit band shifts) + aligned chunk payloads
 ```
 

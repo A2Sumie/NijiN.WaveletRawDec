@@ -79,7 +79,7 @@ Example output on a Nikon Z 8 `.NEV` file (`Ver.03.12`):
 }
 ```
 
-For a Sony ARW6 (`.ARW`) still (`Compression=32766`, `SonyRawFileType=6`), `--info --json` reports the `arw6` codec block alongside TIFF/Exif calibration fields:
+For a Sony ARW6 (`.ARW`) still (`Compressed HQ` / `Compressed`, `Compression=32766`, `SonyRawFileType=6`), `--info --json` reports the `arw6` codec block alongside TIFF/Exif calibration fields:
 
 ```json
 {
@@ -126,7 +126,7 @@ for f in *.NEF; do
   ./build/nev2bayer "$f" --active-crop -o "${f%.NEF}.dng" --threads 8
 done
 
-# Batch-convert a folder of Sony ARW6 / HQ RAW .ARW stills to calibrated DNGs
+# Batch-convert a folder of Sony ARW6 (Compressed HQ / Compressed) .ARW stills to calibrated DNGs
 for f in *.ARW; do
   ./build/nev2bayer "$f" --active-crop -o "${f%.ARW}.dng" --threads 8
 done

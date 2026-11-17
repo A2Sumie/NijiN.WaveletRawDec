@@ -231,7 +231,7 @@ void print_info_human(const nev2bayer::NevClipInfo& clip, const nev2bayer::NevFr
 
 void print_info_arw6_human(const nev2bayer::NevClipInfo& clip, const nev2bayer::NevFrameMeta& m0, const nev2bayer::Arw6Info& arw6) {
     print_info_common_header(clip, m0);
-    std::printf("Image Track:   Sony ARW6 / HQ RAW (TIFF Compression=32766, SonyRawFileType=%u), sensor=%ux%u\n",
+    std::printf("Image Track:   Sony ARW6 (Compressed HQ / Compressed, TIFF Compression=32766, SonyRawFileType=%u), sensor=%ux%u\n",
                 m0.sony_raw_file_type, arw6.width, arw6.height);
     print_info_common_tail(m0);
     std::printf("ARW6 Codec:    A000 %ux%u, strip=%u B, tiles=%zu, decomp=%u, sub_mask=0x%04x, nlt=%u->15->%u-bit\n",

@@ -241,7 +241,7 @@ bool parse_sony_arw_tiff(
         if (other_comp != 0) {
             err = "Unsupported Sony ARW compression (" + std::to_string(other_comp) +
                   ", SonyRawFileType=" + std::to_string(other_raw_type) +
-                  "); only ARW6 / HQ RAW (Compression=32766, SonyRawFileType=6) is supported";
+                  "); only ARW6 Compressed HQ / Compressed (Compression=32766, SonyRawFileType=6) is supported";
         } else {
             err = "ARW contains no ARW6 (Compression=32766, SonyRawFileType=6) CFA SubIFD";
         }

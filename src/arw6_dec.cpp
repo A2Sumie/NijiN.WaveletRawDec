@@ -838,7 +838,7 @@ bool parse_chunk_directory(
     if (total_stream_need > stream_len ||
         magic4 != 4u || zero4 != 0u ||
         static_cast<int32_t>(n_bands) != expected_n_bands ||
-        chunk_count > 300u ||
+        chunk_count == 0u || chunk_count > 8192u ||
         b_sixteen != 0x10u || b_zero != 0u ||
         dir_blocks != ((chunk_count * ((n_bands << 2) | 16u) + 127u) >> 7)) {
         err = "Invalid ARW6 subband chunk directory header";
