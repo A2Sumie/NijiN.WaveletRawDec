@@ -1,0 +1,19 @@
+NijiN.EntropyRawDec (nev2bayer) — Clean-Room Nikon N-RAW (.NEV), HE/HE* (.NEF) & TicoRAW Decoder
+Copyright 2026 A2Sumie (NijiN Project — https://github.com/A2Sumie/NijiN.EntropyRawDec)
+
+This software is licensed under the Apache License, Version 2.0 (see the
+LICENSE file in this directory for the full text).
+
+Provenance and Interoperability Notice:
+  This package is an independent, clean-room C++17 implementation based on
+  observable QuickTime/ISOBMFF NRAW container structures, TIFF-EP / Nikon
+  HE/HE* SubIFD layouts, ISO/IEC 21122 (JPEG XS) / TicoRAW R0 codestream
+  mathematics, and DNG 1.4 specifications. Format identifiers, camera color
+  matrices, and fourcc tags appear solely for format interoperability.
+
+Patent Notice:
+  Under Sections 2 and 3 of the Apache License, Version 2.0, copyright and
+  contributor patent rights granted apply only to contributions authored for
+  this project. Third-party standard or vendor patent licensing (including
+  ISO/IEC 21122 / TicoRAW extensions) remains the responsibility of each
+  downstream user according to their deployment scope.

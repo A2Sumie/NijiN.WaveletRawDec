@@ -1,0 +1,23 @@
+# Compiled binaries & build artifacts
+/build/
+/cmake-build*/
+/*.o
+/*.a
+/*.exe
+/*.dSYM/
+.DS_Store
+__pycache__/
+
+# Sample media & decoded outputs
+*.raw
+*.dng
+*.tif
+*.tiff
+*.png
+*.jpg
+*.jpeg
+*.jxs
+*.nev
+*.NEV
+*.nef
+*.NEF
