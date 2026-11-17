@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "../include/nev2bayer.h"
+#include "tiff_internal.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <sys/stat.h>
@@ -9,85 +11,34 @@
 namespace nev2bayer {
 namespace {
 
-inline uint16_t rd_be16(const uint8_t* p) {
-    return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
-}
+using detail::ScopedFile;
+using detail::TiffTagValue;
+using detail::fourcc_to_str;
+using detail::rd_be16;
+using detail::rd_be32;
+using detail::rd_be64;
+using detail::rd_be_f32;
+using detail::rd_be_f64;
+using detail::rd_le16;
+using detail::rd_le32;
+using detail::rd_u16_e;
+using detail::rd_u32_e;
+using detail::read_tiff_ifd;
+using detail::rstrip_ascii;
+using detail::seek_read;
+using detail::tag_as_rational;
+using detail::tag_as_u32;
 
-inline uint32_t rd_be32(const uint8_t* p) {
-    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
-}
-
-inline uint64_t rd_be64(const uint8_t* p) {
-    return ((uint64_t)rd_be32(p) << 32) | (uint64_t)rd_be32(p + 4);
-}
-
-inline uint16_t rd_le16(const uint8_t* p) {
-    return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
-}
-
-inline uint32_t rd_le32(const uint8_t* p) {
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
-inline uint16_t rd_u16_e(const uint8_t* p, bool be) {
-    return be ? rd_be16(p) : rd_le16(p);
-}
-
-inline uint32_t rd_u32_e(const uint8_t* p, bool be) {
-    return be ? rd_be32(p) : rd_le32(p);
-}
-
-inline float rd_be_f32(const uint8_t* p) {
-    uint32_t u = rd_be32(p);
-    float f = 0.0f;
-    std::memcpy(&f, &u, sizeof(f));
-    return f;
-}
-
-inline double rd_be_f64(const uint8_t* p) {
-    uint64_t u = rd_be64(p);
-    double d = 0.0;
-    std::memcpy(&d, &u, sizeof(d));
-    return d;
-}
-
-std::string fourcc_to_str(const uint8_t* p) {
-    return std::string(reinterpret_cast<const char*>(p), 4);
-}
-
-std::string rstrip_ascii(const uint8_t* p, size_t n) {
-    size_t len = 0;
-    while (len < n && p[len] != '\0') {
-        ++len;
-    }
-    while (len > 0 && p[len - 1] == ' ') {
-        --len;
-    }
-    return std::string(reinterpret_cast<const char*>(p), len);
-}
-
-struct ScopedFile {
-    FILE* fp = nullptr;
-    explicit ScopedFile(const std::string& path) : fp(std::fopen(path.c_str(), "rb")) {}
-    ~ScopedFile() {
-        if (fp) {
-            std::fclose(fp);
+bool starts_with_ci(const std::string& s, const char* prefix) {
+    size_t n = std::strlen(prefix);
+    if (s.size() < n) return false;
+    for (size_t i = 0; i < n; ++i) {
+        if (std::tolower(static_cast<unsigned char>(s[i])) !=
+            std::tolower(static_cast<unsigned char>(prefix[i]))) {
+            return false;
         }
     }
-    ScopedFile(const ScopedFile&) = delete;
-    ScopedFile& operator=(const ScopedFile&) = delete;
-};
-
-bool seek_read(FILE* fp, uint64_t off, void* dst, size_t n) {
-    if (n == 0) {
-        return true;
-    }
-    if (fseeko(fp, static_cast<off_t>(off), SEEK_SET) != 0) {
-        return false;
-    }
-    return std::fread(dst, 1, n, fp) == n;
+    return true;
 }
 
 struct BoxHeader {
@@ -484,13 +435,9 @@ void parse_sequential_makernote(const uint8_t* buf, size_t len, NevFrameMeta& me
     }
 }
 
-struct TiffTagValue {
-    uint16_t tag = 0;
-    uint16_t dtype = 0;
-    uint32_t count = 0;
-    uint64_t file_offset = 0;
-    std::vector<uint8_t> data;
-};
+} // namespace
+
+namespace detail {
 
 size_t tiff_dtype_size(uint16_t dtype) {
     static const size_t kSizes[14] = {0, 1, 1, 2, 4, 8, 1, 1, 2, 4, 8, 4, 8, 4};
@@ -504,7 +451,7 @@ bool read_tiff_ifd(
     bool be,
     uint32_t ifd_rel_off,
     std::vector<TiffTagValue>& out_tags,
-    uint32_t* next_ifd_off = nullptr) {
+    uint32_t* next_ifd_off) {
     out_tags.clear();
     if (next_ifd_off) *next_ifd_off = 0;
     uint64_t ifd_abs = tiff_base + ifd_rel_off;
@@ -581,7 +528,11 @@ bool tag_as_rational(const TiffTagValue& tv, bool be, double& out) {
     return false;
 }
 
-bool parse_nef_he_clip(
+} // namespace detail
+
+namespace {
+
+bool parse_tiff_raw_clip(
     FILE* fp,
     uint64_t file_size,
     bool be,
@@ -593,9 +544,10 @@ bool parse_nef_he_clip(
         return false;
     }
     uint32_t ifd0_off = rd_u32_e(hdr + 4, be);
+    uint32_t ifd0_next_off = 0;
     std::vector<TiffTagValue> ifd0;
-    if (!read_tiff_ifd(fp, 0, file_size, be, ifd0_off, ifd0)) {
-        err = "Malformed NEF IFD0";
+    if (!read_tiff_ifd(fp, 0, file_size, be, ifd0_off, ifd0, &ifd0_next_off)) {
+        err = "Malformed TIFF IFD0";
         return false;
     }
 
@@ -629,8 +581,14 @@ bool parse_nef_he_clip(
         }
     }
 
+    if (starts_with_ci(clip.make, "sony")) {
+        return detail::parse_sony_arw_tiff(
+            fp, file_size, be, ifd0_next_off, ifd0, subifds, exif_ifd_off, clip, meta, err);
+    }
+
     bool found_he_raw = false;
     bool saw_34713 = false;
+    bool saw_sony_tag = false;
     uint64_t raw_off = 0;
     uint32_t raw_sz = 0;
 
@@ -654,6 +612,7 @@ bool parse_nef_he_clip(
             else if (tv.tag == 279) sbc = tag_as_u32(tv, be);
             else if (tv.tag == 513) jpg_off = tag_as_u32(tv, be);
             else if (tv.tag == 514) jpg_sz = tag_as_u32(tv, be);
+            else if (tv.tag == 0x7000 || comp == 32766) saw_sony_tag = true;
             else if (tv.tag == 33422 && tv.data.size() >= 4) {
                 std::memcpy(cfa, tv.data.data(), 4);
                 has_cfa = true;
@@ -679,9 +638,14 @@ bool parse_nef_he_clip(
         }
     }
 
+    if (!found_he_raw && saw_sony_tag) {
+        return detail::parse_sony_arw_tiff(
+            fp, file_size, be, ifd0_next_off, ifd0, subifds, exif_ifd_off, clip, meta, err);
+    }
+
     if (!found_he_raw) {
         err = saw_34713 ? "NEF uses legacy Nikon compression rather than HE/HE* TicoRAW"
-                        : "NEF contains no HE/HE* (Compression=34713) CFA SubIFD";
+                        : "TIFF contains no supported TicoRAW (34713) or Sony ARW6 (32766) CFA SubIFD";
         return false;
     }
 
@@ -814,7 +778,7 @@ bool parse_nev_clip(const std::string& path, NevClipInfo& clip, std::string& err
         bool is_le_tiff = (magic4[0] == 'I' && magic4[1] == 'I' && magic4[2] == 42 && magic4[3] == 0);
         bool is_be_tiff = (magic4[0] == 'M' && magic4[1] == 'M' && magic4[2] == 0 && magic4[3] == 42);
         if (is_le_tiff || is_be_tiff) {
-            return parse_nef_he_clip(sf.fp, clip.file_size, is_be_tiff, clip, err);
+            return parse_tiff_raw_clip(sf.fp, clip.file_size, is_be_tiff, clip, err);
         }
     }
 
@@ -928,7 +892,7 @@ bool read_nev_frame_meta_and_codestream(
             }
             codestream_out->resize(meta.codestream_size);
             if (!seek_read(sf.fp, meta.codestream_offset, codestream_out->data(), meta.codestream_size)) {
-                err = "Failed reading TicoRAW codestream bytes from NEF";
+                err = "Failed reading raw codestream bytes";
                 return false;
             }
         }

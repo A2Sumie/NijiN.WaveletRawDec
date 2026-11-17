@@ -18,6 +18,9 @@
   - Decodes Normal (`~1.5 bpp`) and High (`~2.3–2.5 bpp`) bitrates across arbitrary even sensor geometries (`8.3K`, `4.1K`, etc.).
 - **Nikon High Efficiency RAW (`.NEF` HE / HE\*)**:
   - Endian-aware TIFF `IFD0`, `SubIFDs` (`Compression=34713`, `PhotometricInterpretation=32803` with `0xFF10` TicoRAW `SOC`), Exif IFD, and `"Nikon\0"` embedded MakerNote parser (White Balance `0x000c`, Black Level `0x003d`, Active Crop `0x0045`, Color Temperature `0x004f`, Picture Control `0x0023`).
+- **Sony HQ RAW / ARW6 (`.ARW`)**:
+  - Endian-aware TIFF `IFD0`, `IFD1`, and `SubIFDs` parser targeting `Compression=32766` (`PhotometricInterpretation=32803`, `SonyRawFileType (0x7000) = 6`), extracting `0x7310` / `50714` `BlackLevel`, `0x7313` WB RGGB levels, `50717` `WhiteLevel`, `50719/50720` & `0x74c7/0x74c8` Active Crop, `ExifIFD` metadata, and embedded JPEG preview / thumbnail streams.
+  - Supports `0x68`-byte `1`-tile and `4`-tile strip directories with chunk-parallel `"A000"` wavelet entropy decoding and multi-tile Bayer stitching.
 - **Standalone TicoRAW R0 Codestreams (`.jxs`)**:
   - Header probing and multi-threaded direct decoding for bare ISO/IEC 21122 Bayer-extension codestreams.
 
@@ -25,7 +28,6 @@
 
 Designed with clean separation between container demuxing, parallel entropy/wavelet decoding, and calibrated CFA DNG emission to accommodate additional entropy-compressed RAW families:
 
-- **Sony Compressed / Lossless HQ RAW (`.ARW`)** — planned
 - **Sony X-OCN (`.MXF` Extended Tonal Range Original Camera Negative: X-OCN XT / ST / LT)** — planned
 
 ---
@@ -36,10 +38,13 @@ Designed with clean separation between container demuxing, parallel entropy/wave
   - Executes slice-parallel entropy decoding + 1D horizontal IDWT, followed by a global two-pass 1-level vertical LeGall 5/3 lifting IDWT (even rows first, odd rows interpolated), two-step Star-Tetrix inverse RCT, and an 81,792-entry Fliproot inverse NLT lookup table.
   - Eliminates trailing-tile edge artifacts on heights divisible by `64` (`H % 64 == 0`) or congruent to `4 mod 64` (`H % 64 == 4`) without cross-slice overlap re-decoding.
   - Enforces bounded vertical-prediction GCLI unary upper limits (`u <= 2 * bw`), strict per-packet `(data_B, gcli_B, sign_B)` bit accounting, bounds-safe tail bit-window reads (`peek64z`), and portable integer arithmetic right shifts (`asr_s32`).
+- **Sony ARW6 (`"A000"`) Wavelet & Quincunx Pipeline (`src/arw6_dec.cpp`)**:
+  - Decodes `1`-tile and `4`-tile ARW6 strips using chunk-parallel predictive Golomb-Rice 4-coefficient quad entropy coding (`k=0` adaptive zero-run mode, `update_k` predictor tracking, midpoint dequantization) and 15-bit signed modular `LL0` horizontal DPCM (`[-16384, +16383]`).
+  - Reconstructs `(G_L, R, B)` across 3 decomposition levels via **vertical-first, horizontal-second** integer LeGall 5/3 lifting IDWT (`G_H` bypassed at resolution `0`), followed by two-pass Quincunx diamond green synthesis, `(R, B)` residual reconstruction, and a 4096-entry 12-to-15-bit inverse non-linear tone mapping LUT (`kArw6NltLut`).
 - **Physical 14-bit Linear Light & Out-of-the-Box DNG 1.4 Compatibility**:
-  - Outputs linear sensor RGGB code values (e.g., `BlackLevel = 1008`, `WhiteLevel = 16383`) cleanly separated from `.NEV` N-Log preview metadata (`NCTG 0x02000023 = N-LOG`, nominal `0x0025 = 12`).
-  - `--active-crop` trims sensor margins to MakerNote `CropArea` and recomputes the `2x2 CFAPattern` modulo phase (`(x0 & 1, y0 & 1)`).
-  - Emits scalar `BlackLevel (50714) RATIONAL[1]` (omitting `BlackLevelRepeatDim`) when all four CFA channels share the same pedestal, ensuring consistent black-level parsing across `LibRaw`, `dcraw_emu`, `macOS sips`, and standard DNG 1.4 tools. Built-in D65 `ColorMatrix1` profiles cover Nikon Z 8, Z 9, Z6 III, ZR, Z f, Z50 II, and Z5 II.
+  - Outputs linear sensor RGGB code values (e.g., Nikon `BlackLevel = 1008`, Sony `BlackLevel = 512`, `WhiteLevel = 16383`) cleanly separated from `.NEV` N-Log preview metadata (`NCTG 0x02000023 = N-LOG`, nominal `0x0025 = 12`).
+  - `--active-crop` trims sensor margins to camera `CropArea` / `DefaultCrop` and recomputes the `2x2 CFAPattern` modulo phase (`(x0 & 1, y0 & 1)`).
+  - Emits scalar `BlackLevel (50714) RATIONAL[1]` (omitting `BlackLevelRepeatDim`) when all four CFA channels share the same pedestal, ensuring consistent black-level parsing across `LibRaw`, `dcraw_emu`, `macOS sips`, and standard DNG 1.4 tools. Built-in D65 `ColorMatrix1` profiles cover Nikon (`Z 8`, `Z 9`, `Z6 III`, `ZR`, `Z f`, `Z50 II`, `Z5 II`) and Sony Alpha (`ILCE-7M5`, `ILCE-7RM6`, `ILCE-7RM5`, `ILCE-7M4`, `ILCE-7CR`, `ILCE-7CM2`, `ILCE-1M2`, `ILCE-1`, `ILCE-9M3`, `ZV-E1`, `ILME-FX3`).
 
 ---
 
@@ -52,18 +57,23 @@ Designed with clean separation between container demuxing, parallel entropy/wave
 | Nikon N-RAW `.NEV` clip (first / mid / last frames) | `45.6 MP` (`1.50 bpp` N-RAW) | **`0`** | **`0`** | **`0`** |
 | Nikon Z 8 `.NEF` (`HE*`) | `8280 x 5520` (`5.00 bpp` HE\*) | **`0`** | **`0`** | **`0`** |
 | Nikon Z50 II `.NEF` (`HE*`) | `5600 x 3728` (`5.00 bpp` HE\*) | **`0`** | **`0`** | **`0`** |
+| Sony Alpha `.ARW` (`ARW6` / `HQ RAW`, 1-tile, full-tonal & highlight clips) | `7040 x 4688` (`33.0 MP`, 1 / 8 threads) | **`0`** | **`0`** | **`0`** |
+| Sony `.ARW` 4-tile synthetic stitch (`ARW6` quadrant strip) | `14080 x 9376` (`132.0 MP`, 8 threads) | **`0`** | **`0`** | **`0`** |
 | Trailing-tile edge case (`H % 64 == 0`) | `512 x 512` synthetic stream | **`0`** | **`0`** | **`0`** |
 | Trailing-tile edge case (`H % 64 == 4`) | `512 x 516` synthetic stream | **`0`** | **`0`** | **`0`** |
 
-Single-threaded and multi-threaded runs (`1 / 4 / 8` threads) produce bit-identical outputs (`b1 == b4`).
+Single-threaded and multi-threaded runs (`1 / 4 / 8` threads) produce bit-identical outputs (`b1 == b4`, `b1 == b8`).
 
-### 2. Apple Silicon Multi-Threaded Benchmark (`45.6 MP`, `1.50 bpp` `.NEV`, 20-frame average)
+### 2. Apple Silicon Multi-Threaded Benchmark (`45.6 MP` `.NEV` & `33.0 MP` `.ARW`, 20-frame average)
 
-| Threads | Decode Only (`ms/frame`) | Decode Throughput (`fps`) | Read + Decode E2E (`ms/frame`) | E2E Throughput (`fps`) |
-|---:|---:|---:|---:|---:|
-| `1` | `291.74` | `3.43` | `293.55` | `3.41` |
-| `4` | `81.30` | `12.30` | `82.56` | `12.11` |
-| **`8`** | **`49.67`** | **`20.13`** | **`50.95`** | **`19.63`** |
+| Format / Resolution | Threads | Decode Only (`ms/frame`) | Decode Throughput (`fps`) | Read + Decode E2E (`ms/frame`) | E2E Throughput (`fps`) |
+|---|---:|---:|---:|---:|---:|
+| Nikon `.NEV` (`45.6 MP`, `1.50 bpp`) | `1` | `291.74` | `3.43` | `293.55` | `3.41` |
+| Nikon `.NEV` (`45.6 MP`, `1.50 bpp`) | `4` | `81.30` | `12.30` | `82.56` | `12.11` |
+| Nikon `.NEV` (`45.6 MP`, `1.50 bpp`) | **`8`** | **`49.67`** | **`20.13`** | **`50.95`** | **`19.63`** |
+| Sony `.ARW` (`ARW6`, `7040 x 4688`) | `1` | `399.22` | `2.50` | `402.28` | `2.49` |
+| Sony `.ARW` (`ARW6`, `7040 x 4688`) | `4` | `97.56` | `10.25` | `100.20` | `9.98` |
+| Sony `.ARW` (`ARW6`, `7040 x 4688`) | **`8`** | **`72.38`** | **`13.82`** | **`74.65`** | **`13.40`** |
 
 ---
 
@@ -80,7 +90,7 @@ make clean all test
 Build outputs:
 - `build/nev2bayer` (`-O3` release CLI)
 - `build/nev2bayer_asan` (ASan + UBSan diagnostic CLI)
-- `build/test_nev2bayer` / `build/test_nev2bayer_asan` (standalone unit suite; optional `NEV2BAYER_TEST_NEV` and `NEV2BAYER_TEST_NEF` environment variables enable real-sample regression checks)
+- `build/test_nev2bayer` / `build/test_nev2bayer_asan` (standalone unit suite; optional `NEV2BAYER_TEST_NEV`, `NEV2BAYER_TEST_NEF`, and `NEV2BAYER_TEST_ARW` environment variables enable real-sample regression checks)
 
 ### Build with CMake
 
@@ -93,16 +103,19 @@ ctest --test-dir cmake-build --output-on-failure
 ### CLI Quick Start
 
 ```sh
-# 1. Inspect .NEV / .NEF / .jxs headers, MakerNote, LPCM audio, timecode, and codestream parameters
+# 1. Inspect .NEV / .NEF / .ARW / .jxs headers, metadata, audio/timecode, and codestream parameters
 ./build/nev2bayer --info clip.NEV
 ./build/nev2bayer --info --json photo.NEF
+./build/nev2bayer --info --json photo.ARW
 
 # 2. Decode a frame to linear 14-bit-in-16-bit CFA DNG (full sensor buffer + DefaultCrop metadata)
 ./build/nev2bayer clip.NEV --frame 0 -o frame_0000.dng --threads 8
+./build/nev2bayer photo.ARW -o sony_full.dng --threads 8
 
-# 3. Crop to MakerNote CropArea with CFA phase rotation -> .dng or 16-bit LE .raw
+# 3. Crop to camera active crop with CFA phase rotation -> .dng or 16-bit LE .raw
 ./build/nev2bayer clip.NEV --frame 0 --active-crop -o frame_0000_crop.dng --threads 8
 ./build/nev2bayer photo.NEF --active-crop -o photo_crop.dng --threads 8
+./build/nev2bayer photo.ARW --active-crop -o sony_crop.dng --threads 8
 ./build/nev2bayer clip.NEV --frame 0 -o frame_0000.raw --threads 8
 
 # 4. Batch decode a frame range or entire clip into a directory
@@ -124,9 +137,12 @@ See [**`docs/CLI.md`**](docs/CLI.md) for all flags, JSON fields, and C++17 `nev2
 | Path | Role |
 |---|---|
 | [`include/nev2bayer.h`](include/nev2bayer.h) | Public C++17 data structures and container, decode, crop, and DNG APIs |
+| [`src/tiff_internal.h`](src/tiff_internal.h) | Shared endian-aware TIFF IFD reader and Sony ARW dispatch helper |
 | [`src/nev_container.cpp`](src/nev_container.cpp) | 64-bit `.NEV` ISOBMFF/NCDT/NRFH/NRTH parser and `.NEF` HE/HE\* TIFF/MakerNote parser |
+| [`src/arw_container.cpp`](src/arw_container.cpp) | Sony `.ARW` (`ARW6` / `HQ RAW`) TIFF `SubIFDs`, calibration tags, and JPEG preview parser |
 | [`src/ticoraw_dec.cpp`](src/ticoraw_dec.cpp) | Clean-room TicoRAW R0 parallel entropy decoder, 5/3 2D IDWT, Star-Tetrix RCT, and Fliproot NLT |
-| [`src/dng_writer.cpp`](src/dng_writer.cpp) | Scalar `BlackLevel` DNG 1.4 writer, D65 `ColorMatrix1` lookup, and modulo CFA cropper |
+| [`src/arw6_dec.cpp`](src/arw6_dec.cpp) | Clean-room Sony ARW6 (`"A000"`) multi-tile parser, chunk-parallel entropy decoder, vertical-first 5/3 IDWT, Quincunx synthesis, and NLT LUT |
+| [`src/dng_writer.cpp`](src/dng_writer.cpp) | Scalar `BlackLevel` DNG 1.4 writer, Nikon/Sony D65 `ColorMatrix1` lookup, and modulo CFA cropper |
 | [`src/main.cpp`](src/main.cpp) | CLI driver (`--info` / `--json` / batch decode / stream & preview extraction / `--bench`) |
 | [`tests/test_nev2bayer.cpp`](tests/test_nev2bayer.cpp) | Standalone negative container/stream checks, CFA phase rotation, DNG round-trip, and optional corpus hooks |
 | [`CMakeLists.txt`](CMakeLists.txt) · [`Makefile`](Makefile) | Zero-dependency build configuration (`nev2bayer_core` static library, `nev2bayer`, and tests) |

@@ -3,31 +3,31 @@
 ## 1. CLI Synopsis
 
 ```sh
-nev2bayer --info [--json] <in.NEV | in.NEF | in.jxs>
-nev2bayer <in.NEV | in.NEF> [--frame <N|start-end|all>] -o <out.dng|out.raw|dir/> [options]
+nev2bayer --info [--json] <in.NEV | in.NEF | in.ARW | in.jxs>
+nev2bayer <in.NEV | in.NEF | in.ARW> [--frame <N|start-end|all>] -o <out.dng|out.raw|dir/> [options]
 nev2bayer --raw-jxs <in.jxs> -o <out.raw|out.dng> [options]
 nev2bayer --extract-jxs <in.NEV | in.NEF> [--frame <N>] -o <out.jxs>
-nev2bayer --extract-preview <in.NEV | in.NEF> [--thumb] -o <out.jpg>
-nev2bayer --bench <in.NEV> [--frames N] [--threads N]
+nev2bayer --extract-preview <in.NEV | in.NEF | in.ARW> [--thumb] -o <out.jpg>
+nev2bayer --bench <in.NEV | in.ARW> [--frames N] [--threads N]
 ```
 
 ### Options
 
 | Flag | Argument | Description |
 |---|---|---|
-| `-i`, `--input` | `<path>` | Input file (`.NEV`, `.NEF`, or `.jxs`; also accepted positionally) |
+| `-i`, `--input` | `<path>` | Input file (`.NEV`, `.NEF`, `.ARW`, or `.jxs`; also accepted positionally) |
 | `-o`, `--output` | `<path>` | Output file (`.dng`, `.raw`, `.jxs`, `.jpg`) or directory (creates directory and writes `frame_NNNN.<ext>`) |
-| `--frame` | `<N \| start-end \| all>` | Frame index, inclusive range (e.g., `0-29`), or `all` (default `0`; `.NEF` accepts `0`) |
+| `--frame` | `<N \| start-end \| all>` | Frame index, inclusive range (e.g., `0-29`), or `all` (default `0`; `.NEF` and `.ARW` accept `0`) |
 | `--format` | `dng \| raw` | Overrides extension inference when writing into a directory (`.raw` is 16-bit LE RGGB row-major) |
-| `--active-crop` | — | Crops decoded buffer to MakerNote `0x0045 CropArea` and adjusts `2x2 CFAPattern` parity |
+| `--active-crop` | — | Crops decoded buffer to camera active crop (`CropArea` / `DefaultCrop`) and adjusts `2x2 CFAPattern` parity |
 | `--orientation` | `<1..8>` | Overrides TIFF Orientation tag in output DNG |
-| `--threads` | `<N>` | Worker thread count for slice entropy decode and 2D IDWT (`0` or omitted uses hardware concurrency) |
-| `--info` | — | Inspect container, MakerNote, tracks, and TicoRAW header without decoding pixels |
+| `--threads` | `<N>` | Worker thread count for slice/chunk entropy decode and 2D IDWT (`0` or omitted uses hardware concurrency) |
+| `--info` | — | Inspect container, camera metadata, tracks, and codestream header without decoding pixels |
 | `--json` | — | Emits machine-readable JSON when combined with `--info` |
 | `--raw-jxs` | `<in.jxs>` | Decodes a standalone TicoRAW R0 codestream to `.raw` or `.dng` |
 | `--extract-jxs` | `<in.NEV \| in.NEF>` | Extracts bare frame `--frame` TicoRAW codestream bytes to `.jxs` |
-| `--extract-preview` | `<in.NEV \| in.NEF>` | Extracts embedded preview JPEG (`NCVW` or largest NEF `Compression=6` SubIFD); add `--thumb` for thumbnail |
-| `--bench` | `<in.NEV>` | Benchmarks `min(N, total_frames)` frames reporting decode-only and read+decode ms/fps |
+| `--extract-preview` | `<in.NEV \| in.NEF \| in.ARW>` | Extracts embedded preview JPEG (`NCVW` or largest TIFF `Compression=6` SubIFD); add `--thumb` for thumbnail |
+| `--bench` | `<in.NEV \| in.ARW>` | Benchmarks `min(N, total_frames)` clip frames or `N` iterations of a single `.ARW` strip |
 | `--frames` | `<N>` | Frame count for `--bench` (default `20`) |
 
 ### Exit Codes
@@ -79,6 +79,31 @@ Example output on a Nikon Z 8 `.NEV` file (`Ver.03.12`):
 }
 ```
 
+For a Sony ARW6 (`.ARW`) still (`Compression=32766`, `SonyRawFileType=6`), `--info --json` reports the `arw6` codec block alongside TIFF/Exif calibration fields:
+
+```json
+{
+  "file": "photo.ARW",
+  "file_size": 16965632,
+  "major_brand": "ARW",
+  "make": "SONY",
+  "model": "ILCE-7M5",
+  "codestream_width": 7040,
+  "codestream_height": 4688,
+  "active_crop": [12, 8, 7008, 4672],
+  "black_level": [512, 512, 512, 512],
+  "arw6": {
+    "strip_bytes": 14540288,
+    "tiles": 1,
+    "bit_depth": 14,
+    "internal_depth": 12,
+    "decomp_levels": 3,
+    "subsampling_mask": "0x0200",
+    "sony_raw_file_type": 6
+  }
+}
+```
+
 For a bare `.jxs` codestream, `--info --json` emits a compact header summary:
 
 ```json
@@ -99,6 +124,11 @@ For a bare `.jxs` codestream, `--info --json` emits a compact header summary:
 # Batch-convert a folder of Nikon HE / HE* .NEF stills to calibrated DNGs
 for f in *.NEF; do
   ./build/nev2bayer "$f" --active-crop -o "${f%.NEF}.dng" --threads 8
+done
+
+# Batch-convert a folder of Sony ARW6 / HQ RAW .ARW stills to calibrated DNGs
+for f in *.ARW; do
+  ./build/nev2bayer "$f" --active-crop -o "${f%.ARW}.dng" --threads 8
 done
 ```
 
@@ -122,26 +152,40 @@ int decode_one_frame(const std::string& input_path, const std::string& out_dng) 
     }
 
     nev2bayer::NevFrameMeta meta;
-    std::vector<uint8_t> codestream;
-    if (!nev2bayer::read_nev_frame_meta_and_codestream(clip, 0, meta, &codestream, err)) {
+    std::vector<uint8_t> payload;
+    if (!nev2bayer::read_nev_frame_meta_and_codestream(clip, 0, meta, &payload, err)) {
         std::fprintf(stderr, "read frame failed: %s\n", err.c_str());
         return 1;
     }
 
-    nev2bayer::TicoRawInfo jxs;
     std::vector<uint16_t> bayer;
-    if (!nev2bayer::decode_ticoraw_bayer(codestream.data(), codestream.size(), 8, bayer, jxs, err)) {
-        std::fprintf(stderr, "decode failed: %s\n", err.c_str());
-        return 1;
-    }
-
     nev2bayer::DngWriteOptions opts;
-    nev2bayer::build_dng_options_from_clip_and_frame(clip, meta, jxs, /*apply_active_crop=*/true, 0, opts);
+    uint32_t raw_w = 0, raw_h = 0;
+
+    if (clip.major_brand == "ARW") {
+        nev2bayer::Arw6Info arw6;
+        if (!nev2bayer::decode_arw6_bayer(payload.data(), payload.size(), 8, bayer, arw6, err)) {
+            std::fprintf(stderr, "arw6 decode failed: %s\n", err.c_str());
+            return 1;
+        }
+        nev2bayer::build_dng_options_from_clip_and_frame(clip, meta, arw6, /*apply_active_crop=*/true, 0, opts);
+        raw_w = arw6.width;
+        raw_h = arw6.height;
+    } else {
+        nev2bayer::TicoRawInfo jxs;
+        if (!nev2bayer::decode_ticoraw_bayer(payload.data(), payload.size(), 8, bayer, jxs, err)) {
+            std::fprintf(stderr, "ticoraw decode failed: %s\n", err.c_str());
+            return 1;
+        }
+        nev2bayer::build_dng_options_from_clip_and_frame(clip, meta, jxs, /*apply_active_crop=*/true, 0, opts);
+        raw_w = jxs.width;
+        raw_h = jxs.height;
+    }
 
     std::vector<uint16_t> cropped;
     const uint16_t* pix = bayer.data();
     if (meta.has_crop &&
-        nev2bayer::apply_bayer_crop(bayer.data(), jxs.width, jxs.height, meta.crop, opts.cfa_pattern, cropped, opts.cfa_pattern)) {
+        nev2bayer::apply_bayer_crop(bayer.data(), raw_w, raw_h, meta.crop, opts.cfa_pattern, cropped, opts.cfa_pattern)) {
         pix = cropped.data();
         opts.width = meta.crop[2];
         opts.height = meta.crop[3];

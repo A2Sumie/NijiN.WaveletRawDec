@@ -1,6 +1,6 @@
 # Format & Codec Specification
 
-This document specifies the **Nikon `.NEV` ISOBMFF/QuickTime container**, **Nikon `.NEF` (`HE` / `HE*`) TIFF SubIFD layout**, **TicoRAW R0 (ISO/IEC 21122 Bayer extension) decoding pipeline**, and **calibrated DNG 1.4 emission** implemented in `NijiN.EntropyRawDec` (`nev2bayer`).
+This document specifies the **Nikon `.NEV` ISOBMFF/QuickTime container**, **Nikon `.NEF` (`HE` / `HE*`) TIFF SubIFD layout**, **TicoRAW R0 (ISO/IEC 21122 Bayer extension) decoding pipeline**, **Sony `.ARW` (`ARW6` / `HQ RAW`) multi-tile container and `"A000"` wavelet pipeline**, and **calibrated DNG 1.4 emission** implemented in `NijiN.EntropyRawDec` (`nev2bayer`).
 
 ---
 
@@ -117,8 +117,81 @@ Nikon N-RAW (`.NEV`) and HE / HE\* (`.NEF`) share the **wavelet-subband + block-
 
 ---
 
-## 5. DNG 1.4 Calibration & CFA Geometry
+## 5. Sony `.ARW` (`ARW6` / `HQ RAW`) Container & `"A000"` Wavelet Architecture
 
-- **Active Crop & CFA Modulo Rotation (`apply_bayer_crop`)**: When trimming margins to MakerNote `CropArea = [x0, y0, w, h]`, shifts the `2x2` Bayer pattern according to `dst_cfa[ry*2 + rx] = src_cfa[((ry ^ (y0 & 1)) * 2) + (rx ^ (x0 & 1))]`; otherwise emits the full decoded buffer with `DefaultCropOrigin (50719)` and `DefaultCropSize (50720)`.
-- **Scalar `BlackLevel (50714)` Convention**: When all 4 CFA channels share one black level (e.g., `1008`), omits `BlackLevelRepeatDim (50713)` and writes scalar `BlackLevel (50714) RATIONAL[1]` alongside `WhiteLevel (50717) = (1 << bit_depth) - 1 = 16383`, ensuring uniform black-level attribution across `LibRaw` and standard DNG readers. Distinct per-channel black levels emit `BlackLevelRepeatDim = [2, 2]` and 4 rationals.
-- **Built-In D65 `ColorMatrix1 (50721)`**: Embeds CIE XYZ(D65)-to-camera matrices for Nikon Z 8, Z 9, Z6 III, ZR, Z f, Z50 II, and Z5 II (falling back to Z 8 for unlisted models).
+### 5.1 TIFF Container Selection & Calibration Tags (`src/arw_container.cpp`)
+
+When a TIFF input carries `Make` containing `"SONY"` or contains a Bayer `SubIFD` with `Compression (259) == 32766`, `parse_nev_clip` dispatches to `parse_sony_arw_tiff`:
+
+1. **`SubIFDs` & Compression Selection**: Scans `IFD0`, `SubIFDs`, and `IFD1` for a CFA image directory (`PhotometricInterpretation == 32803` or `0`) matching `Compression (259) == 32766` and `SonyRawFileType (0x7000) == 6`, verifying an embedded `"A000"` signature at the first tile's `rel_offset`. Legacy Sony ARW modes (such as `Compression=32767`) return an explicit unsupported-format error.
+2. **Sony Sensor Calibration & Crop Tags**:
+   - `BlackLevel`: Reads Sony tag `0x7310` or DNG `50714` (`uint16[4]`), defaulting to `[512, 512, 512, 512]` when absent.
+   - `WhiteLevel (50717)`: Captured alongside `CFAPattern (33422)`.
+   - `WB_RGGBLevels (0x7313)`: Signed 16-bit `[R, G0, G1, B]` multipliers.
+   - `DefaultCrop`: Reads `DefaultCropOrigin` (`50719` / `0x74c7`) and `DefaultCropSize` (`50720` / `0x74c8`).
+   - `ExifIFD` & Preview JPEG: Extracts exposure, aperture, ISO, focal length, and `LensModel`, while recording the largest `Compression == 6` SubIFD (or `IFD1` `513`/`514`) JPEG as `ncvw` / `ncth`.
+
+### 5.2 Multi-Tile Strip Header & `"A000"` Bitstream Grammar (`src/arw6_dec.cpp`)
+
+The TIFF strip begins with a little-endian tile directory of at least `0x68` bytes supporting `1`-tile (e.g., `7040x4688`) and `4`-tile quadrant layouts:
+
+```text
++0x00  [u64 LE]  tile_count (1 or 4)
++0x08  [N x 24B] tile[i]:
+                   ├─ +0x00 [u64 LE] rel_offset (from strip start)
+                   ├─ +0x08 [u32 LE] tile_x     (2x2 CFA aligned)
+                   ├─ +0x0C [u32 LE] tile_y     (2x2 CFA aligned)
+                   ├─ +0x10 [u32 LE] width      (even, >= 2)
+                   └─ +0x14 [u32 LE] height     (even, >= 2)
+```
+
+Each tile points to a big-endian `"A000"` wavelet codestream:
+
+```text
++0x00  [4 B]   "A000" magic
++0x08  [2 B]   width (BE u16),  +0x0A [2 B] half_height = height / 2 (BE u16)
++0x0C  [2 B]   bit-depth word (coded_bd = (word >> 4) & 0x3F)
++0x0E  [2 B]   num_comps (=3), decomp_levels (=3), subsampling_mask (=0x0200)
++0x10  [32 B]  4 x 24-bit BE resolution-group byte sizes (in 16-byte blocks)
++0x30  [var]   5 group records (16 B or 32 B each): per-component stream lengths for
+               resolutions 0..3 of (G_L, R, B) in groups 0..3 and raw G_H in group 4
+[res streams]  For each resolution stream:
+                 └─ 16B directory header (dir_blocks, payload_blocks, magic=4, n_bands, chunk_count)
+                 └─ chunk descriptors (u16 clen + n_bands x 4-bit band shifts) + aligned chunk payloads
+```
+
+### 5.3 ARW6 Multi-Threaded Decoding Pipeline
+
+```text
+["A000" Tile Codestream]
+   │
+   ├─► Chunk-Parallel Entropy Decode [Worker Pool across all (comp, res, chunk) slices]
+   │     ├─ MSB-first WordBitReader parsing predictive Golomb-Rice parameter k (0..19).
+   │     ├─ k == 0 triggers adaptive zero-quad run-length skip (rem >= 2).
+   │     ├─ Predictor update_k runs BEFORE reading sign bits of the current 4-coeff quad.
+   │     ├─ Midpoint dequantization: m != 0, shift > 0 -> (((m << 1) | 1) << (shift - 1)) - (m & 1).
+   │     └─ LL0 horizontal DPCM with 15-bit signed modular wrap: (acc + v) & 0x7FFF -> [-16384, +16383].
+   │
+   ├─► Component-Parallel 2D LeGall 5/3 IDWT [(G_L, R, B) across r = 1..3; G_H bypassed at r = 0]
+   │     ├─ Pass 1 (Vertical FIRST): 1D 5/3 inverse lifting over [LL|HL] even rows and [LH|HH] odd rows.
+   │     └─ Pass 2 (Horizontal SECOND): 1D 5/3 inverse lifting across columns into next_ll.
+   │        (Integer floor rounding in 5/3 lifting makes Vert->Horiz non-commutative with Horiz->Vert.)
+   │
+   ├─► Pass 3 [Parallel Rows]: Quincunx Diamond Even-Diagonal G0 Synthesis
+   │     └─ Reconstructs G0[r][c] from G_L[r][c] minus rounded average of four G_H neighbors
+   │        (3-neighbor boundary handling at the rightmost column w_comp - 1).
+   │
+   └─► Pass 4 [Parallel Rows]: Odd-Diagonal G1 + (R, B) + 4096-Entry NLT LUT
+         ├─ G1[r][c] = G_H[r][c] + rounded diamond average of G0 neighbors.
+         ├─ Clamps ug0, ug1 into [0, 4095] around bias 2048; computes g_avg = (ug0 + ug1) >> 1.
+         ├─ ur = clamp(g_avg + 2 * R, 0, 4095), ub = clamp(g_avg + 2 * B, 0, 4095).
+         └─ Maps via kArw6NltLut[4096] >> 1 (clamped <= 0x4000) to 14-bit linear RGGB output.
+```
+
+---
+
+## 6. DNG 1.4 Calibration & CFA Geometry
+
+- **Active Crop & CFA Modulo Rotation (`apply_bayer_crop`)**: When trimming margins to Nikon MakerNote `CropArea` or Sony `DefaultCrop = [x0, y0, w, h]`, shifts the `2x2` Bayer pattern according to `dst_cfa[ry*2 + rx] = src_cfa[((ry ^ (y0 & 1)) * 2) + (rx ^ (x0 & 1))]`; otherwise emits the full decoded buffer with `DefaultCropOrigin (50719)` and `DefaultCropSize (50720)`.
+- **Scalar `BlackLevel (50714)` Convention**: When all 4 CFA channels share one black level (e.g., Nikon `1008`, Sony `512`), omits `BlackLevelRepeatDim (50713)` and writes scalar `BlackLevel (50714) RATIONAL[1]` alongside `WhiteLevel (50717) = 16383`, ensuring uniform black-level attribution across `LibRaw` and standard DNG readers. Distinct per-channel black levels emit `BlackLevelRepeatDim = [2, 2]` and 4 rationals.
+- **Built-In D65 `ColorMatrix1 (50721)`**: Embeds CIE XYZ(D65)-to-camera matrices for Nikon (`Z 8`, `Z 9`, `Z6 III`, `ZR`, `Z f`, `Z50 II`, `Z5 II`) and Sony Alpha (`ILCE-7M5`, `ILCE-7RM6`, `ILCE-7RM5`, `ILCE-7M4`, `ILCE-7CR`, `ILCE-7CM2`, `ILCE-1M2`, `ILCE-1`, `ILCE-9M3`, `ZV-E1`, `ILME-FX3`), falling back cleanly per make for unlisted models.

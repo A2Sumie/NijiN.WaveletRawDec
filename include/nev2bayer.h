@@ -56,10 +56,12 @@ struct NevFrameMeta {
     double wb_rggb[4] = {1.0, 1.0, 1.0, 1.0}; // [R, G0, G1, B]
     bool has_black = false;
     uint16_t black[4] = {1008, 1008, 1008, 1008};
+    uint16_t white_level = 0; // 0 = derive (1 << bit_depth) - 1
     bool has_crop = false;
     uint16_t crop[4] = {0, 0, 0, 0}; // left, top, width, height
     uint16_t color_temp = 0;
     uint16_t nef_compression = 0;
+    uint16_t sony_raw_file_type = 0;
     std::string wb_mode;
     std::string picture_control_base;
     std::string picture_control_name;
@@ -74,7 +76,7 @@ struct NevClipInfo {
     uint64_t movie_duration = 0;
     double fps = 0.0;
 
-    // From NCDT / NCTG
+    // From NCDT / NCTG / TIFF IFD0 + Exif
     std::string make;
     std::string model;
     std::string firmware_version;
@@ -86,7 +88,7 @@ struct NevClipInfo {
     uint16_t nctg_active_h = 0;
     uint16_t nctg_kelvin = 0;
 
-    // Embedded JPEGs in moov/udta/NCDT or NEF preview SubIFD
+    // Embedded JPEGs in moov/udta/NCDT or TIFF previews
     uint64_t ncth_offset = 0;
     uint32_t ncth_size = 0;
     uint64_t ncvw_offset = 0;
@@ -138,6 +140,28 @@ struct TicoRawInfo {
     int num_slices = 0;
     int num_precincts = 0;
     int line_stride = 0;
+};
+
+struct Arw6TileInfo {
+    uint64_t rel_offset = 0;
+    uint32_t data_size = 0;
+    uint32_t x = 0;
+    uint32_t y = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+};
+
+struct Arw6Info {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t codestream_size = 0;
+    uint16_t bit_depth = 14;
+    uint16_t internal_depth = 12;
+    uint16_t coded_depth = 16;
+    uint8_t num_comps = 3;
+    uint8_t decomp_levels = 3;
+    uint16_t subsampling_mask = 0x0200;
+    std::vector<Arw6TileInfo> tiles;
 };
 
 struct DngWriteOptions {
@@ -196,12 +220,53 @@ bool decode_ticoraw_bayer(
     TicoRawInfo& info_out,
     std::string& err);
 
+// Sony ARW6 (Compression=32766, SonyRawFileType=6) multi-tile & "A000" wavelet decoding
+bool probe_arw6_codestream(
+    const uint8_t* data,
+    size_t len,
+    Arw6Info& info,
+    std::string& err);
+
+bool probe_arw6_strip(
+    const uint8_t* strip_data,
+    size_t strip_len,
+    Arw6Info& info,
+    std::string& err);
+
+bool decode_arw6_tile(
+    const uint8_t* cs_data,
+    size_t cs_len,
+    int num_threads,
+    uint32_t tile_x,
+    uint32_t tile_y,
+    uint32_t full_w,
+    uint32_t full_h,
+    std::vector<uint16_t>& bayer_out,
+    Arw6Info& tile_info_out,
+    std::string& err);
+
+bool decode_arw6_bayer(
+    const uint8_t* strip_data,
+    size_t strip_len,
+    int num_threads,
+    std::vector<uint16_t>& bayer_out,
+    Arw6Info& info_out,
+    std::string& err);
+
 // DNG 1.4 writer & camera matrix lookup
 bool lookup_nikon_d65_colormatrix(const std::string& model, double out_cm[9]);
+bool lookup_camera_d65_colormatrix(const std::string& make, const std::string& model, double out_cm[9]);
 void build_dng_options_from_clip_and_frame(
     const NevClipInfo& clip,
     const NevFrameMeta& meta,
     const TicoRawInfo& jxs,
+    bool apply_active_crop,
+    uint16_t override_orientation,
+    DngWriteOptions& opts);
+void build_dng_options_from_clip_and_frame(
+    const NevClipInfo& clip,
+    const NevFrameMeta& meta,
+    const Arw6Info& arw6,
     bool apply_active_crop,
     uint16_t override_orientation,
     DngWriteOptions& opts);

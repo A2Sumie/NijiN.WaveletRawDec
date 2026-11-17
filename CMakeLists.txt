@@ -10,7 +10,9 @@ find_package(Threads REQUIRED)
 
 add_library(nev2bayer_core STATIC
     src/nev_container.cpp
+    src/arw_container.cpp
     src/ticoraw_dec.cpp
+    src/arw6_dec.cpp
     src/dng_writer.cpp
 )
 target_include_directories(nev2bayer_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

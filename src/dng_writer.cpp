@@ -104,52 +104,53 @@ std::string to_lower_copy(const std::string& s) {
     return out;
 }
 
-} // namespace
+struct CameraMatrixEntry {
+    const char* key;
+    double cm[9];
+};
 
-bool lookup_nikon_d65_colormatrix(const std::string& model, double out_cm[9]) {
-    struct ModelEntry {
-        const char* key;
-        double cm[9];
+bool lookup_sony_d65_colormatrix(const std::string& lm, double out_cm[9]) {
+    static const CameraMatrixEntry kSonyTable[] = {
+        {"ilce-7m5",  {0.9089, -0.3577, -0.0787, -0.3563, 1.1326, 0.2557, -0.0114, 0.0928, 0.5904}},
+        {"ilce-7rm6", {1.1765, -0.5595, -0.1192, -0.3689, 1.1507, 0.2485,  0.0051, 0.0681, 0.5731}},
+        {"ilce-7rm5", {0.8200, -0.2976, -0.0719, -0.4296, 1.2053, 0.2532, -0.0429, 0.1282, 0.5774}},
+        {"ilce-7m4",  {0.7460, -0.2365, -0.0588, -0.5687, 1.3442, 0.2474, -0.0624, 0.1156, 0.6584}},
+        {"ilce-7cr",  {0.8200, -0.2976, -0.0719, -0.4296, 1.2053, 0.2532, -0.0429, 0.1282, 0.5774}},
+        {"ilce-7cm2", {0.7460, -0.2365, -0.0588, -0.5687, 1.3442, 0.2474, -0.0624, 0.1156, 0.6584}},
+        {"ilce-1m2",  {1.0279, -0.3899, -0.1462, -0.7108, 1.6980, -0.0168, -0.0168, 0.0544, 0.6116}},
+        {"ilce-1",    {0.8161, -0.2947, -0.0739, -0.4811, 1.2668, 0.2389, -0.0437, 0.1229, 0.6524}},
+        {"ilce-9m3",  {0.9811, -0.3908, -0.0752, -0.3704, 1.1577, 0.2417, -0.0073, 0.0950, 0.5980}},
+        {"zv-e1",     {0.6912, -0.2127, -0.0469, -0.4470, 1.2175, 0.2587, -0.0398, 0.1478, 0.6492}},
+        {"ilme-fx3",  {0.6912, -0.2127, -0.0469, -0.4470, 1.2175, 0.2587, -0.0398, 0.1478, 0.6492}},
     };
-    static const ModelEntry kTable[] = {
-        {"z 8",   { 1.1423, -0.4564, -0.1123, -0.4816, 1.2895, 0.2119, -0.0210, 0.1061, 0.7282}},
-        {"z 9",   { 1.3389, -0.6049, -0.1441, -0.4544, 1.2757, 0.1969,  0.0229, 0.0498, 0.7390}},
-        {"z6_3",  { 1.1206, -0.4286, -0.0941, -0.4879, 1.2847, 0.2251, -0.0745, 0.1654, 0.7374}},
-        {"zr",    { 1.1206, -0.4286, -0.0941, -0.4879, 1.2847, 0.2251, -0.0745, 0.1654, 0.7374}},
-        {"z f",   { 1.1607, -0.4491, -0.0977, -0.4522, 1.2460, 0.2304, -0.0458, 0.1519, 0.7616}},
-        {"z50_2", { 1.1640, -0.4829, -0.1079, -0.5107, 1.3006, 0.2325, -0.0972, 0.1711, 0.7380}},
-        {"z5_2",  { 0.9874, -0.3784, -0.0823, -0.4728, 1.2673, 0.2286, -0.0648, 0.1513, 0.6375}},
-    };
-    std::string lm = to_lower_copy(model);
-    for (const auto& ent : kTable) {
+    for (const auto& ent : kSonyTable) {
         if (lm.find(ent.key) != std::string::npos) {
             std::memcpy(out_cm, ent.cm, sizeof(ent.cm));
             return true;
         }
     }
-    // Fallback to Nikon Z 8 D65 matrix
-    std::memcpy(out_cm, kTable[0].cm, sizeof(kTable[0].cm));
+    std::memcpy(out_cm, kSonyTable[0].cm, sizeof(kSonyTable[0].cm));
     return false;
 }
 
-void build_dng_options_from_clip_and_frame(
+void populate_dng_options_common(
     const NevClipInfo& clip,
     const NevFrameMeta& meta,
-    const TicoRawInfo& jxs,
+    uint32_t width,
+    uint32_t height,
+    uint16_t bit_depth,
     bool apply_active_crop,
     uint16_t override_orientation,
     DngWriteOptions& opts) {
-    opts = DngWriteOptions();
-    opts.width = jxs.width;
-    opts.height = jxs.height;
-    opts.bit_depth = static_cast<uint16_t>(jxs.cdt_depth > 0 ? jxs.cdt_depth : meta.bit_depth);
-    opts.white = static_cast<uint16_t>((1u << opts.bit_depth) - 1u);
+    opts.width = width;
+    opts.height = height;
+    opts.bit_depth = bit_depth;
+    opts.white = (meta.white_level > 0)
+                     ? meta.white_level
+                     : static_cast<uint16_t>((1u << opts.bit_depth) - 1u);
 
     if (meta.has_black) {
         std::memcpy(opts.black, meta.black, sizeof(opts.black));
-    } else if (jxs.offset_16 > 0 && jxs.out_bitdepth >= opts.bit_depth) {
-        uint16_t blk = static_cast<uint16_t>(jxs.offset_16 >> (jxs.out_bitdepth - opts.bit_depth));
-        opts.black[0] = opts.black[1] = opts.black[2] = opts.black[3] = blk;
     }
 
     if (override_orientation >= 1 && override_orientation <= 8) {
@@ -173,8 +174,10 @@ void build_dng_options_from_clip_and_frame(
         opts.crop_size[1] = meta.crop[3];
     }
 
-    opts.make = clip.make.empty() ? "NIKON CORPORATION" : clip.make;
-    opts.model = clip.model.empty() ? "NIKON Z 8" : clip.model;
+    const bool is_sony = (clip.major_brand == "ARW") ||
+                         (to_lower_copy(clip.make).find("sony") != std::string::npos);
+    opts.make = clip.make.empty() ? (is_sony ? "SONY" : "NIKON CORPORATION") : clip.make;
+    opts.model = clip.model.empty() ? (is_sony ? "ILCE-7M5" : "NIKON Z 8") : clip.model;
     opts.unique_model = opts.model;
     opts.software = clip.firmware_version.empty() ? "nev2bayer" : clip.firmware_version;
     opts.datetime = clip.datetime;
@@ -192,7 +195,76 @@ void build_dng_options_from_clip_and_frame(
         opts.as_shot_neutral[1] = 1.0;
         opts.as_shot_neutral[2] = 0.827337;
     }
-    lookup_nikon_d65_colormatrix(opts.model, opts.color_matrix1);
+    lookup_camera_d65_colormatrix(opts.make, opts.model, opts.color_matrix1);
+}
+
+} // namespace
+
+bool lookup_nikon_d65_colormatrix(const std::string& model, double out_cm[9]) {
+    static const CameraMatrixEntry kTable[] = {
+        {"z 8",   { 1.1423, -0.4564, -0.1123, -0.4816, 1.2895, 0.2119, -0.0210, 0.1061, 0.7282}},
+        {"z 9",   { 1.3389, -0.6049, -0.1441, -0.4544, 1.2757, 0.1969,  0.0229, 0.0498, 0.7390}},
+        {"z6_3",  { 1.1206, -0.4286, -0.0941, -0.4879, 1.2847, 0.2251, -0.0745, 0.1654, 0.7374}},
+        {"zr",    { 1.1206, -0.4286, -0.0941, -0.4879, 1.2847, 0.2251, -0.0745, 0.1654, 0.7374}},
+        {"z f",   { 1.1607, -0.4491, -0.0977, -0.4522, 1.2460, 0.2304, -0.0458, 0.1519, 0.7616}},
+        {"z50_2", { 1.1640, -0.4829, -0.1079, -0.5107, 1.3006, 0.2325, -0.0972, 0.1711, 0.7380}},
+        {"z5_2",  { 0.9874, -0.3784, -0.0823, -0.4728, 1.2673, 0.2286, -0.0648, 0.1513, 0.6375}},
+    };
+    std::string lm = to_lower_copy(model);
+    for (const auto& ent : kTable) {
+        if (lm.find(ent.key) != std::string::npos) {
+            std::memcpy(out_cm, ent.cm, sizeof(ent.cm));
+            return true;
+        }
+    }
+    // Fallback to Nikon Z 8 D65 matrix
+    std::memcpy(out_cm, kTable[0].cm, sizeof(kTable[0].cm));
+    return false;
+}
+
+bool lookup_camera_d65_colormatrix(const std::string& make, const std::string& model, double out_cm[9]) {
+    std::string lmake = to_lower_copy(make);
+    std::string lmodel = to_lower_copy(model);
+    if (lmake.find("sony") != std::string::npos ||
+        lmodel.find("ilce-") != std::string::npos ||
+        lmodel.find("ilme-") != std::string::npos ||
+        lmodel.find("zv-e") != std::string::npos) {
+        return lookup_sony_d65_colormatrix(lmodel, out_cm);
+    }
+    return lookup_nikon_d65_colormatrix(model, out_cm);
+}
+
+void build_dng_options_from_clip_and_frame(
+    const NevClipInfo& clip,
+    const NevFrameMeta& meta,
+    const TicoRawInfo& jxs,
+    bool apply_active_crop,
+    uint16_t override_orientation,
+    DngWriteOptions& opts) {
+    opts = DngWriteOptions();
+    uint16_t bd = static_cast<uint16_t>(jxs.cdt_depth > 0 ? jxs.cdt_depth : meta.bit_depth);
+    populate_dng_options_common(
+        clip, meta, jxs.width, jxs.height, bd, apply_active_crop, override_orientation, opts);
+    if (!meta.has_black && jxs.offset_16 > 0 && jxs.out_bitdepth >= opts.bit_depth) {
+        uint16_t blk = static_cast<uint16_t>(jxs.offset_16 >> (jxs.out_bitdepth - opts.bit_depth));
+        opts.black[0] = opts.black[1] = opts.black[2] = opts.black[3] = blk;
+    }
+}
+
+void build_dng_options_from_clip_and_frame(
+    const NevClipInfo& clip,
+    const NevFrameMeta& meta,
+    const Arw6Info& arw6,
+    bool apply_active_crop,
+    uint16_t override_orientation,
+    DngWriteOptions& opts) {
+    opts = DngWriteOptions();
+    uint16_t bd = (arw6.bit_depth > 0) ? arw6.bit_depth : meta.bit_depth;
+    if (!meta.has_black) {
+        opts.black[0] = opts.black[1] = opts.black[2] = opts.black[3] = 512;
+    }
+    populate_dng_options_common(
+        clip, meta, arw6.width, arw6.height, bd, apply_active_crop, override_orientation, opts);
 }
 
 bool apply_bayer_crop(
