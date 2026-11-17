@@ -241,11 +241,57 @@ struct Arw6Info {
     std::vector<Arw6TileInfo> tiles;
 };
 
+struct WaveletQuantProfile {
+    static constexpr uint32_t kNltSlopeLutSize = 256u;
+    static constexpr uint32_t kScaleBins = 6u;
+    static constexpr uint32_t kWalsh16Bins = 16u;
+
+    bool available = false;
+    CodecFamily codec = CodecFamily::Unknown;
+    bool nlt_enabled = false;
+    uint16_t raw_bit_depth = 14u;
+    uint16_t code_bit_depth = 16u;
+    uint32_t nlt_raw_white_adu = 16383u;
+    uint32_t nlt_code_max = 65535u;
+
+    float black_ref = 0.0f;
+    float white_ref = 16383.0f;
+
+    // Spatial row granularity in output Bayer rows (e.g. 4 for TicoRAW, 8 for ARW6).
+    uint32_t row_step = 4u;
+    uint32_t num_rows = 0u;
+
+    // Normalized code-domain RMS quantization std per row block; multiply by
+    // nlt_slope_lut(I) for linear [0, 1] normalized quantization std.
+    std::vector<float> q_luma_code_row;
+    std::vector<float> q_chroma_code_row;
+
+    float mean_luma_code_std = 0.0f;
+    float mean_chroma_code_std = 0.0f;
+    float max_luma_code_std = 0.0f;
+    float max_chroma_code_std = 0.0f;
+
+    // Normalized spectral power across [DC/LL, coarse..fine, Nyquist/G_H] (sum == 1 when active).
+    float luma_scale_psd[kScaleBins] = {};
+    float chroma_scale_psd[kScaleBins] = {};
+
+    // Normalized 4x4 Walsh-Hadamard spatial spectrum (white noise == 1.0 in every bin, sum == 16).
+    float walsh16_luma_norm[kWalsh16Bins] = {};
+    float walsh16_chroma_norm[kWalsh16Bins] = {};
+
+    // Calibrated inverse-NLT derivative multiplier indexed by normalized linear intensity I in [0, 1].
+    float nlt_slope_lut[kNltSlopeLutSize] = {};
+
+    // Codec-intrinsic d(ADU)/du indexed by normalized raw ADU in [0, 1] = raw / nlt_raw_white_adu.
+    float nlt_dadu_du_raw[kNltSlopeLutSize] = {};
+};
+
 struct DecodeOptions {
     int num_threads = 0;          // 0 = use session default
     bool apply_active_crop = false;
     bool has_roi = false;
     uint32_t roi[4] = {0, 0, 0, 0}; // [x, y, width, height] in coded pixels
+    bool want_quant_profile = false;
 };
 
 struct DecodedFrameInfo {
@@ -262,6 +308,7 @@ struct DecodedFrameInfo {
     NevFrameMeta meta;
     bool has_timing = false;
     VideoFrameTiming timing;
+    WaveletQuantProfile quant_profile;
 };
 
 struct DngWriteOptions {
@@ -535,6 +582,18 @@ public:
 private:
     std::unique_ptr<Impl> impl_;
 };
+
+// Recalibrate nlt_slope_lut inside an extracted WaveletQuantProfile to caller linear [black, white].
+NIJINWVDC_API void recalibrate_quant_profile_range(
+    WaveletQuantProfile& profile,
+    float black_level,
+    float white_level);
+
+// Vertical crop/slice of per-row quantization arrays after active-crop or ROI extraction.
+NIJINWVDC_API bool crop_quant_profile_vertical(
+    WaveletQuantProfile& profile,
+    uint32_t offset_y,
+    uint32_t output_h);
 
 } // namespace nijinwvdc
 

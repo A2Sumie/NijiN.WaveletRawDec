@@ -18,6 +18,7 @@ struct nijin_reader_s {
 
 struct nijin_decoder_s {
     nijinwvdc::DecoderSession cpp;
+    nijinwvdc::WaveletQuantProfile last_quant;
     std::string last_err;
 
     explicit nijin_decoder_s(int32_t threads) : cpp(threads) {}
@@ -105,6 +106,7 @@ void fill_c_decoded_info(const nijinwvdc::DecodedFrameInfo& src, nijin_decoded_i
     dst->bit_depth = src.bit_depth;
     std::memcpy(dst->cfa_pattern, src.cfa_pattern, 4);
     dst->has_meta = src.has_meta ? 1u : 0u;
+    dst->has_quant_profile = src.quant_profile.available ? 1u : 0u;
     if (src.has_meta) {
         fill_c_frame_meta(src.meta, src.has_timing ? &src.timing : nullptr, &dst->meta);
     } else if (src.has_timing) {
@@ -125,9 +127,40 @@ nijinwvdc::DecodeOptions to_cpp_decode_options(const nijin_decode_options_t* opt
         out.num_threads = opts->num_threads;
         out.apply_active_crop = (opts->apply_active_crop != 0);
         out.has_roi = (opts->has_roi != 0);
+        out.want_quant_profile = (opts->want_quant_profile != 0);
         std::memcpy(out.roi, opts->roi, sizeof(out.roi));
     }
     return out;
+}
+
+void fill_c_quant_summary(
+    const nijinwvdc::WaveletQuantProfile& src,
+    nijin_wavelet_quant_summary_t* dst) {
+    if (!dst) {
+        return;
+    }
+    std::memset(dst, 0, sizeof(*dst));
+    dst->struct_size = static_cast<uint32_t>(sizeof(*dst));
+    dst->available = src.available ? 1u : 0u;
+    dst->nlt_enabled = src.nlt_enabled ? 1u : 0u;
+    dst->raw_bit_depth = src.raw_bit_depth;
+    dst->code_bit_depth = src.code_bit_depth;
+    dst->codec = static_cast<uint32_t>(src.codec);
+    dst->nlt_raw_white_adu = src.nlt_raw_white_adu;
+    dst->nlt_code_max = src.nlt_code_max;
+    dst->row_step = src.row_step;
+    dst->num_rows = src.num_rows;
+    dst->black_ref = src.black_ref;
+    dst->white_ref = src.white_ref;
+    dst->mean_luma_code_std = src.mean_luma_code_std;
+    dst->mean_chroma_code_std = src.mean_chroma_code_std;
+    dst->max_luma_code_std = src.max_luma_code_std;
+    dst->max_chroma_code_std = src.max_chroma_code_std;
+    std::memcpy(dst->luma_scale_psd, src.luma_scale_psd, sizeof(dst->luma_scale_psd));
+    std::memcpy(dst->chroma_scale_psd, src.chroma_scale_psd, sizeof(dst->chroma_scale_psd));
+    std::memcpy(dst->walsh16_luma_norm, src.walsh16_luma_norm, sizeof(dst->walsh16_luma_norm));
+    std::memcpy(dst->walsh16_chroma_norm, src.walsh16_chroma_norm, sizeof(dst->walsh16_chroma_norm));
+    std::memcpy(dst->nlt_slope_lut, src.nlt_slope_lut, sizeof(dst->nlt_slope_lut));
 }
 
 nijin_status_t to_cpp_dng_options(const nijin_dng_options_t* opts, nijinwvdc::DngWriteOptions& out) {
@@ -580,10 +613,14 @@ nijin_status_t nijin_decoder_decode_codestream(
         if (!decoder->cpp.decode_codestream_into(
                 data, len, cpp_opts, dst, dst_row_stride_bytes, dst_height_capacity,
                 info, decoder->last_err)) {
+            decoder->last_quant = nijinwvdc::WaveletQuantProfile();
             return (decoder->last_err.find("too small") != std::string::npos)
                        ? NIJIN_ERR_BUFFER_TOO_SMALL
                        : NIJIN_ERR_DECODE;
         }
+        decoder->last_quant = info.quant_profile.available
+                                  ? std::move(info.quant_profile)
+                                  : nijinwvdc::WaveletQuantProfile();
         if (out_info) {
             fill_c_decoded_info(info, out_info);
         }
@@ -616,10 +653,14 @@ nijin_status_t nijin_decoder_decode_frame(
         if (!decoder->cpp.decode_frame_into(
                 reader->cpp, frame_index, cpp_opts, dst, dst_row_stride_bytes, dst_height_capacity,
                 info, decoder->last_err)) {
+            decoder->last_quant = nijinwvdc::WaveletQuantProfile();
             return (decoder->last_err.find("too small") != std::string::npos)
                        ? NIJIN_ERR_BUFFER_TOO_SMALL
                        : NIJIN_ERR_DECODE;
         }
+        decoder->last_quant = info.quant_profile.available
+                                  ? std::move(info.quant_profile)
+                                  : nijinwvdc::WaveletQuantProfile();
         if (out_info) {
             fill_c_decoded_info(info, out_info);
         }
@@ -838,6 +879,63 @@ nijin_status_t nijin_write_dng_file(
         write_err_buf(err_buf, err_buf_cap, "internal exception");
         return NIJIN_ERR_INTERNAL;
     }
+}
+
+void nijin_wavelet_quant_summary_init(nijin_wavelet_quant_summary_t* summary) {
+    if (!summary) {
+        return;
+    }
+    std::memset(summary, 0, sizeof(*summary));
+    summary->struct_size = static_cast<uint32_t>(sizeof(*summary));
+}
+
+nijin_status_t nijin_decoder_get_last_quant_profile(
+    const nijin_decoder_t* decoder,
+    nijin_wavelet_quant_summary_t* out_summary,
+    float* out_luma_rows,
+    float* out_chroma_rows,
+    uint32_t row_capacity) {
+    if (!decoder || !out_summary) {
+        return NIJIN_ERR_INVALID_ARG;
+    }
+    if (out_summary->struct_size != 0 &&
+        out_summary->struct_size < sizeof(nijin_wavelet_quant_summary_t)) {
+        return NIJIN_ERR_INVALID_ARG;
+    }
+    fill_c_quant_summary(decoder->last_quant, out_summary);
+    if (!decoder->last_quant.available) {
+        return NIJIN_OK;
+    }
+    const uint32_t nrows = static_cast<uint32_t>(decoder->last_quant.q_luma_code_row.size());
+    if ((out_luma_rows || out_chroma_rows) && row_capacity < nrows) {
+        return NIJIN_ERR_BUFFER_TOO_SMALL;
+    }
+    if (out_luma_rows && nrows > 0u) {
+        std::memcpy(out_luma_rows, decoder->last_quant.q_luma_code_row.data(), nrows * sizeof(float));
+    }
+    if (out_chroma_rows && nrows > 0u) {
+        std::memcpy(out_chroma_rows, decoder->last_quant.q_chroma_code_row.data(), nrows * sizeof(float));
+    }
+    return NIJIN_OK;
+}
+
+nijin_status_t nijin_decoder_recalibrate_last_quant_range(
+    nijin_decoder_t* decoder,
+    float black_level,
+    float white_level,
+    nijin_wavelet_quant_summary_t* out_summary) {
+    if (!decoder || !decoder->last_quant.available || white_level <= black_level) {
+        return NIJIN_ERR_INVALID_ARG;
+    }
+    nijinwvdc::recalibrate_quant_profile_range(decoder->last_quant, black_level, white_level);
+    if (out_summary) {
+        if (out_summary->struct_size != 0 &&
+            out_summary->struct_size < sizeof(nijin_wavelet_quant_summary_t)) {
+            return NIJIN_ERR_INVALID_ARG;
+        }
+        fill_c_quant_summary(decoder->last_quant, out_summary);
+    }
+    return NIJIN_OK;
 }
 
 } // extern "C"

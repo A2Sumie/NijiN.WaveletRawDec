@@ -31,7 +31,8 @@ bool decode_ticoraw_bayer_strided(
     TicoRawInfo& info_out,
     std::string& err,
     WorkerPool* external_pool,
-    TicoArena* external_arena);
+    TicoArena* external_arena,
+    WaveletQuantProfile* quant_out = nullptr);
 
 bool decode_arw6_bayer_strided(
     const uint8_t* strip_data,
@@ -43,7 +44,8 @@ bool decode_arw6_bayer_strided(
     Arw6Info& info_out,
     std::string& err,
     WorkerPool* external_pool,
-    Arw6Arena* external_arena);
+    Arw6Arena* external_arena,
+    WaveletQuantProfile* quant_out = nullptr);
 
 bool decode_arw6_tile_strided(
     const uint8_t* cs_data,
@@ -59,7 +61,8 @@ bool decode_arw6_tile_strided(
     Arw6Info& tile_info_out,
     std::string& err,
     WorkerPool* external_pool,
-    Arw6Arena* external_arena);
+    Arw6Arena* external_arena,
+    WaveletQuantProfile* quant_out = nullptr);
 
 } // namespace detail
 } // namespace nijinwvdc

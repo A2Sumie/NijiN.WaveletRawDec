@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "../include/nijinWVDC.h"
 #include "codec_internal.h"
+#include "quant_model_internal.h"
 #include "simd_platform.h"
 #include "worker_pool.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <mutex>
 #include <thread>
@@ -2033,6 +2035,161 @@ inline void reconstruct_bayer_row(
     }
 }
 
+struct Arw6QuantAccum {
+    uint32_t full_w = 0u;
+    uint32_t full_h = 0u;
+    uint32_t row_step = 8u;
+    std::vector<double> luma_var_row;
+    std::vector<double> chroma_var_row;
+    double luma_scale[6] = {};
+    double chroma_scale[6] = {};
+    double luma_w16[16] = {};
+    double chroma_w16[16] = {};
+
+    void init(uint32_t fw, uint32_t fh) {
+        full_w = fw;
+        full_h = fh;
+        row_step = 8u;
+        const size_t nbins = (static_cast<size_t>(fh) + row_step - 1u) / row_step;
+        luma_var_row.assign(nbins, 0.0);
+        chroma_var_row.assign(nbins, 0.0);
+    }
+
+    void accumulate_tile(
+        uint32_t tile_x,
+        uint32_t tile_y,
+        uint32_t tile_w,
+        uint32_t tile_h,
+        const Arw6Info& info,
+        const std::array<ComponentStream, 4>& comps,
+        const std::array<std::array<ParsedResStream, 4>, 4>& parsed_streams) {
+        (void)tile_x;
+        if (full_w == 0u || full_h == 0u || tile_w == 0u || tile_h == 0u ||
+            info.decomp_levels != 3 || info.internal_depth != 12) {
+            return;
+        }
+        const detail::Arw6SubbandWeightTable& wtbl = detail::get_arw6_subband_weights();
+        const double w_frac = static_cast<double>(tile_w) / static_cast<double>(full_w);
+        const uint32_t tile_nbins = (tile_h + row_step - 1u) / row_step;
+        std::vector<double> t_luma(tile_nbins, 0.0);
+        std::vector<double> t_chroma(tile_nbins, 0.0);
+
+        for (int c = 0; c < 4; ++c) {
+            const ComponentStream& comp = comps[static_cast<size_t>(c)];
+            const int max_r = (c == 3) ? 0 : 3;
+            for (int r = 0; r <= max_r; ++r) {
+                const ParsedResStream& prs = parsed_streams[static_cast<size_t>(c)][static_cast<size_t>(r)];
+                const size_t n_chunks = prs.chunks.size();
+                if (n_chunks == 0u) {
+                    continue;
+                }
+                const int32_t crows = (r == 0) ? ((c == 3) ? 8 : 1) : (1 << (r - 1));
+                const int32_t sb_step = (c == 3) ? 1 : (1 << (3 - r + ((r == 0) ? 0 : 1)));
+                const int b0 = (r == 0) ? 0 : 1;
+                const int b1 = (r == 0) ? 0 : 3;
+                const SubbandBox& sb = comp.res[static_cast<size_t>(r)].sb[static_cast<size_t>(b0)];
+                if (sb.w <= 0 || sb.h <= 0) {
+                    continue;
+                }
+
+                for (size_t ci = 0; ci < n_chunks; ++ci) {
+                    const ChunkMeta& cm = prs.chunks[ci];
+                    int32_t ys0 = sb.chunk_y_off + crows * static_cast<int32_t>(ci);
+                    int32_t ys1 = ys0 + crows;
+                    int32_t by0 = 2 * (ys0 * sb_step - comp.y0);
+                    int32_t by1 = 2 * (ys1 * sb_step - comp.y0);
+                    if (ci == 0u && by0 > 0) by0 = 0;
+                    if (ci + 1u == n_chunks && by1 < static_cast<int32_t>(tile_h)) {
+                        by1 = static_cast<int32_t>(tile_h);
+                    }
+                    by0 = std::max<int32_t>(0, by0);
+                    by1 = std::min<int32_t>(static_cast<int32_t>(tile_h), by1);
+                    if (by1 <= by0) {
+                        continue;
+                    }
+                    const double area_frac = (static_cast<double>(by1 - by0) / static_cast<double>(full_h)) * w_frac;
+
+                    for (int b = b0; b <= b1; ++b) {
+                        const int s_idx = (r == 0) ? 0 : (b - 1);
+                        const uint8_t shift = cm.shift[s_idx];
+                        if (shift == 0u) {
+                            continue;
+                        }
+                        const double step = std::ldexp(1.0, static_cast<int>(shift));
+                        const double var_coeff = (step * step) / 12.0;
+                        const detail::SubbandSynthWeight& sw = wtbl.w[c][r][b];
+                        const double dl = var_coeff * sw.luma_gain;
+                        const double dc = var_coeff * sw.chroma_gain;
+
+                        const uint32_t bin0 = static_cast<uint32_t>(by0) / row_step;
+                        const uint32_t bin1 = static_cast<uint32_t>(by1 - 1) / row_step;
+                        for (uint32_t bi = bin0; bi <= bin1 && bi < tile_nbins; ++bi) {
+                            const int32_t r_a = static_cast<int32_t>(bi * row_step);
+                            const int32_t r_b = std::min<int32_t>(static_cast<int32_t>(tile_h), r_a + static_cast<int32_t>(row_step));
+                            const int32_t ov = std::min(by1, r_b) - std::max(by0, r_a);
+                            if (ov > 0) {
+                                const double frac = static_cast<double>(ov) / static_cast<double>(std::max<int32_t>(1, r_b - r_a));
+                                t_luma[bi] += dl * frac;
+                                t_chroma[bi] += dc * frac;
+                            }
+                        }
+
+                        luma_scale[sw.scale_bin] += dl * area_frac;
+                        chroma_scale[sw.scale_bin] += dc * area_frac;
+                        for (int k = 0; k < 16; ++k) {
+                            luma_w16[k] += var_coeff * sw.walsh16_luma[k] * area_frac;
+                            chroma_w16[k] += var_coeff * sw.walsh16_chroma[k] * area_frac;
+                        }
+                    }
+                }
+            }
+        }
+
+        const uint32_t g_bin_off = tile_y / row_step;
+        for (uint32_t bi = 0; bi < tile_nbins; ++bi) {
+            const uint32_t gi = g_bin_off + bi;
+            if (gi < luma_var_row.size()) {
+                luma_var_row[gi] += t_luma[bi] * w_frac;
+                chroma_var_row[gi] += t_chroma[bi] * w_frac;
+            }
+        }
+    }
+
+    void finalize(const Arw6Info& info, WaveletQuantProfile& out) const {
+        out = WaveletQuantProfile();
+        if (info.decomp_levels != 3 || info.internal_depth != 12 || luma_var_row.empty()) {
+            return;
+        }
+        out.available = true;
+        out.codec = CodecFamily::Arw6;
+        out.nlt_enabled = true;
+        out.raw_bit_depth = info.bit_depth;
+        out.code_bit_depth = info.internal_depth;
+        const uint32_t raw_white = (info.bit_depth > 0 && info.bit_depth <= 16)
+                                       ? ((1u << info.bit_depth) - 1u)
+                                       : 16383u;
+        out.nlt_raw_white_adu = raw_white;
+        out.nlt_code_max = (1u << info.internal_depth) - 1u;
+        out.row_step = row_step;
+
+        const double u_full = static_cast<double>(1u << info.internal_depth);
+        const double inv_u = 1.0 / std::max(1.0, u_full);
+        const size_t n = luma_var_row.size();
+        out.q_luma_code_row.resize(n);
+        out.q_chroma_code_row.resize(n);
+        for (size_t i = 0; i < n; ++i) {
+            out.q_luma_code_row[i] = static_cast<float>(std::sqrt(std::max(0.0, luma_var_row[i])) * inv_u);
+            out.q_chroma_code_row[i] = static_cast<float>(std::sqrt(std::max(0.0, chroma_var_row[i])) * inv_u);
+        }
+
+        const uint16_t* const lut14 = get_arw6_nlt_lut14();
+        detail::compute_dadu_du_raw_from_lut(lut14, 4096, 4, raw_white, out.nlt_dadu_du_raw);
+        detail::finalize_quant_profile_stats(out);
+        detail::normalize_spectra(luma_scale, chroma_scale, luma_w16, chroma_w16, out);
+        recalibrate_quant_profile_range(out, 0.0f, static_cast<float>(raw_white));
+    }
+};
+
 bool decode_arw6_codestream_internal(
     const uint8_t* cs,
     size_t cs_len,
@@ -2046,7 +2203,8 @@ bool decode_arw6_codestream_internal(
     Arw6Info& info,
     std::string& err,
     detail::WorkerPool* external_pool,
-    Arw6ArenaImpl* external_arena) {
+    Arw6ArenaImpl* external_arena,
+    Arw6QuantAccum* quant_accum = nullptr) {
     if (!probe_arw6_codestream(cs, cs_len, info, err)) {
         return false;
     }
@@ -2130,6 +2288,10 @@ bool decode_arw6_codestream_internal(
                 tasks.push_back(t);
             }
         }
+    }
+
+    if (quant_accum != nullptr) {
+        quant_accum->accumulate_tile(tile_x, tile_y, w, h, info, comps, parsed_streams);
     }
 
     int workers = detail::resolve_worker_count(num_threads);
@@ -2437,7 +2599,8 @@ bool decode_arw6_tile_strided(
     Arw6Info& tile_info_out,
     std::string& err,
     WorkerPool* external_pool,
-    Arw6Arena* external_arena) {
+    Arw6Arena* external_arena,
+    WaveletQuantProfile* quant_out) {
     if (!cs_data || cs_len < 16) {
         err = "Empty ARW6 tile codestream";
         return false;
@@ -2452,10 +2615,21 @@ bool decode_arw6_tile_strided(
         err = "Destination Bayer buffer too small for ARW6 tile";
         return false;
     }
-    return decode_arw6_codestream_internal(
-        cs_data, cs_len, num_threads, tile_x, tile_y, tw, th,
-        dst, dst_stride_u16, tile_info_out, err,
-        external_pool, reinterpret_cast<Arw6ArenaImpl*>(external_arena));
+    Arw6QuantAccum qacc;
+    if (quant_out != nullptr) {
+        qacc.init(tw, th);
+    }
+    if (!decode_arw6_codestream_internal(
+            cs_data, cs_len, num_threads, tile_x, tile_y, tw, th,
+            dst, dst_stride_u16, tile_info_out, err,
+            external_pool, reinterpret_cast<Arw6ArenaImpl*>(external_arena),
+            quant_out ? &qacc : nullptr)) {
+        return false;
+    }
+    if (quant_out != nullptr) {
+        qacc.finalize(tile_info_out, *quant_out);
+    }
+    return true;
 }
 
 bool decode_arw6_bayer_strided(
@@ -2468,7 +2642,8 @@ bool decode_arw6_bayer_strided(
     Arw6Info& info_out,
     std::string& err,
     WorkerPool* external_pool,
-    Arw6Arena* external_arena) {
+    Arw6Arena* external_arena,
+    WaveletQuantProfile* quant_out) {
     if (!probe_arw6_strip(strip_data, strip_len, info_out, err)) {
         return false;
     }
@@ -2506,6 +2681,10 @@ bool decode_arw6_bayer_strided(
                         static_cast<size_t>(info_out.width) * sizeof(uint16_t));
         }
     }
+    Arw6QuantAccum qacc;
+    if (quant_out != nullptr) {
+        qacc.init(info_out.width, info_out.height);
+    }
     Arw6ArenaImpl* arena_ptr = reinterpret_cast<Arw6ArenaImpl*>(external_arena);
     for (size_t i = 0; i < info_out.tiles.size(); ++i) {
         const Arw6TileInfo& ti = info_out.tiles[i];
@@ -2513,9 +2692,13 @@ bool decode_arw6_bayer_strided(
         if (!decode_arw6_codestream_internal(
                 strip_data + ti.rel_offset, ti.data_size, num_threads,
                 ti.x, ti.y, info_out.width, info_out.height,
-                dst, dst_stride_u16, tinfo, err, external_pool, arena_ptr)) {
+                dst, dst_stride_u16, tinfo, err, external_pool, arena_ptr,
+                quant_out ? &qacc : nullptr)) {
             return false;
         }
+    }
+    if (quant_out != nullptr) {
+        qacc.finalize(info_out, *quant_out);
     }
     return true;
 }

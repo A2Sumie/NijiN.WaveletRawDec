@@ -6,12 +6,14 @@
 
 #include "../include/nijinWVDC.h"
 #include "codec_internal.h"
+#include "quant_model_internal.h"
 #include "simd_platform.h"
 #include "worker_pool.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -2088,7 +2090,8 @@ bool decode_ticoraw_bayer_strided(
     TicoRawInfo& info_out,
     std::string& err,
     WorkerPool* external_pool,
-    TicoArena* external_arena) {
+    TicoArena* external_arena,
+    WaveletQuantProfile* quant_out) {
     ParsedR0Header hdr;
     if (!parse_r0_header(data, len, hdr, err)) {
         return false;
@@ -2386,6 +2389,96 @@ bool decode_ticoraw_bayer_strided(
     });
 
     fill_info_from_parsed(hdr, geom, info_out);
+
+    if (quant_out != nullptr) {
+        WaveletQuantProfile qp_prof;
+        qp_prof.available = true;
+        qp_prof.codec = CodecFamily::TicoRaw;
+        qp_prof.nlt_enabled = hdr.gamma_enabled;
+        qp_prof.raw_bit_depth = static_cast<uint16_t>(hdr.in_bitdepth);
+        qp_prof.code_bit_depth = static_cast<uint16_t>(input_scale);
+        qp_prof.nlt_raw_white_adu = static_cast<uint32_t>(max_value);
+        qp_prof.nlt_code_max = (1u << static_cast<unsigned>(input_scale)) - 1u;
+        qp_prof.row_step = 4u;
+
+        const uint32_t num_row_blocks = (static_cast<uint32_t>(geom.full_h) + 3u) / 4u;
+        qp_prof.q_luma_code_row.assign(num_row_blocks, 0.0f);
+        qp_prof.q_chroma_code_row.assign(num_row_blocks, 0.0f);
+
+        const detail::TicoSubbandWeightTable& wtbl = detail::get_ticoraw_subband_weights();
+        const double u_full = static_cast<double>(1u << static_cast<unsigned>(input_scale));
+        const double inv_u_full = 1.0 / std::max(1.0, u_full);
+
+        std::vector<double> raw_luma_var(num_row_blocks, 0.0);
+        std::vector<double> raw_chroma_var(num_row_blocks, 0.0);
+        double luma_scale[6] = {};
+        double chroma_scale[6] = {};
+        double luma_w16[16] = {};
+        double chroma_w16[16] = {};
+
+        const int p_eval_end = std::min(geom.n_prec, static_cast<int>(num_row_blocks));
+        for (int p_idx = 0; p_idx < p_eval_end; ++p_idx) {
+            const uint8_t* phdr = data + prec_spans[static_cast<size_t>(p_idx)].offset;
+            const uint8_t qp = phdr[3];
+            const uint8_t rp = phdr[4];
+            double pv_luma = 0.0;
+            double pv_chroma = 0.0;
+            for (int j = 0; j < kNumSubbands; ++j) {
+                const int sb = geom.sp_sb_order[j];
+                const int v = static_cast<int>(qp) - static_cast<int>(geom.sb_gains[sb]);
+                int gtli = 0;
+                if (v > 0) {
+                    const int refine = (static_cast<int>(geom.sb_prios[sb]) < static_cast<int>(rp)) ? 1 : 0;
+                    gtli = std::min(v - refine, 15);
+                }
+                const int eff_shift = gtli + static_cast<int>(hdr.fq);
+                if (eff_shift <= 0) {
+                    continue;
+                }
+                const double step_u = std::ldexp(1.0, eff_shift);
+                const double var_u = (step_u * step_u) / 12.0;
+                const detail::SubbandSynthWeight& sw = wtbl.by_sb[static_cast<size_t>(sb)];
+                const double dl = var_u * sw.luma_gain;
+                const double dc = var_u * sw.chroma_gain;
+                pv_luma += dl;
+                pv_chroma += dc;
+                luma_scale[sw.scale_bin] += dl;
+                chroma_scale[sw.scale_bin] += dc;
+                for (int k = 0; k < 16; ++k) {
+                    luma_w16[k] += var_u * sw.walsh16_luma[k];
+                    chroma_w16[k] += var_u * sw.walsh16_chroma[k];
+                }
+            }
+            raw_luma_var[static_cast<size_t>(p_idx)] = pv_luma;
+            raw_chroma_var[static_cast<size_t>(p_idx)] = pv_chroma;
+        }
+        // Vertical 5/3 IDWT cross-precinct coupling weights [0.125, 0.75, 0.125].
+        for (uint32_t i = 0; i < num_row_blocks; ++i) {
+            const uint32_t ip = (i > 0u) ? (i - 1u) : 0u;
+            const uint32_t in = (i + 1u < num_row_blocks) ? (i + 1u) : (num_row_blocks - 1u);
+            const double vl = 0.125 * raw_luma_var[ip] + 0.75 * raw_luma_var[i] + 0.125 * raw_luma_var[in];
+            const double vc = 0.125 * raw_chroma_var[ip] + 0.75 * raw_chroma_var[i] + 0.125 * raw_chroma_var[in];
+            qp_prof.q_luma_code_row[i] = static_cast<float>(std::sqrt(std::max(0.0, vl)) * inv_u_full);
+            qp_prof.q_chroma_code_row[i] = static_cast<float>(std::sqrt(std::max(0.0, vc)) * inv_u_full);
+        }
+
+        if (hdr.gamma_enabled && baked_lut != nullptr) {
+            detail::compute_dadu_du_raw_from_lut(
+                baked_lut, lut_max_idx + 1, 24,
+                static_cast<uint32_t>(max_value), qp_prof.nlt_dadu_du_raw);
+        } else {
+            const float lin_slope = std::ldexp(1.0f, -scale);
+            std::fill(qp_prof.nlt_dadu_du_raw,
+                      qp_prof.nlt_dadu_du_raw + WaveletQuantProfile::kNltSlopeLutSize,
+                      lin_slope);
+        }
+
+        detail::finalize_quant_profile_stats(qp_prof);
+        detail::normalize_spectra(luma_scale, chroma_scale, luma_w16, chroma_w16, qp_prof);
+        recalibrate_quant_profile_range(qp_prof, 0.0f, static_cast<float>(max_value));
+        *quant_out = std::move(qp_prof);
+    }
+
     return true;
 }
 

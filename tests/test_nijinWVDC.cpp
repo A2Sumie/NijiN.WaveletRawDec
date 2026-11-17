@@ -810,6 +810,7 @@ void test_session_reader_postproc_and_threading() {
 
     nijinwvdc::DecodeOptions dopts_roi;
     dopts_roi.has_roi = true;
+    dopts_roi.want_quant_profile = true;
     dopts_roi.roi[0] = 3; dopts_roi.roi[1] = 3; dopts_roi.roi[2] = 22; dopts_roi.roi[3] = 20;
     std::vector<uint16_t> b_roi, b_roi_ref;
     nijinwvdc::DecodedFrameInfo di_roi;
@@ -819,6 +820,22 @@ void test_session_reader_postproc_and_threading() {
     CHECK(di_roi.output_width == 22u && di_roi.output_height == 20u);
     CHECK(std::memcmp(di_roi.cfa_pattern, ref_cfa, 4) == 0);
     CHECK(b_roi == b_roi_ref);
+    CHECK(di_roi.quant_profile.available);
+    CHECK(di_roi.quant_profile.codec == nijinwvdc::CodecFamily::Arw6);
+    CHECK(di_roi.quant_profile.row_step == 8u);
+    CHECK(di_roi.quant_profile.num_rows == 3u);
+    {
+        float wsum = 0.0f, psum = 0.0f;
+        for (int k = 0; k < 16; ++k) wsum += di_roi.quant_profile.walsh16_luma_norm[k];
+        for (int k = 0; k < 6; ++k) psum += di_roi.quant_profile.luma_scale_psd[k];
+        CHECK(wsum > 15.5f && wsum < 16.5f);
+        CHECK(psum > 0.99f && psum < 1.01f);
+        CHECK(di_roi.quant_profile.nlt_slope_lut[240] > di_roi.quant_profile.nlt_slope_lut[4]);
+        auto qp_cal = di_roi.quant_profile;
+        nijinwvdc::recalibrate_quant_profile_range(qp_cal, 512.0f, 16383.0f);
+        CHECK(qp_cal.black_ref == 512.0f && qp_cal.white_ref == 16383.0f);
+        CHECK(qp_cal.nlt_slope_lut[240] > qp_cal.nlt_slope_lut[4]);
+    }
 
     // Concurrent multi-thread decode sharing one MediaReader
     std::vector<std::thread> workers;
@@ -1119,10 +1136,21 @@ void test_optional_real_corpus() {
         CHECK(mr.open_file(env_nev, err));
         nijinwvdc::DecoderSession ds;
         nijinwvdc::DecodeOptions dopts_s;
+        dopts_s.want_quant_profile = true;
+        dopts_s.num_threads = 1;
         std::vector<uint16_t> bs;
         nijinwvdc::DecodedFrameInfo ds_info;
         CHECK(ds.decode_frame(mr, 0, dopts_s, bs, ds_info, err));
         CHECK(bs == b1);
+        CHECK(ds_info.quant_profile.available && ds_info.quant_profile.mean_luma_code_std > 0.0f);
+        CHECK(ds_info.quant_profile.nlt_slope_lut[240] > ds_info.quant_profile.nlt_slope_lut[4]);
+        nijinwvdc::DecodeOptions dopts_m = dopts_s;
+        dopts_m.num_threads = 4;
+        nijinwvdc::DecodedFrameInfo ds_info4;
+        std::vector<uint16_t> bs4;
+        CHECK(ds.decode_frame(mr, 0, dopts_m, bs4, ds_info4, err));
+        CHECK(ds_info4.quant_profile.q_luma_code_row == ds_info.quant_profile.q_luma_code_row);
+        CHECK(ds_info4.quant_profile.mean_luma_code_std == ds_info.quant_profile.mean_luma_code_std);
         const auto ainfo = mr.audio_info();
         if (ainfo.available) {
             std::string wav_p = temp_file_path("nijin_corpus_nev.wav");

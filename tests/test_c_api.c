@@ -251,11 +251,27 @@ int main(void) {
     }
 
     dopts.has_roi = 1u;
+    dopts.want_quant_profile = 1u;
     dopts.roi[0] = 2u; dopts.roi[1] = 2u; dopts.roi[2] = 10u; dopts.roi[3] = 10u;
     C_CHECK(nijin_decoder_decode_frame(dec, reader_cb, 0u, &dopts, roi_bayer, 0u, 10u, &dinfo) == NIJIN_OK);
     C_CHECK(dinfo.output_width == 10u && dinfo.output_height == 10u);
+    C_CHECK(dinfo.has_quant_profile == 1u);
     for (y = 0; y < 10u; ++y) {
         C_CHECK(memcmp(roi_bayer + y * 10u, bayer + (y + 2u) * 16u + 2u, 10u * sizeof(uint16_t)) == 0);
+    }
+    {
+        nijin_wavelet_quant_summary_t qsum;
+        float q_luma[8], q_chroma[8];
+        float walsh_sum = 0.0f;
+        uint32_t k;
+        nijin_wavelet_quant_summary_init(&qsum);
+        C_CHECK(nijin_decoder_get_last_quant_profile(dec, &qsum, q_luma, q_chroma, 1u) == NIJIN_ERR_BUFFER_TOO_SMALL);
+        C_CHECK(nijin_decoder_get_last_quant_profile(dec, &qsum, q_luma, q_chroma, 8u) == NIJIN_OK);
+        C_CHECK(qsum.available == 1u && qsum.codec == NIJIN_CODEC_ARW6 && qsum.row_step == 8u && qsum.num_rows == 2u);
+        for (k = 0; k < 16u; ++k) walsh_sum += qsum.walsh16_luma_norm[k];
+        C_CHECK(walsh_sum > 15.5f && walsh_sum < 16.5f);
+        C_CHECK(nijin_decoder_recalibrate_last_quant_range(dec, 512.0f, 16383.0f, &qsum) == NIJIN_OK);
+        C_CHECK(qsum.black_ref == 512.0f && qsum.nlt_slope_lut[240] > qsum.nlt_slope_lut[4]);
     }
 
     C_CHECK(nijin_split_bayer_planes(bayer, 0u, 16u, 16u, p00, p01, p10, p11, 0u) == NIJIN_OK);

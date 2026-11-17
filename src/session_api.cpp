@@ -996,11 +996,12 @@ struct DecoderSession::Impl {
             dec_h_cap = coded_h;
         }
 
+        WaveletQuantProfile* q_ptr = opts.want_quant_profile ? &info_out.quant_profile : nullptr;
         if (codec == CodecFamily::TicoRaw) {
             TicoRawInfo jxs;
             if (!detail::decode_ticoraw_bayer_strided(
                     data, len, eff_threads, dec_dst, dec_stride_u16, dec_h_cap,
-                    jxs, err, ext_pool, tico_arena)) {
+                    jxs, err, ext_pool, tico_arena, q_ptr)) {
                 return false;
             }
         } else if (single_a000) {
@@ -1008,15 +1009,38 @@ struct DecoderSession::Impl {
             if (!detail::decode_arw6_tile_strided(
                     data, len, eff_threads, 0, 0, coded_w, coded_h,
                     dec_dst, dec_stride_u16, dec_h_cap,
-                    arw, err, ext_pool, arw6_arena)) {
+                    arw, err, ext_pool, arw6_arena, q_ptr)) {
                 return false;
             }
         } else {
             Arw6Info arw;
             if (!detail::decode_arw6_bayer_strided(
                     data, len, eff_threads, dec_dst, dec_stride_u16, dec_h_cap,
-                    arw, err, ext_pool, arw6_arena)) {
+                    arw, err, ext_pool, arw6_arena, q_ptr)) {
                 return false;
+            }
+        }
+
+        if (opts.want_quant_profile && info_out.quant_profile.available) {
+            if (use_crop && (crop_y > 0u || crop_h != coded_h)) {
+                crop_quant_profile_vertical(info_out.quant_profile, crop_y, crop_h);
+            }
+            if (opt_meta != nullptr) {
+                float blk = 0.0f;
+                if (opt_meta->has_black) {
+                    blk = 0.25f * static_cast<float>(
+                        static_cast<uint32_t>(opt_meta->black[0]) + opt_meta->black[1] +
+                        opt_meta->black[2] + opt_meta->black[3]);
+                } else if (codec == CodecFamily::Arw6) {
+                    blk = 512.0f;
+                }
+                const uint32_t raw_white = (info_out.quant_profile.nlt_raw_white_adu > 0u)
+                                               ? info_out.quant_profile.nlt_raw_white_adu
+                                               : ((1u << bd) - 1u);
+                const float wht = (opt_meta->white_level > 0u)
+                                      ? static_cast<float>(opt_meta->white_level)
+                                      : static_cast<float>(raw_white);
+                recalibrate_quant_profile_range(info_out.quant_profile, blk, wht);
             }
         }
 
@@ -1203,6 +1227,89 @@ bool DecoderSession::decode_frame(
     if (reader.get_frame_timing(frame_index, info_out.timing, t_err)) {
         info_out.has_timing = true;
     }
+    return true;
+}
+
+void recalibrate_quant_profile_range(
+    WaveletQuantProfile& profile,
+    float black_level,
+    float white_level) {
+    if (!profile.available) {
+        return;
+    }
+    const float span = std::max(1.0f, white_level - black_level);
+    profile.black_ref = black_level;
+    profile.white_ref = white_level;
+    const float raw_max = static_cast<float>(std::max<uint32_t>(1u, profile.nlt_raw_white_adu));
+    const double u_scale = static_cast<double>(profile.nlt_code_max) + 1.0;
+
+    for (uint32_t i = 0; i < WaveletQuantProfile::kNltSlopeLutSize; ++i) {
+        const float t = static_cast<float>(i) / 255.0f;
+        const float raw = black_level + t * span;
+        const float pos = std::min(std::max(raw / raw_max, 0.0f), 1.0f) * 255.0f;
+        const uint32_t i0 = static_cast<uint32_t>(pos);
+        const uint32_t i1 = (i0 + 1u < WaveletQuantProfile::kNltSlopeLutSize) ? (i0 + 1u) : i0;
+        const float f = pos - static_cast<float>(i0);
+        const double dadu = static_cast<double>((1.0f - f) * profile.nlt_dadu_du_raw[i0] +
+                                                f * profile.nlt_dadu_du_raw[i1]);
+        profile.nlt_slope_lut[i] = static_cast<float>((dadu * u_scale) / static_cast<double>(span));
+    }
+}
+
+bool crop_quant_profile_vertical(
+    WaveletQuantProfile& profile,
+    uint32_t offset_y,
+    uint32_t output_h) {
+    if (!profile.available || profile.q_luma_code_row.empty() ||
+        profile.q_chroma_code_row.size() != profile.q_luma_code_row.size() ||
+        profile.row_step == 0u || output_h == 0u) {
+        return false;
+    }
+    const uint32_t step = profile.row_step;
+    const uint32_t src_n = static_cast<uint32_t>(profile.q_luma_code_row.size());
+    const uint32_t out_n = (output_h + step - 1u) / step;
+    std::vector<float> out_l(out_n, 0.0f);
+    std::vector<float> out_c(out_n, 0.0f);
+
+    for (uint32_t oi = 0; oi < out_n; ++oi) {
+        const uint32_t ya = offset_y + oi * step;
+        const uint32_t yb = std::min(offset_y + output_h, offset_y + (oi + 1u) * step);
+        double sl = 0.0, sc = 0.0;
+        uint32_t wsum = 0u;
+        const uint32_t s0 = std::min(src_n - 1u, ya / step);
+        const uint32_t s1 = std::min(src_n - 1u, (yb - 1u) / step);
+        for (uint32_t si = s0; si <= s1; ++si) {
+            const uint32_t sa = si * step;
+            const uint32_t sb = (si + 1u) * step;
+            const uint32_t ov = (std::min(yb, sb) > std::max(ya, sa))
+                                    ? (std::min(yb, sb) - std::max(ya, sa))
+                                    : 1u;
+            const double ql = profile.q_luma_code_row[si];
+            const double qc = profile.q_chroma_code_row[si];
+            sl += ql * ql * static_cast<double>(ov);
+            sc += qc * qc * static_cast<double>(ov);
+            wsum += ov;
+        }
+        const double inv_w = (wsum > 0u) ? (1.0 / static_cast<double>(wsum)) : 0.0;
+        out_l[oi] = static_cast<float>(std::sqrt(sl * inv_w));
+        out_c[oi] = static_cast<float>(std::sqrt(sc * inv_w));
+    }
+
+    profile.q_luma_code_row.swap(out_l);
+    profile.q_chroma_code_row.swap(out_c);
+    profile.num_rows = out_n;
+    double sum_l = 0.0, sum_c = 0.0;
+    float max_l = 0.0f, max_c = 0.0f;
+    for (uint32_t i = 0; i < out_n; ++i) {
+        sum_l += profile.q_luma_code_row[i];
+        sum_c += profile.q_chroma_code_row[i];
+        if (profile.q_luma_code_row[i] > max_l) max_l = profile.q_luma_code_row[i];
+        if (profile.q_chroma_code_row[i] > max_c) max_c = profile.q_chroma_code_row[i];
+    }
+    profile.mean_luma_code_std = static_cast<float>(sum_l / static_cast<double>(out_n));
+    profile.mean_chroma_code_std = static_cast<float>(sum_c / static_cast<double>(out_n));
+    profile.max_luma_code_std = max_l;
+    profile.max_chroma_code_std = max_c;
     return true;
 }
 

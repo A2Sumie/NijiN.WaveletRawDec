@@ -373,11 +373,59 @@ void print_info_json_prefix(
     std::printf("  \"nef_compression\": %u,\n", m0.nef_compression);
 }
 
+void print_quant_json_block(const nijinwvdc::WaveletQuantProfile& q) {
+    if (!q.available) {
+        return;
+    }
+    const char* cname = (q.codec == nijinwvdc::CodecFamily::TicoRaw) ? "ticoraw"
+                      : (q.codec == nijinwvdc::CodecFamily::Arw6)    ? "arw6"
+                                                                     : "unknown";
+    std::printf(",\n  \"quant_profile\": {\n");
+    std::printf("    \"codec\": \"%s\",\n", cname);
+    std::printf("    \"nlt_enabled\": %s,\n", q.nlt_enabled ? "true" : "false");
+    std::printf("    \"row_step\": %u,\n", q.row_step);
+    std::printf("    \"num_rows\": %u,\n", q.num_rows);
+    std::printf("    \"black_ref\": %.2f,\n", q.black_ref);
+    std::printf("    \"white_ref\": %.2f,\n", q.white_ref);
+    std::printf("    \"mean_luma_code_std\": %.8f,\n", q.mean_luma_code_std);
+    std::printf("    \"mean_chroma_code_std\": %.8f,\n", q.mean_chroma_code_std);
+    std::printf("    \"max_luma_code_std\": %.8f,\n", q.max_luma_code_std);
+    std::printf("    \"max_chroma_code_std\": %.8f,\n", q.max_chroma_code_std);
+    std::printf("    \"nlt_slope_shadow\": %.6f,\n", q.nlt_slope_lut[4]);
+    std::printf("    \"nlt_slope_mid\": %.6f,\n", q.nlt_slope_lut[128]);
+    std::printf("    \"nlt_slope_high\": %.6f,\n", q.nlt_slope_lut[240]);
+    std::printf("    \"luma_scale_psd\": [%.6f, %.6f, %.6f, %.6f, %.6f, %.6f],\n",
+                q.luma_scale_psd[0], q.luma_scale_psd[1], q.luma_scale_psd[2],
+                q.luma_scale_psd[3], q.luma_scale_psd[4], q.luma_scale_psd[5]);
+    std::printf("    \"chroma_scale_psd\": [%.6f, %.6f, %.6f, %.6f, %.6f, %.6f],\n",
+                q.chroma_scale_psd[0], q.chroma_scale_psd[1], q.chroma_scale_psd[2],
+                q.chroma_scale_psd[3], q.chroma_scale_psd[4], q.chroma_scale_psd[5]);
+    std::printf("    \"walsh16_luma_norm\": [");
+    for (int k = 0; k < 16; ++k) {
+        std::printf("%.5f%s", q.walsh16_luma_norm[k], (k < 15) ? ", " : "");
+    }
+    std::printf("],\n    \"walsh16_chroma_norm\": [");
+    for (int k = 0; k < 16; ++k) {
+        std::printf("%.5f%s", q.walsh16_chroma_norm[k], (k < 15) ? ", " : "");
+    }
+    std::printf("]\n  }");
+}
+
+void print_quant_human_line(const nijinwvdc::WaveletQuantProfile& q) {
+    if (!q.available) {
+        return;
+    }
+    std::printf("QuantProfile:  rows=%ux%u, mean_code_std=(Y=%.6f, C=%.6f), nlt_slope=(sh=%.3f, mid=%.3f, hi=%.3f)\n",
+                q.num_rows, q.row_step, q.mean_luma_code_std, q.mean_chroma_code_std,
+                q.nlt_slope_lut[4], q.nlt_slope_lut[128], q.nlt_slope_lut[240]);
+}
+
 void print_info_json(
     const nijinwvdc::NevClipInfo& clip,
     const nijinwvdc::NevFrameMeta& m0,
     const nijinwvdc::VideoFrameTiming& t0,
-    const nijinwvdc::TicoRawInfo& jxs) {
+    const nijinwvdc::TicoRawInfo& jxs,
+    const nijinwvdc::WaveletQuantProfile* qprof = nullptr) {
     print_info_json_prefix(clip, m0, t0, jxs.width, jxs.height);
     std::printf("  \"ticoraw\": {\n");
     std::printf("    \"lcod\": %u,\n", jxs.lcod);
@@ -390,15 +438,19 @@ void print_info_json(
     std::printf("    \"r_flip\": %d,\n", jxs.r_flip);
     std::printf("    \"slices\": %d,\n", jxs.num_slices);
     std::printf("    \"precincts\": %d\n", jxs.num_precincts);
-    std::printf("  }\n");
-    std::printf("}\n");
+    std::printf("  }");
+    if (qprof && qprof->available) {
+        print_quant_json_block(*qprof);
+    }
+    std::printf("\n}\n");
 }
 
 void print_info_arw6_json(
     const nijinwvdc::NevClipInfo& clip,
     const nijinwvdc::NevFrameMeta& m0,
     const nijinwvdc::VideoFrameTiming& t0,
-    const nijinwvdc::Arw6Info& arw6) {
+    const nijinwvdc::Arw6Info& arw6,
+    const nijinwvdc::WaveletQuantProfile* qprof = nullptr) {
     print_info_json_prefix(clip, m0, t0, arw6.width, arw6.height);
     std::printf("  \"arw6\": {\n");
     std::printf("    \"strip_bytes\": %u,\n", arw6.codestream_size);
@@ -408,15 +460,18 @@ void print_info_arw6_json(
     std::printf("    \"decomp_levels\": %u,\n", arw6.decomp_levels);
     std::printf("    \"subsampling_mask\": \"0x%04x\",\n", arw6.subsampling_mask);
     std::printf("    \"sony_raw_file_type\": %u\n", m0.sony_raw_file_type);
-    std::printf("  }\n");
-    std::printf("}\n");
+    std::printf("  }");
+    if (qprof && qprof->available) {
+        print_quant_json_block(*qprof);
+    }
+    std::printf("\n}\n");
 }
 
 void print_usage(const char* prog) {
     std::fprintf(stderr,
         "Usage:\n"
         "  %s --version\n"
-        "  %s --info [--json] <in.NEV | in.NEF | in.ARW | in.jxs>\n"
+        "  %s --info [--json] [--quant] <in.NEV | in.NEF | in.ARW | in.jxs>\n"
         "  %s <in.NEV | in.NEF | in.ARW> [--frame <N|start-end|all>] -o <out.dng|out.raw|dir/> [options]\n"
         "  %s --raw-jxs <in.jxs> -o <out.raw|out.dng> [options]\n"
         "  %s --extract-jxs <in.NEV | in.NEF> [--frame <N>] -o <out.jxs>\n"
@@ -427,6 +482,7 @@ void print_usage(const char* prog) {
         "  --format dng|raw        Force output format when writing to a directory\n"
         "  --active-crop           Crop sensor margins to camera active crop area\n"
         "  --orientation <1..8>    Override TIFF Orientation\n"
+        "  --quant                 Include wavelet quantization profile in --info output\n"
         "  --threads <N>           Worker threads (default: hardware concurrency)\n",
         prog, prog, prog, prog, prog, prog, prog, prog);
 }
@@ -443,6 +499,7 @@ int main(int argc, char** argv) {
     bool extract_thumb = false;
     bool bench_mode = false;
     bool active_crop = false;
+    bool quant_mode = false;
 
     std::string input_path;
     std::string output_path;
@@ -486,6 +543,8 @@ int main(int argc, char** argv) {
             bench_mode = true;
         } else if (std::strcmp(a, "--active-crop") == 0) {
             active_crop = true;
+        } else if (std::strcmp(a, "--quant") == 0) {
+            quant_mode = true;
         } else if (std::strcmp(a, "-i") == 0 || std::strcmp(a, "--input") == 0) {
             input_path = need_val(a);
         } else if (std::strcmp(a, "-o") == 0 || std::strcmp(a, "--output") == 0) {
@@ -529,12 +588,31 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "Error: %s\n", err.c_str());
                 return 1;
             }
+            nijinwvdc::DecodedFrameInfo q_info;
+            if (quant_mode) {
+                nijinwvdc::DecoderSession q_sess(threads);
+                nijinwvdc::DecodeOptions q_opts;
+                q_opts.num_threads = threads;
+                q_opts.want_quant_profile = true;
+                std::vector<uint16_t> q_bayer;
+                if (!q_sess.decode_codestream(cs.data(), cs.size(), q_opts, q_bayer, q_info, err)) {
+                    std::fprintf(stderr, "Error: %s\n", err.c_str());
+                    return 1;
+                }
+            }
             if (json_mode) {
-                std::printf("{\"width\":%u,\"height\":%u,\"lcod\":%u,\"cdt_depth\":%d,\"in_bitdepth\":%d,\"out_bitdepth\":%d,\"gamma_type\":%d,\"slices\":%d,\"precincts\":%d}\n",
+                std::printf("{\"width\":%u,\"height\":%u,\"lcod\":%u,\"cdt_depth\":%d,\"in_bitdepth\":%d,\"out_bitdepth\":%d,\"gamma_type\":%d,\"slices\":%d,\"precincts\":%d",
                             jxs.width, jxs.height, jxs.lcod, jxs.cdt_depth, jxs.in_bitdepth, jxs.out_bitdepth, jxs.gamma_type, jxs.num_slices, jxs.num_precincts);
+                if (quant_mode && q_info.quant_profile.available) {
+                    print_quant_json_block(q_info.quant_profile);
+                }
+                std::printf("\n}\n");
             } else {
                 std::printf("Raw TicoRAW: %ux%u, Lcod=%u B, cdt_depth=%d, slices=%d, precincts=%d\n",
                             jxs.width, jxs.height, jxs.lcod, jxs.cdt_depth, jxs.num_slices, jxs.num_precincts);
+                if (quant_mode && q_info.quant_profile.available) {
+                    print_quant_human_line(q_info.quant_profile);
+                }
             }
             return 0;
         }
@@ -583,6 +661,19 @@ int main(int argc, char** argv) {
         nijinwvdc::VideoFrameTiming t0;
         std::string t_err;
         reader.get_frame_timing(0, t0, t_err);
+        nijinwvdc::DecodedFrameInfo q_info;
+        if (quant_mode) {
+            nijinwvdc::DecoderSession q_sess(threads);
+            nijinwvdc::DecodeOptions q_opts;
+            q_opts.num_threads = threads;
+            q_opts.apply_active_crop = active_crop;
+            q_opts.want_quant_profile = true;
+            std::vector<uint16_t> q_bayer;
+            if (!q_sess.decode_frame(reader, 0, q_opts, q_bayer, q_info, err)) {
+                std::fprintf(stderr, "Error: %s\n", err.c_str());
+                return 1;
+            }
+        }
         if (clip.codec_family == nijinwvdc::CodecFamily::Arw6) {
             nijinwvdc::Arw6Info arw6;
             const bool ok = (cs0.size() >= 16 && std::memcmp(cs0.data(), "A000", 4) == 0)
@@ -593,9 +684,12 @@ int main(int argc, char** argv) {
                 return 1;
             }
             if (json_mode) {
-                print_info_arw6_json(clip, m0, t0, arw6);
+                print_info_arw6_json(clip, m0, t0, arw6, quant_mode ? &q_info.quant_profile : nullptr);
             } else {
                 print_info_arw6_human(clip, m0, arw6);
+                if (quant_mode) {
+                    print_quant_human_line(q_info.quant_profile);
+                }
             }
             return 0;
         }
@@ -605,9 +699,12 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (json_mode) {
-            print_info_json(clip, m0, t0, jxs);
+            print_info_json(clip, m0, t0, jxs, quant_mode ? &q_info.quant_profile : nullptr);
         } else {
             print_info_human(clip, m0, t0, jxs);
+            if (quant_mode) {
+                print_quant_human_line(q_info.quant_profile);
+            }
         }
         return 0;
     }

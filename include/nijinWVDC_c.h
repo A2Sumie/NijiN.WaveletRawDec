@@ -105,7 +105,8 @@ typedef struct nijin_decode_options_t {
     int32_t num_threads;
     uint8_t apply_active_crop;
     uint8_t has_roi;
-    uint8_t reserved[2];
+    uint8_t want_quant_profile;
+    uint8_t reserved;
     uint32_t roi[4];
 } nijin_decode_options_t;
 
@@ -120,9 +121,34 @@ typedef struct nijin_decoded_info_t {
     uint16_t bit_depth;
     uint8_t cfa_pattern[4];
     uint8_t has_meta;
-    uint8_t reserved;
+    uint8_t has_quant_profile;
     nijin_frame_meta_t meta;
 } nijin_decoded_info_t;
+
+typedef struct nijin_wavelet_quant_summary_t {
+    uint32_t struct_size;
+    uint8_t available;
+    uint8_t nlt_enabled;
+    uint16_t raw_bit_depth;
+    uint16_t code_bit_depth;
+    uint16_t reserved;
+    uint32_t codec;
+    uint32_t nlt_raw_white_adu;
+    uint32_t nlt_code_max;
+    uint32_t row_step;
+    uint32_t num_rows;
+    float black_ref;
+    float white_ref;
+    float mean_luma_code_std;
+    float mean_chroma_code_std;
+    float max_luma_code_std;
+    float max_chroma_code_std;
+    float luma_scale_psd[6];
+    float chroma_scale_psd[6];
+    float walsh16_luma_norm[16];
+    float walsh16_chroma_norm[16];
+    float nlt_slope_lut[256];
+} nijin_wavelet_quant_summary_t;
 
 typedef struct nijin_audio_info_t {
     uint8_t available;
@@ -233,6 +259,19 @@ NIJINWVDC_API nijin_status_t nijin_decoder_decode_frame(
     size_t dst_row_stride_bytes,
     size_t dst_height_capacity,
     nijin_decoded_info_t* out_info);
+
+NIJINWVDC_API void nijin_wavelet_quant_summary_init(nijin_wavelet_quant_summary_t* summary);
+NIJINWVDC_API nijin_status_t nijin_decoder_get_last_quant_profile(
+    const nijin_decoder_t* decoder,
+    nijin_wavelet_quant_summary_t* out_summary,
+    float* out_luma_rows,
+    float* out_chroma_rows,
+    uint32_t row_capacity);
+NIJINWVDC_API nijin_status_t nijin_decoder_recalibrate_last_quant_range(
+    nijin_decoder_t* decoder,
+    float black_level,
+    float white_level,
+    nijin_wavelet_quant_summary_t* out_summary);
 
 NIJINWVDC_API nijin_status_t nijin_crop_bayer_strided(
     const uint16_t* src,
