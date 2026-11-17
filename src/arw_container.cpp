@@ -4,7 +4,7 @@
 #include <algorithm>
 #include <cstring>
 
-namespace nev2bayer {
+namespace nijinwvdc {
 namespace detail {
 
 namespace {
@@ -279,4 +279,4 @@ bool parse_sony_arw_tiff(
 }
 
 } // namespace detail
-} // namespace nev2bayer
+} // namespace nijinwvdc

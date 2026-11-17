@@ -1,4 +1,4 @@
-NijiN.WaveletRawDec (nev2bayer) — Clean-Room Decoder for TicoRAW (.NEV / .NEF HE & HE*) and Sony ARW6 (.ARW) Wavelet-Compressed RAW Formats
+NijiN.WaveletRawDec (nijinWVDC) — Clean-Room Decoder for TicoRAW (.NEV / .NEF HE & HE*) and Sony ARW6 (.ARW) Wavelet-Compressed RAW Formats
 Copyright 2026 A2Sumie (NijiN Project — https://github.com/A2Sumie/NijiN.WaveletRawDec)
 
 This software is licensed under the Apache License, Version 2.0 (see the

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "../include/nev2bayer.h"
+#include "../include/nijinWVDC.h"
 #include "tiff_internal.h"
 
 #include <algorithm>
@@ -8,7 +8,7 @@
 #include <cstring>
 #include <sys/stat.h>
 
-namespace nev2bayer {
+namespace nijinwvdc {
 namespace {
 
 using detail::ScopedFile;
@@ -1006,4 +1006,4 @@ bool extract_nev_blob(
     return true;
 }
 
-} // namespace nev2bayer
+} // namespace nijinwvdc

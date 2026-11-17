@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "../include/nev2bayer.h"
+#include "../include/nijinWVDC.h"
 
 #include <cerrno>
 #include <chrono>
@@ -163,7 +163,7 @@ bool read_file_bytes(const std::string& path, std::vector<uint8_t>& out, std::st
     return true;
 }
 
-void print_info_common_header(const nev2bayer::NevClipInfo& clip, const nev2bayer::NevFrameMeta& m0) {
+void print_info_common_header(const nijinwvdc::NevClipInfo& clip, const nijinwvdc::NevFrameMeta& m0) {
     std::printf("File:          %s (%.2f MB)\n", clip.file_path.c_str(), clip.file_size / (1024.0 * 1024.0));
     std::printf("Brand:         %s\n", clip.major_brand.c_str());
     std::printf("Camera:        %s / %s\n", clip.make.c_str(), clip.model.c_str());
@@ -173,7 +173,7 @@ void print_info_common_header(const nev2bayer::NevClipInfo& clip, const nev2baye
     (void)m0;
 }
 
-void print_info_common_tail(const nev2bayer::NevFrameMeta& m0) {
+void print_info_common_tail(const nijinwvdc::NevFrameMeta& m0) {
     if (m0.has_crop) {
         std::printf("Active Crop:   [%u, %u, %u, %u]\n", m0.crop[0], m0.crop[1], m0.crop[2], m0.crop[3]);
     }
@@ -192,7 +192,7 @@ void print_info_common_tail(const nev2bayer::NevFrameMeta& m0) {
                 m0.wb_rggb[0], m0.wb_rggb[1], m0.wb_rggb[2], m0.wb_rggb[3], m0.wb_mode.c_str(), m0.color_temp);
 }
 
-void print_info_human(const nev2bayer::NevClipInfo& clip, const nev2bayer::NevFrameMeta& m0, const nev2bayer::TicoRawInfo& jxs) {
+void print_info_human(const nijinwvdc::NevClipInfo& clip, const nijinwvdc::NevFrameMeta& m0, const nijinwvdc::TicoRawInfo& jxs) {
     print_info_common_header(clip, m0);
     if (clip.major_brand == "NEF") {
         const char* fmt_str = (!clip.tracks.empty() && !clip.tracks[0].format.empty())
@@ -229,7 +229,7 @@ void print_info_human(const nev2bayer::NevClipInfo& clip, const nev2bayer::NevFr
     }
 }
 
-void print_info_arw6_human(const nev2bayer::NevClipInfo& clip, const nev2bayer::NevFrameMeta& m0, const nev2bayer::Arw6Info& arw6) {
+void print_info_arw6_human(const nijinwvdc::NevClipInfo& clip, const nijinwvdc::NevFrameMeta& m0, const nijinwvdc::Arw6Info& arw6) {
     print_info_common_header(clip, m0);
     std::printf("Image Track:   Sony ARW6 (Compressed HQ / Compressed, TIFF Compression=32766, SonyRawFileType=%u), sensor=%ux%u\n",
                 m0.sony_raw_file_type, arw6.width, arw6.height);
@@ -244,7 +244,7 @@ void print_info_arw6_human(const nev2bayer::NevClipInfo& clip, const nev2bayer::
     }
 }
 
-void print_info_json_prefix(const nev2bayer::NevClipInfo& clip, const nev2bayer::NevFrameMeta& m0, uint32_t cs_w, uint32_t cs_h) {
+void print_info_json_prefix(const nijinwvdc::NevClipInfo& clip, const nijinwvdc::NevFrameMeta& m0, uint32_t cs_w, uint32_t cs_h) {
     std::printf("{\n");
     std::printf("  \"file\": \"%s\",\n", json_escape(clip.file_path).c_str());
     std::printf("  \"file_size\": %llu,\n", static_cast<unsigned long long>(clip.file_size));
@@ -268,7 +268,7 @@ void print_info_json_prefix(const nev2bayer::NevClipInfo& clip, const nev2bayer:
     std::printf("  \"nef_compression\": %u,\n", m0.nef_compression);
 }
 
-void print_info_json(const nev2bayer::NevClipInfo& clip, const nev2bayer::NevFrameMeta& m0, const nev2bayer::TicoRawInfo& jxs) {
+void print_info_json(const nijinwvdc::NevClipInfo& clip, const nijinwvdc::NevFrameMeta& m0, const nijinwvdc::TicoRawInfo& jxs) {
     print_info_json_prefix(clip, m0, jxs.width, jxs.height);
     std::printf("  \"ticoraw\": {\n");
     std::printf("    \"lcod\": %u,\n", jxs.lcod);
@@ -285,7 +285,7 @@ void print_info_json(const nev2bayer::NevClipInfo& clip, const nev2bayer::NevFra
     std::printf("}\n");
 }
 
-void print_info_arw6_json(const nev2bayer::NevClipInfo& clip, const nev2bayer::NevFrameMeta& m0, const nev2bayer::Arw6Info& arw6) {
+void print_info_arw6_json(const nijinwvdc::NevClipInfo& clip, const nijinwvdc::NevFrameMeta& m0, const nijinwvdc::Arw6Info& arw6) {
     print_info_json_prefix(clip, m0, arw6.width, arw6.height);
     std::printf("  \"arw6\": {\n");
     std::printf("    \"strip_bytes\": %u,\n", arw6.codestream_size);
@@ -402,9 +402,9 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "Error: %s\n", err.c_str());
             return 1;
         }
-        nev2bayer::TicoRawInfo jxs;
+        nijinwvdc::TicoRawInfo jxs;
         if (info_mode) {
-            if (!nev2bayer::probe_ticoraw_header(cs.data(), cs.size(), jxs, err)) {
+            if (!nijinwvdc::probe_ticoraw_header(cs.data(), cs.size(), jxs, err)) {
                 std::fprintf(stderr, "Error: %s\n", err.c_str());
                 return 1;
             }
@@ -422,7 +422,7 @@ int main(int argc, char** argv) {
             return 2;
         }
         std::vector<uint16_t> bayer;
-        if (!nev2bayer::decode_ticoraw_bayer(cs.data(), cs.size(), threads, bayer, jxs, err)) {
+        if (!nijinwvdc::decode_ticoraw_bayer(cs.data(), cs.size(), threads, bayer, jxs, err)) {
             std::fprintf(stderr, "Decode failed: %s\n", err.c_str());
             return 1;
         }
@@ -432,11 +432,11 @@ int main(int argc, char** argv) {
                 return 1;
             }
         } else {
-            nev2bayer::NevClipInfo dummy_clip;
-            nev2bayer::NevFrameMeta dummy_meta;
-            nev2bayer::DngWriteOptions opts;
-            nev2bayer::build_dng_options_from_clip_and_frame(dummy_clip, dummy_meta, jxs, false, override_orientation, opts);
-            if (!nev2bayer::write_cfa_dng(output_path, bayer.data(), opts, err)) {
+            nijinwvdc::NevClipInfo dummy_clip;
+            nijinwvdc::NevFrameMeta dummy_meta;
+            nijinwvdc::DngWriteOptions opts;
+            nijinwvdc::build_dng_options_from_clip_and_frame(dummy_clip, dummy_meta, jxs, false, override_orientation, opts);
+            if (!nijinwvdc::write_cfa_dng(output_path, bayer.data(), opts, err)) {
                 std::fprintf(stderr, "Error: %s\n", err.c_str());
                 return 1;
             }
@@ -445,22 +445,22 @@ int main(int argc, char** argv) {
     }
 
     // NEV clip modes
-    nev2bayer::NevClipInfo clip;
-    if (!nev2bayer::parse_nev_clip(input_path, clip, err)) {
+    nijinwvdc::NevClipInfo clip;
+    if (!nijinwvdc::parse_nev_clip(input_path, clip, err)) {
         std::fprintf(stderr, "Error: %s\n", err.c_str());
         return 1;
     }
 
     if (info_mode) {
-        nev2bayer::NevFrameMeta m0;
+        nijinwvdc::NevFrameMeta m0;
         std::vector<uint8_t> cs0;
-        if (!nev2bayer::read_nev_frame_meta_and_codestream(clip, 0, m0, &cs0, err)) {
+        if (!nijinwvdc::read_nev_frame_meta_and_codestream(clip, 0, m0, &cs0, err)) {
             std::fprintf(stderr, "Error: %s\n", err.c_str());
             return 1;
         }
         if (clip.major_brand == "ARW") {
-            nev2bayer::Arw6Info arw6;
-            if (!nev2bayer::probe_arw6_strip(cs0.data(), cs0.size(), arw6, err)) {
+            nijinwvdc::Arw6Info arw6;
+            if (!nijinwvdc::probe_arw6_strip(cs0.data(), cs0.size(), arw6, err)) {
                 std::fprintf(stderr, "Error: %s\n", err.c_str());
                 return 1;
             }
@@ -471,8 +471,8 @@ int main(int argc, char** argv) {
             }
             return 0;
         }
-        nev2bayer::TicoRawInfo jxs;
-        if (!nev2bayer::probe_ticoraw_header(cs0.data(), cs0.size(), jxs, err)) {
+        nijinwvdc::TicoRawInfo jxs;
+        if (!nijinwvdc::probe_ticoraw_header(cs0.data(), cs0.size(), jxs, err)) {
             std::fprintf(stderr, "Error: %s\n", err.c_str());
             return 1;
         }
@@ -492,7 +492,7 @@ int main(int argc, char** argv) {
         uint64_t off = extract_thumb ? clip.ncth_offset : clip.ncvw_offset;
         uint32_t sz = extract_thumb ? clip.ncth_size : clip.ncvw_size;
         std::vector<uint8_t> blob;
-        if (!nev2bayer::extract_nev_blob(clip.file_path, off, sz, blob, err) ||
+        if (!nijinwvdc::extract_nev_blob(clip.file_path, off, sz, blob, err) ||
             !write_raw_file(output_path, blob.data(), blob.size(), err)) {
             std::fprintf(stderr, "Error: %s\n", err.c_str());
             return 1;
@@ -515,9 +515,9 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "Error: --extract-jxs requires a single valid --frame index (%s)\n", err.c_str());
             return 2;
         }
-        nev2bayer::NevFrameMeta meta;
+        nijinwvdc::NevFrameMeta meta;
         std::vector<uint8_t> cs;
-        if (!nev2bayer::read_nev_frame_meta_and_codestream(clip, frames[0], meta, &cs, err) ||
+        if (!nijinwvdc::read_nev_frame_meta_and_codestream(clip, frames[0], meta, &cs, err) ||
             !write_raw_file(output_path, cs.data(), cs.size(), err)) {
             std::fprintf(stderr, "Error: %s\n", err.c_str());
             return 1;
@@ -526,27 +526,27 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    auto decode_clip_sample = [&](const nev2bayer::NevFrameMeta& meta,
+    auto decode_clip_sample = [&](const nijinwvdc::NevFrameMeta& meta,
                                   const std::vector<uint8_t>& cs_bytes,
                                   std::vector<uint16_t>& bayer_pix,
-                                  nev2bayer::DngWriteOptions& dopts,
+                                  nijinwvdc::DngWriteOptions& dopts,
                                   uint32_t& out_w,
                                   uint32_t& out_h) -> bool {
         if (clip.major_brand == "ARW") {
-            nev2bayer::Arw6Info arw6;
-            if (!nev2bayer::decode_arw6_bayer(cs_bytes.data(), cs_bytes.size(), threads, bayer_pix, arw6, err)) {
+            nijinwvdc::Arw6Info arw6;
+            if (!nijinwvdc::decode_arw6_bayer(cs_bytes.data(), cs_bytes.size(), threads, bayer_pix, arw6, err)) {
                 return false;
             }
-            nev2bayer::build_dng_options_from_clip_and_frame(clip, meta, arw6, active_crop, override_orientation, dopts);
+            nijinwvdc::build_dng_options_from_clip_and_frame(clip, meta, arw6, active_crop, override_orientation, dopts);
             out_w = arw6.width;
             out_h = arw6.height;
             return true;
         }
-        nev2bayer::TicoRawInfo jxs;
-        if (!nev2bayer::decode_ticoraw_bayer(cs_bytes.data(), cs_bytes.size(), threads, bayer_pix, jxs, err)) {
+        nijinwvdc::TicoRawInfo jxs;
+        if (!nijinwvdc::decode_ticoraw_bayer(cs_bytes.data(), cs_bytes.size(), threads, bayer_pix, jxs, err)) {
             return false;
         }
-        nev2bayer::build_dng_options_from_clip_and_frame(clip, meta, jxs, active_crop, override_orientation, dopts);
+        nijinwvdc::build_dng_options_from_clip_and_frame(clip, meta, jxs, active_crop, override_orientation, dopts);
         out_w = jxs.width;
         out_h = jxs.height;
         return true;
@@ -558,12 +558,12 @@ int main(int argc, char** argv) {
                            : static_cast<size_t>(std::min<long>(std::max(1, bench_frames), static_cast<long>(clip.video_samples.size())));
         std::vector<uint8_t> cs;
         std::vector<uint16_t> bayer;
-        nev2bayer::NevFrameMeta meta;
-        nev2bayer::DngWriteOptions dopts;
+        nijinwvdc::NevFrameMeta meta;
+        nijinwvdc::DngWriteOptions dopts;
         uint32_t bw = 0, bh = 0;
 
         // Warmup frame 0
-        if (!nev2bayer::read_nev_frame_meta_and_codestream(clip, 0, meta, &cs, err) ||
+        if (!nijinwvdc::read_nev_frame_meta_and_codestream(clip, 0, meta, &cs, err) ||
             !decode_clip_sample(meta, cs, bayer, dopts, bw, bh)) {
             std::fprintf(stderr, "Benchmark warmup failed: %s\n", err.c_str());
             return 1;
@@ -573,7 +573,7 @@ int main(int argc, char** argv) {
         auto t_e2e_start = std::chrono::steady_clock::now();
         for (size_t i = 0; i < count; ++i) {
             uint32_t fidx = (clip.video_samples.size() == 1) ? 0u : static_cast<uint32_t>(i);
-            if (!nev2bayer::read_nev_frame_meta_and_codestream(clip, fidx, meta, &cs, err)) {
+            if (!nijinwvdc::read_nev_frame_meta_and_codestream(clip, fidx, meta, &cs, err)) {
                 std::fprintf(stderr, "Read failed at iter %zu: %s\n", i, err.c_str());
                 return 1;
             }
@@ -626,12 +626,12 @@ int main(int argc, char** argv) {
     std::vector<uint16_t> bayer;
     std::vector<uint16_t> cropped;
     for (uint32_t fidx : frames) {
-        nev2bayer::NevFrameMeta meta;
-        if (!nev2bayer::read_nev_frame_meta_and_codestream(clip, fidx, meta, &cs, err)) {
+        nijinwvdc::NevFrameMeta meta;
+        if (!nijinwvdc::read_nev_frame_meta_and_codestream(clip, fidx, meta, &cs, err)) {
             std::fprintf(stderr, "Error reading frame %u: %s\n", fidx, err.c_str());
             return 1;
         }
-        nev2bayer::DngWriteOptions opts;
+        nijinwvdc::DngWriteOptions opts;
         uint32_t fw = 0, fh = 0;
         if (!decode_clip_sample(meta, cs, bayer, opts, fw, fh)) {
             std::fprintf(stderr, "Error decoding frame %u: %s\n", fidx, err.c_str());
@@ -641,7 +641,7 @@ int main(int argc, char** argv) {
         const uint16_t* out_pix = bayer.data();
         if (active_crop && meta.has_crop && meta.crop[2] > 0 && meta.crop[3] > 0) {
             uint8_t new_cfa[4];
-            if (!nev2bayer::apply_bayer_crop(bayer.data(), fw, fh, meta.crop, opts.cfa_pattern, cropped, new_cfa)) {
+            if (!nijinwvdc::apply_bayer_crop(bayer.data(), fw, fh, meta.crop, opts.cfa_pattern, cropped, new_cfa)) {
                 std::fprintf(stderr, "Error applying active crop [%u,%u,%u,%u]\n",
                              meta.crop[0], meta.crop[1], meta.crop[2], meta.crop[3]);
                 return 1;
@@ -667,7 +667,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
         } else {
-            if (!nev2bayer::write_cfa_dng(target, out_pix, opts, err)) {
+            if (!nijinwvdc::write_cfa_dng(target, out_pix, opts, err)) {
                 std::fprintf(stderr, "Error: %s\n", err.c_str());
                 return 1;
             }

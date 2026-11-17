@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "../include/nev2bayer.h"
+#include "../include/nijinWVDC.h"
 
 #include <algorithm>
 #include <array>
@@ -8,7 +8,7 @@
 #include <thread>
 #include <vector>
 
-namespace nev2bayer {
+namespace nijinwvdc {
 namespace {
 
 inline uint16_t rd_be16(const uint8_t* p) {
@@ -1533,4 +1533,4 @@ bool decode_arw6_bayer(
     return true;
 }
 
-} // namespace nev2bayer
+} // namespace nijinwvdc

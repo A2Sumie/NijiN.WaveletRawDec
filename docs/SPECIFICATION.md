@@ -1,6 +1,6 @@
 # Format & Codec Specification
 
-This document specifies the **Nikon `.NEV` ISOBMFF/QuickTime container**, **Nikon `.NEF` (`HE` / `HE*`) TIFF SubIFD layout**, **TicoRAW R0 (ISO/IEC 21122 Bayer extension) decoding pipeline**, **Sony `.ARW` (`ARW6` `Compressed HQ` / `Compressed`) multi-tile container and `"A000"` wavelet pipeline**, and **calibrated DNG 1.4 emission** implemented in `NijiN.WaveletRawDec` (`nev2bayer`).
+This document specifies the **Nikon `.NEV` ISOBMFF/QuickTime container**, **Nikon `.NEF` (`HE` / `HE*`) TIFF SubIFD layout**, **TicoRAW R0 (ISO/IEC 21122 Bayer extension) decoding pipeline**, **Sony `.ARW` (`ARW6` `Compressed HQ` / `Compressed`) multi-tile container and `"A000"` wavelet pipeline**, and **calibrated DNG 1.4 emission** implemented in `NijiN.WaveletRawDec` (`nijinWVDC`).
 
 > **Scope Note**: `NijiN.WaveletRawDec` targets specifically the two 2D-wavelet Bayer codec families lacking complete open-ecosystem support (**TicoRAW R0** in `.NEV`/`.NEF` `HE`/`HE*`/`.jxs` and **Sony ARW6 `"A000"`** in `.ARW` `Compression=32766`). Conventional uncompressed, packed-linear, and lossless-JPEG RAW variants return explicit format-classification errors so host pipelines can dispatch them to standard open decoders.
 

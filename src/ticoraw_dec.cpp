@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-// Clean-room C++17 TicoRAW / JPEG XS R0 Bayer decoder for nev2bayer.
+// Clean-room C++17 TicoRAW / JPEG XS R0 Bayer decoder for nijinWVDC.
 // Implements ISO/IEC 21122-1 / R0 Bayer extensions (CAP, PIH, CDT, WGT, SLH,
 // bounded GCLI prediction, uniform dequantization, 5/3 IDWT, Star-Tetrix RCT,
 // and piecewise Fliproot NLT inverse LUT) with zero external dependencies.
 
-#include "../include/nev2bayer.h"
+#include "../include/nijinWVDC.h"
 
 #include <algorithm>
 #include <atomic>
@@ -14,7 +14,7 @@
 #include <thread>
 #include <vector>
 
-namespace nev2bayer {
+namespace nijinwvdc {
 namespace {
 
 constexpr int kMaxComponents = 4;
@@ -1190,4 +1190,4 @@ bool decode_ticoraw_bayer(
     return true;
 }
 
-} // namespace nev2bayer
+} // namespace nijinwvdc

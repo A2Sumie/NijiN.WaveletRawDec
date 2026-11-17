@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-#ifndef NEV2BAYER_TIFF_INTERNAL_H
-#define NEV2BAYER_TIFF_INTERNAL_H
+#ifndef NIJINWVDC_TIFF_INTERNAL_H
+#define NIJINWVDC_TIFF_INTERNAL_H
 
-#include "../include/nev2bayer.h"
+#include "../include/nijinWVDC.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-namespace nev2bayer {
+namespace nijinwvdc {
 namespace detail {
 
 inline uint16_t rd_be16(const uint8_t* p) {
@@ -131,6 +131,6 @@ bool parse_sony_arw_tiff(
     std::string& err);
 
 } // namespace detail
-} // namespace nev2bayer
+} // namespace nijinwvdc
 
-#endif // NEV2BAYER_TIFF_INTERNAL_H
+#endif // NIJINWVDC_TIFF_INTERNAL_H

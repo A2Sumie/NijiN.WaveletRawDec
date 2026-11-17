@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "../include/nev2bayer.h"
+#include "../include/nijinWVDC.h"
 
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 
-namespace nev2bayer {
+namespace nijinwvdc {
 namespace {
 
 enum TiffType : uint16_t {
@@ -179,7 +179,7 @@ void populate_dng_options_common(
     opts.make = clip.make.empty() ? (is_sony ? "SONY" : "NIKON CORPORATION") : clip.make;
     opts.model = clip.model.empty() ? (is_sony ? "ILCE-7M5" : "NIKON Z 8") : clip.model;
     opts.unique_model = opts.model;
-    opts.software = clip.firmware_version.empty() ? "nev2bayer" : clip.firmware_version;
+    opts.software = clip.firmware_version.empty() ? "nijinWVDC" : clip.firmware_version;
     opts.datetime = clip.datetime;
     opts.exposure_time_s = meta.exposure_time_s;
     opts.fnumber = meta.fnumber;
@@ -481,4 +481,4 @@ bool write_cfa_dng(
     return true;
 }
 
-} // namespace nev2bayer
+} // namespace nijinwvdc

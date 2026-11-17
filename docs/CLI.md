@@ -3,12 +3,12 @@
 ## 1. CLI Synopsis
 
 ```sh
-nev2bayer --info [--json] <in.NEV | in.NEF | in.ARW | in.jxs>
-nev2bayer <in.NEV | in.NEF | in.ARW> [--frame <N|start-end|all>] -o <out.dng|out.raw|dir/> [options]
-nev2bayer --raw-jxs <in.jxs> -o <out.raw|out.dng> [options]
-nev2bayer --extract-jxs <in.NEV | in.NEF> [--frame <N>] -o <out.jxs>
-nev2bayer --extract-preview <in.NEV | in.NEF | in.ARW> [--thumb] -o <out.jpg>
-nev2bayer --bench <in.NEV | in.ARW> [--frames N] [--threads N]
+nijinWVDC --info [--json] <in.NEV | in.NEF | in.ARW | in.jxs>
+nijinWVDC <in.NEV | in.NEF | in.ARW> [--frame <N|start-end|all>] -o <out.dng|out.raw|dir/> [options]
+nijinWVDC --raw-jxs <in.jxs> -o <out.raw|out.dng> [options]
+nijinWVDC --extract-jxs <in.NEV | in.NEF> [--frame <N>] -o <out.jxs>
+nijinWVDC --extract-preview <in.NEV | in.NEF | in.ARW> [--thumb] -o <out.jpg>
+nijinWVDC --bench <in.NEV | in.ARW> [--frames N] [--threads N]
 ```
 
 ### Options
@@ -116,68 +116,68 @@ For a bare `.jxs` codestream, `--info --json` emits a compact header summary:
 
 ```sh
 # Decode a single frame to cropped linear DNG
-./build/nev2bayer clip.NEV --frame 54 --active-crop -o frame_0054.dng --threads 8
+./build/nijinWVDC clip.NEV --frame 54 --active-crop -o frame_0054.dng --threads 8
 
 # Export all frames in a .NEV clip as uncompressed 16-bit CFA DNGs
-./build/nev2bayer clip.NEV --frame all -o frames_dng/ --active-crop --threads 8
+./build/nijinWVDC clip.NEV --frame all -o frames_dng/ --active-crop --threads 8
 
 # Batch-convert a folder of Nikon HE / HE* .NEF stills to calibrated DNGs
 for f in *.NEF; do
-  ./build/nev2bayer "$f" --active-crop -o "${f%.NEF}.dng" --threads 8
+  ./build/nijinWVDC "$f" --active-crop -o "${f%.NEF}.dng" --threads 8
 done
 
 # Batch-convert a folder of Sony ARW6 (Compressed HQ / Compressed) .ARW stills to calibrated DNGs
 for f in *.ARW; do
-  ./build/nev2bayer "$f" --active-crop -o "${f%.ARW}.dng" --threads 8
+  ./build/nijinWVDC "$f" --active-crop -o "${f%.ARW}.dng" --threads 8
 done
 ```
 
 ---
 
-## 4. C++17 Static Library (`nev2bayer_core`) Example
+## 4. C++17 Static Library (`nijinWVDC_core`) Example
 
-Link against `nev2bayer_core` via CMake and include [`include/nev2bayer.h`](../include/nev2bayer.h):
+Link against `nijinWVDC_core` via CMake and include [`include/nijinWVDC.h`](../include/nijinWVDC.h):
 
 ```cpp
-#include "nev2bayer.h"
+#include "nijinWVDC.h"
 #include <cstdio>
 #include <vector>
 
 int decode_one_frame(const std::string& input_path, const std::string& out_dng) {
     std::string err;
-    nev2bayer::NevClipInfo clip;
-    if (!nev2bayer::parse_nev_clip(input_path, clip, err)) {
+    nijinwvdc::NevClipInfo clip;
+    if (!nijinwvdc::parse_nev_clip(input_path, clip, err)) {
         std::fprintf(stderr, "parse failed: %s\n", err.c_str());
         return 1;
     }
 
-    nev2bayer::NevFrameMeta meta;
+    nijinwvdc::NevFrameMeta meta;
     std::vector<uint8_t> payload;
-    if (!nev2bayer::read_nev_frame_meta_and_codestream(clip, 0, meta, &payload, err)) {
+    if (!nijinwvdc::read_nev_frame_meta_and_codestream(clip, 0, meta, &payload, err)) {
         std::fprintf(stderr, "read frame failed: %s\n", err.c_str());
         return 1;
     }
 
     std::vector<uint16_t> bayer;
-    nev2bayer::DngWriteOptions opts;
+    nijinwvdc::DngWriteOptions opts;
     uint32_t raw_w = 0, raw_h = 0;
 
     if (clip.major_brand == "ARW") {
-        nev2bayer::Arw6Info arw6;
-        if (!nev2bayer::decode_arw6_bayer(payload.data(), payload.size(), 8, bayer, arw6, err)) {
+        nijinwvdc::Arw6Info arw6;
+        if (!nijinwvdc::decode_arw6_bayer(payload.data(), payload.size(), 8, bayer, arw6, err)) {
             std::fprintf(stderr, "arw6 decode failed: %s\n", err.c_str());
             return 1;
         }
-        nev2bayer::build_dng_options_from_clip_and_frame(clip, meta, arw6, /*apply_active_crop=*/true, 0, opts);
+        nijinwvdc::build_dng_options_from_clip_and_frame(clip, meta, arw6, /*apply_active_crop=*/true, 0, opts);
         raw_w = arw6.width;
         raw_h = arw6.height;
     } else {
-        nev2bayer::TicoRawInfo jxs;
-        if (!nev2bayer::decode_ticoraw_bayer(payload.data(), payload.size(), 8, bayer, jxs, err)) {
+        nijinwvdc::TicoRawInfo jxs;
+        if (!nijinwvdc::decode_ticoraw_bayer(payload.data(), payload.size(), 8, bayer, jxs, err)) {
             std::fprintf(stderr, "ticoraw decode failed: %s\n", err.c_str());
             return 1;
         }
-        nev2bayer::build_dng_options_from_clip_and_frame(clip, meta, jxs, /*apply_active_crop=*/true, 0, opts);
+        nijinwvdc::build_dng_options_from_clip_and_frame(clip, meta, jxs, /*apply_active_crop=*/true, 0, opts);
         raw_w = jxs.width;
         raw_h = jxs.height;
     }
@@ -185,14 +185,14 @@ int decode_one_frame(const std::string& input_path, const std::string& out_dng) 
     std::vector<uint16_t> cropped;
     const uint16_t* pix = bayer.data();
     if (meta.has_crop &&
-        nev2bayer::apply_bayer_crop(bayer.data(), raw_w, raw_h, meta.crop, opts.cfa_pattern, cropped, opts.cfa_pattern)) {
+        nijinwvdc::apply_bayer_crop(bayer.data(), raw_w, raw_h, meta.crop, opts.cfa_pattern, cropped, opts.cfa_pattern)) {
         pix = cropped.data();
         opts.width = meta.crop[2];
         opts.height = meta.crop[3];
         opts.has_crop = false;
     }
 
-    if (!nev2bayer::write_cfa_dng(out_dng, pix, opts, err)) {
+    if (!nijinwvdc::write_cfa_dng(out_dng, pix, opts, err)) {
         std::fprintf(stderr, "write dng failed: %s\n", err.c_str());
         return 1;
     }

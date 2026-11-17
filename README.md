@@ -3,7 +3,7 @@
 **Clean-Room Multi-Threaded C++17 Decoder for Wavelet-Compressed Camera & Cinema RAW Formats**  
 (`Apache-2.0` · `C++17` · `POSIX Threads` · `Zero External Dependencies`)
 
-`NijiN.WaveletRawDec` (library `nev2bayer_core` / CLI `nev2bayer`) is purpose-built for the **two modern 2D-wavelet camera RAW codec families** whose open-source ecosystem support has historically been absent or incomplete:
+`NijiN.WaveletRawDec` (library `nijinWVDC_core` / CLI `nijinWVDC`) is purpose-built for the **two modern 2D-wavelet camera RAW codec families** whose open-source ecosystem support has historically been absent or incomplete:
 
 1. **TicoRAW R0 (`5H+1V` LeGall 5/3 lifting + Star-Tetrix RCT + Fliproot NLT)** — Nikon N-RAW video (`.NEV`), Nikon High Efficiency stills (`.NEF` `HE` / `HE*`), and bare `.jxs` codestreams.
 2. **Sony ARW 6.0 `"A000"` (`3`-level 5/3 lifting + Quincunx diamond green synthesis + 12-to-15-bit NLT)** — Sony `Compressed (HQ)` and `Compressed` stills (`.ARW`, `Compression=32766`, `SonyRawFileType=6`).
@@ -16,7 +16,7 @@ Conventional uncompressed, packed-linear, and lossless-JPEG RAW modes (such as l
 
 ## Format Coverage & Roadmap
 
-### Currently Shipped (`nev2bayer_core` / `nev2bayer`)
+### Currently Shipped (`nijinWVDC_core` / `nijinWVDC`)
 
 - **Nikon N-RAW (`.NEV`)**:
   - 64-bit QuickTime / ISOBMFF container parser (`ftyp=niko`, `co64` / `stsz` / `stsc`), QuickTime Sound v2 `lpcm` audio and `tmcd` timecode inspection, `moov/udta/NCDT/NCTG` metadata extraction, embedded `NCVW` / `NCTH` JPEG preview extraction, and per-sample `NRAW -> NRFM + NRFH(NRMT) + NRTH(NRTI/NRTA)` framing.
@@ -93,9 +93,9 @@ make clean all test
 ```
 
 Build outputs:
-- `build/nev2bayer` (`-O3` release CLI)
-- `build/nev2bayer_asan` (ASan + UBSan diagnostic CLI)
-- `build/test_nev2bayer` / `build/test_nev2bayer_asan` (standalone unit suite; optional `NEV2BAYER_TEST_NEV`, `NEV2BAYER_TEST_NEF`, and `NEV2BAYER_TEST_ARW` environment variables enable real-sample regression checks)
+- `build/nijinWVDC` (`-O3` release CLI)
+- `build/nijinWVDC_asan` (ASan + UBSan diagnostic CLI)
+- `build/test_nijinWVDC` / `build/test_nijinWVDC_asan` (standalone unit suite; optional `NIJINWVDC_TEST_NEV`, `NIJINWVDC_TEST_NEF`, and `NIJINWVDC_TEST_ARW` environment variables enable real-sample regression checks)
 
 ### Build with CMake
 
@@ -109,31 +109,31 @@ ctest --test-dir cmake-build --output-on-failure
 
 ```sh
 # 1. Inspect .NEV / .NEF / .ARW / .jxs headers, metadata, audio/timecode, and codestream parameters
-./build/nev2bayer --info clip.NEV
-./build/nev2bayer --info --json photo.NEF
-./build/nev2bayer --info --json photo.ARW
+./build/nijinWVDC --info clip.NEV
+./build/nijinWVDC --info --json photo.NEF
+./build/nijinWVDC --info --json photo.ARW
 
 # 2. Decode a frame to linear 14-bit-in-16-bit CFA DNG (full sensor buffer + DefaultCrop metadata)
-./build/nev2bayer clip.NEV --frame 0 -o frame_0000.dng --threads 8
-./build/nev2bayer photo.ARW -o sony_full.dng --threads 8
+./build/nijinWVDC clip.NEV --frame 0 -o frame_0000.dng --threads 8
+./build/nijinWVDC photo.ARW -o sony_full.dng --threads 8
 
 # 3. Crop to camera active crop with CFA phase rotation -> .dng or 16-bit LE .raw
-./build/nev2bayer clip.NEV --frame 0 --active-crop -o frame_0000_crop.dng --threads 8
-./build/nev2bayer photo.NEF --active-crop -o photo_crop.dng --threads 8
-./build/nev2bayer photo.ARW --active-crop -o sony_crop.dng --threads 8
-./build/nev2bayer clip.NEV --frame 0 -o frame_0000.raw --threads 8
+./build/nijinWVDC clip.NEV --frame 0 --active-crop -o frame_0000_crop.dng --threads 8
+./build/nijinWVDC photo.NEF --active-crop -o photo_crop.dng --threads 8
+./build/nijinWVDC photo.ARW --active-crop -o sony_crop.dng --threads 8
+./build/nijinWVDC clip.NEV --frame 0 -o frame_0000.raw --threads 8
 
 # 4. Batch decode a frame range or entire clip into a directory
-./build/nev2bayer clip.NEV --frame 0-9 -o out_dng/ --active-crop --threads 8
+./build/nijinWVDC clip.NEV --frame 0-9 -o out_dng/ --active-crop --threads 8
 
 # 5. Extract/decode bare .jxs codestreams, embedded JPEG previews, or run a throughput benchmark
-./build/nev2bayer --extract-jxs clip.NEV --frame 0 -o frame_0000.jxs
-./build/nev2bayer --raw-jxs frame_0000.jxs -o frame_0000.dng --threads 8
-./build/nev2bayer --extract-preview clip.NEV -o preview.jpg
-./build/nev2bayer --bench clip.NEV --frames 20 --threads 8
+./build/nijinWVDC --extract-jxs clip.NEV --frame 0 -o frame_0000.jxs
+./build/nijinWVDC --raw-jxs frame_0000.jxs -o frame_0000.dng --threads 8
+./build/nijinWVDC --extract-preview clip.NEV -o preview.jpg
+./build/nijinWVDC --bench clip.NEV --frames 20 --threads 8
 ```
 
-See [**`docs/CLI.md`**](docs/CLI.md) for all flags, JSON fields, and C++17 `nev2bayer_core` integration examples.
+See [**`docs/CLI.md`**](docs/CLI.md) for all flags, JSON fields, and C++17 `nijinWVDC_core` integration examples.
 
 ---
 
@@ -141,7 +141,7 @@ See [**`docs/CLI.md`**](docs/CLI.md) for all flags, JSON fields, and C++17 `nev2
 
 | Path | Role |
 |---|---|
-| [`include/nev2bayer.h`](include/nev2bayer.h) | Public C++17 data structures and container, decode, crop, and DNG APIs |
+| [`include/nijinWVDC.h`](include/nijinWVDC.h) | Public C++17 data structures and container, decode, crop, and DNG APIs |
 | [`src/tiff_internal.h`](src/tiff_internal.h) | Shared endian-aware TIFF IFD reader and Sony ARW dispatch helper |
 | [`src/nev_container.cpp`](src/nev_container.cpp) | 64-bit `.NEV` ISOBMFF/NCDT/NRFH/NRTH parser and `.NEF` HE/HE\* TIFF/MakerNote parser |
 | [`src/arw_container.cpp`](src/arw_container.cpp) | Sony `.ARW` (`ARW6` `Compressed HQ` / `Compressed`) TIFF `SubIFDs`, calibration tags, and JPEG preview parser |
@@ -149,8 +149,8 @@ See [**`docs/CLI.md`**](docs/CLI.md) for all flags, JSON fields, and C++17 `nev2
 | [`src/arw6_dec.cpp`](src/arw6_dec.cpp) | Clean-room Sony ARW6 (`"A000"`) multi-tile parser, chunk-parallel entropy decoder, vertical-first 5/3 IDWT, Quincunx synthesis, and NLT LUT |
 | [`src/dng_writer.cpp`](src/dng_writer.cpp) | Scalar `BlackLevel` DNG 1.4 writer, Nikon/Sony D65 `ColorMatrix1` lookup, and modulo CFA cropper |
 | [`src/main.cpp`](src/main.cpp) | CLI driver (`--info` / `--json` / batch decode / stream & preview extraction / `--bench`) |
-| [`tests/test_nev2bayer.cpp`](tests/test_nev2bayer.cpp) | Standalone negative container/stream checks, CFA phase rotation, DNG round-trip, and optional corpus hooks |
-| [`CMakeLists.txt`](CMakeLists.txt) · [`Makefile`](Makefile) | Zero-dependency build configuration (`nev2bayer_core` static library, `nev2bayer`, and tests) |
+| [`tests/test_nijinWVDC.cpp`](tests/test_nijinWVDC.cpp) | Standalone negative container/stream checks, CFA phase rotation, DNG round-trip, and optional corpus hooks |
+| [`CMakeLists.txt`](CMakeLists.txt) · [`Makefile`](Makefile) | Zero-dependency build configuration (`nijinWVDC_core` static library, `nijinWVDC`, and tests) |
 
 ---
 

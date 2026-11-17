@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-#ifndef NEV2BAYER_H
-#define NEV2BAYER_H
+#ifndef NIJINWVDC_H
+#define NIJINWVDC_H
 
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
 
-namespace nev2bayer {
+namespace nijinwvdc {
 
 struct NevSampleLocation {
     uint64_t file_offset = 0;
@@ -284,6 +284,6 @@ bool write_cfa_dng(
     const DngWriteOptions& opts,
     std::string& err);
 
-} // namespace nev2bayer
+} // namespace nijinwvdc
 
-#endif // NEV2BAYER_H
+#endif // NIJINWVDC_H
