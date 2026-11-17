@@ -3,7 +3,12 @@
 **Clean-Room Multi-Threaded C++17 Decoder for Wavelet-Compressed Camera & Cinema RAW Formats**  
 (`Apache-2.0` · `C++17` · `POSIX Threads` · `Zero External Dependencies`)
 
-`NijiN.WaveletRawDec` (library `nev2bayer_core` / CLI `nev2bayer`) provides an independent, dependency-free C++17 decoder for wavelet-compressed Bayer RAW formats, converting container frames directly into **physical 14-bit linear RGGB Bayer buffers (`.raw`)** and **calibrated uncompressed CFA DNG 1.4 negatives (`.dng`)**.
+`NijiN.WaveletRawDec` (library `nev2bayer_core` / CLI `nev2bayer`) is purpose-built for the **two modern 2D-wavelet camera RAW codec families** whose open-source ecosystem support has historically been absent or incomplete:
+
+1. **TicoRAW R0 (`5H+1V` LeGall 5/3 lifting + Star-Tetrix RCT + Fliproot NLT)** — Nikon N-RAW video (`.NEV`), Nikon High Efficiency stills (`.NEF` `HE` / `HE*`), and bare `.jxs` codestreams.
+2. **Sony ARW 6.0 `"A000"` (`3`-level 5/3 lifting + Quincunx diamond green synthesis + 12-to-15-bit NLT)** — Sony `Compressed (HQ)` and `Compressed` stills (`.ARW`, `Compression=32766`, `SonyRawFileType=6`).
+
+Conventional uncompressed, packed-linear, and lossless-JPEG RAW modes (such as legacy Nikon `.NEF` variants, or Sony `Compression=1`, `7`, and `32767`) are maturely handled by standard open-source decoders and intentionally return explicit format-classification errors here so downstream pipelines can route them cleanly. For both wavelet-compressed families, `NijiN.WaveletRawDec` outputs **physical 14-bit linear RGGB Bayer buffers (`.raw`)** and **calibrated uncompressed CFA DNG 1.4 negatives (`.dng`)**.
 
 > **Documentation**: [**`docs/SPECIFICATION.md`** (Containers, Entropy/Wavelet Pipeline & DNG Calibration)](docs/SPECIFICATION.md) · [**`docs/CLI.md`** (CLI Reference & C++17 API)](docs/CLI.md) · [**`LICENSE`**](LICENSE) · [**`NOTICE`**](NOTICE)
 
@@ -26,7 +31,7 @@
 
 ### Modular Expansion Targets
 
-Designed with clean separation between container demuxing, parallel entropy/wavelet decoding, and calibrated CFA DNG emission to accommodate additional entropy-compressed RAW families:
+Designed with clean separation between container demuxing, parallel entropy/wavelet decoding, and calibrated CFA DNG emission to accommodate additional wavelet-compressed cinema RAW families:
 
 - **Sony X-OCN (`.MXF` Extended Tonal Range Original Camera Negative: X-OCN XT / ST / LT)** — planned
 
