@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "../include/nijinWVDC.h"
+#include "tiff_internal.h"
 
 #include <cmath>
 #include <cstdio>
@@ -267,30 +268,47 @@ void build_dng_options_from_clip_and_frame(
         clip, meta, arw6.width, arw6.height, bd, apply_active_crop, override_orientation, opts);
 }
 
-bool apply_bayer_crop(
+bool apply_bayer_crop_strided(
     const uint16_t* src,
+    size_t src_row_stride_bytes,
     uint32_t src_w,
     uint32_t src_h,
     const uint16_t crop_xywh[4],
     const uint8_t src_cfa[4],
-    std::vector<uint16_t>& dst,
+    uint16_t* dst,
+    size_t dst_row_stride_bytes,
     uint8_t dst_cfa[4]) {
-    uint32_t x0 = crop_xywh[0];
-    uint32_t y0 = crop_xywh[1];
-    uint32_t cw = crop_xywh[2];
-    uint32_t ch = crop_xywh[3];
-    if (!src || cw == 0 || ch == 0 || x0 + cw > src_w || y0 + ch > src_h) {
+    if (!src || !dst || !crop_xywh || !src_cfa || !dst_cfa) {
         return false;
     }
-    dst.resize(static_cast<size_t>(cw) * static_cast<size_t>(ch));
+    const uint32_t x0 = crop_xywh[0];
+    const uint32_t y0 = crop_xywh[1];
+    const uint32_t cw = crop_xywh[2];
+    const uint32_t ch = crop_xywh[3];
+    if (cw == 0 || ch == 0 || x0 + cw > src_w || y0 + ch > src_h) {
+        return false;
+    }
+    const size_t min_src_stride = static_cast<size_t>(src_w) * sizeof(uint16_t);
+    const size_t min_dst_stride = static_cast<size_t>(cw) * sizeof(uint16_t);
+    const size_t s_stride = (src_row_stride_bytes == 0) ? min_src_stride : src_row_stride_bytes;
+    const size_t d_stride = (dst_row_stride_bytes == 0) ? min_dst_stride : dst_row_stride_bytes;
+    if (s_stride < min_src_stride || d_stride < min_dst_stride) {
+        return false;
+    }
+
+    const uint8_t* sbase = reinterpret_cast<const uint8_t*>(src);
+    uint8_t* dbase = reinterpret_cast<uint8_t*>(dst);
+    const size_t x_off_bytes = static_cast<size_t>(x0) * sizeof(uint16_t);
+    const size_t row_copy_bytes = static_cast<size_t>(cw) * sizeof(uint16_t);
     for (uint32_t r = 0; r < ch; ++r) {
         std::memcpy(
-            dst.data() + static_cast<size_t>(r) * cw,
-            src + static_cast<size_t>(y0 + r) * src_w + x0,
-            static_cast<size_t>(cw) * sizeof(uint16_t));
+            dbase + static_cast<size_t>(r) * d_stride,
+            sbase + static_cast<size_t>(y0 + r) * s_stride + x_off_bytes,
+            row_copy_bytes);
     }
-    uint32_t dy = y0 & 1u;
-    uint32_t dx = x0 & 1u;
+
+    const uint32_t dy = y0 & 1u;
+    const uint32_t dx = x0 & 1u;
     for (uint32_t ry = 0; ry < 2; ++ry) {
         for (uint32_t rx = 0; rx < 2; ++rx) {
             dst_cfa[ry * 2 + rx] = src_cfa[((ry ^ dy) * 2) + (rx ^ dx)];
@@ -299,12 +317,40 @@ bool apply_bayer_crop(
     return true;
 }
 
-bool write_cfa_dng(
-    const std::string& path,
-    const uint16_t* pixels,
+bool apply_bayer_crop(
+    const uint16_t* src,
+    uint32_t src_w,
+    uint32_t src_h,
+    const uint16_t crop_xywh[4],
+    const uint8_t src_cfa[4],
+    std::vector<uint16_t>& dst,
+    uint8_t dst_cfa[4]) {
+    if (!crop_xywh) {
+        return false;
+    }
+    const uint32_t cw = crop_xywh[2];
+    const uint32_t ch = crop_xywh[3];
+    if (cw == 0 || ch == 0) {
+        return false;
+    }
+    dst.resize(static_cast<size_t>(cw) * static_cast<size_t>(ch));
+    return apply_bayer_crop_strided(
+        src,
+        static_cast<size_t>(src_w) * sizeof(uint16_t),
+        src_w,
+        src_h,
+        crop_xywh,
+        src_cfa,
+        dst.data(),
+        static_cast<size_t>(cw) * sizeof(uint16_t),
+        dst_cfa);
+}
+
+bool build_cfa_dng_header(
     const DngWriteOptions& opts,
+    std::vector<uint8_t>& header_out,
     std::string& err) {
-    if (!pixels || opts.width == 0 || opts.height == 0) {
+    if (opts.width == 0 || opts.height == 0) {
         err = "Invalid image dimensions for DNG output";
         return false;
     }
@@ -444,35 +490,75 @@ bool write_cfa_dng(
     const uint32_t strip_off = data_base + static_cast<uint32_t>(ool_data.size());
     put_le32(b.entries[strip_offset_idx].inline_bytes.data(), strip_off);
 
-    FILE* fp = std::fopen(path.c_str(), "wb");
+    header_out.resize(strip_off);
+    uint8_t* hp = header_out.data();
+    const uint8_t tiff_hdr[8] = {'I', 'I', 42, 0, 8, 0, 0, 0};
+    std::memcpy(hp, tiff_hdr, 8);
+    put_le16(hp + 8, static_cast<uint16_t>(b.entries.size()));
+
+    size_t pos = 10;
+    for (const auto& ent : b.entries) {
+        put_le16(hp + pos, ent.tag);
+        put_le16(hp + pos + 2, ent.type);
+        put_le32(hp + pos + 4, ent.count);
+        if (!ent.ool_bytes.empty()) {
+            put_le32(hp + pos + 8, ent.value_or_offset);
+        } else {
+            std::memcpy(hp + pos + 8, ent.inline_bytes.data(), 4);
+        }
+        pos += 12;
+    }
+    std::memset(hp + pos, 0, 4);
+    pos += 4;
+    if (!ool_data.empty()) {
+        std::memcpy(hp + pos, ool_data.data(), ool_data.size());
+    }
+    return true;
+}
+
+bool encode_cfa_dng_memory(
+    const uint16_t* pixels,
+    const DngWriteOptions& opts,
+    std::vector<uint8_t>& dng_out,
+    std::string& err) {
+    if (!pixels) {
+        err = "Null pixel buffer for DNG encoding";
+        return false;
+    }
+    std::vector<uint8_t> hdr;
+    if (!build_cfa_dng_header(opts, hdr, err)) {
+        return false;
+    }
+    const size_t strip_bytes = static_cast<size_t>(opts.width) * static_cast<size_t>(opts.height) * 2u;
+    dng_out.resize(hdr.size() + strip_bytes);
+    std::memcpy(dng_out.data(), hdr.data(), hdr.size());
+    std::memcpy(dng_out.data() + hdr.size(), pixels, strip_bytes);
+    return true;
+}
+
+bool write_cfa_dng(
+    const std::string& path,
+    const uint16_t* pixels,
+    const DngWriteOptions& opts,
+    std::string& err) {
+    if (!pixels) {
+        err = "Null pixel buffer for DNG output";
+        return false;
+    }
+    std::vector<uint8_t> hdr;
+    if (!build_cfa_dng_header(opts, hdr, err)) {
+        return false;
+    }
+    const size_t strip_bytes = static_cast<size_t>(opts.width) * static_cast<size_t>(opts.height) * 2u;
+
+    FILE* fp = detail::open_c_file_write(path);
     if (!fp) {
         err = "Failed opening DNG output for writing: " + path;
         return false;
     }
 
-    uint8_t tiff_hdr[8] = {'I', 'I', 42, 0, 8, 0, 0, 0};
-    uint8_t cnt_buf[2];
-    put_le16(cnt_buf, static_cast<uint16_t>(b.entries.size()));
-    bool ok = (std::fwrite(tiff_hdr, 1, 8, fp) == 8) &&
-              (std::fwrite(cnt_buf, 1, 2, fp) == 2);
-
-    for (const auto& ent : b.entries) {
-        uint8_t rec[12];
-        put_le16(rec, ent.tag);
-        put_le16(rec + 2, ent.type);
-        put_le32(rec + 4, ent.count);
-        if (!ent.ool_bytes.empty()) {
-            put_le32(rec + 8, ent.value_or_offset);
-        } else {
-            std::memcpy(rec + 8, ent.inline_bytes.data(), 4);
-        }
-        if (ok && std::fwrite(rec, 1, 12, fp) != 12) ok = false;
-    }
-    uint8_t next_ifd[4] = {0, 0, 0, 0};
-    if (ok && std::fwrite(next_ifd, 1, 4, fp) != 4) ok = false;
-    if (ok && !ool_data.empty() && std::fwrite(ool_data.data(), 1, ool_data.size(), fp) != ool_data.size()) ok = false;
-    if (ok && std::fwrite(pixels, 1, strip_bytes, fp) != strip_bytes) ok = false;
-
+    bool ok = (std::fwrite(hdr.data(), 1, hdr.size(), fp) == hdr.size()) &&
+              (std::fwrite(pixels, 1, strip_bytes, fp) == strip_bytes);
     if (std::fclose(fp) != 0) ok = false;
     if (!ok) {
         err = "Write failure while writing DNG: " + path;

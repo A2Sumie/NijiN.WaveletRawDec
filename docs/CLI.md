@@ -1,12 +1,14 @@
-# CLI & C++17 Library Reference
+# CLI, C++17 & Pure C99 Library Reference
 
 ## 1. CLI Synopsis
 
 ```sh
+nijinWVDC --version
 nijinWVDC --info [--json] <in.NEV | in.NEF | in.ARW | in.jxs>
 nijinWVDC <in.NEV | in.NEF | in.ARW> [--frame <N|start-end|all>] -o <out.dng|out.raw|dir/> [options]
 nijinWVDC --raw-jxs <in.jxs> -o <out.raw|out.dng> [options]
 nijinWVDC --extract-jxs <in.NEV | in.NEF> [--frame <N>] -o <out.jxs>
+nijinWVDC --extract-audio <in.NEV> -o <out.wav>
 nijinWVDC --extract-preview <in.NEV | in.NEF | in.ARW> [--thumb] -o <out.jpg>
 nijinWVDC --bench <in.NEV | in.ARW> [--frames N] [--threads N]
 ```
@@ -15,19 +17,21 @@ nijinWVDC --bench <in.NEV | in.ARW> [--frames N] [--threads N]
 
 | Flag | Argument | Description |
 |---|---|---|
+| `-V`, `--version` | — | Prints library/CLI version string (`nijinWVDC 0.2.0`) and exits |
 | `-i`, `--input` | `<path>` | Input file (`.NEV`, `.NEF`, `.ARW`, or `.jxs`; also accepted positionally) |
-| `-o`, `--output` | `<path>` | Output file (`.dng`, `.raw`, `.jxs`, `.jpg`) or directory (creates directory and writes `frame_NNNN.<ext>`) |
+| `-o`, `--output` | `<path>` | Output file (`.dng`, `.raw`, `.jxs`, `.wav`, `.jpg`) or directory (creates directory and writes `frame_NNNN.<ext>`) |
 | `--frame` | `<N \| start-end \| all>` | Frame index, inclusive range (e.g., `0-29`), or `all` (default `0`; `.NEF` and `.ARW` accept `0`) |
 | `--format` | `dng \| raw` | Overrides extension inference when writing into a directory (`.raw` is 16-bit LE RGGB row-major) |
 | `--active-crop` | — | Crops decoded buffer to camera active crop (`CropArea` / `DefaultCrop`) and adjusts `2x2 CFAPattern` parity |
 | `--orientation` | `<1..8>` | Overrides TIFF Orientation tag in output DNG |
 | `--threads` | `<N>` | Worker thread count for slice/chunk entropy decode and 2D IDWT (`0` or omitted uses hardware concurrency) |
-| `--info` | — | Inspect container, camera metadata, tracks, and codestream header without decoding pixels |
+| `--info` | — | Inspect container, camera metadata, tracks (including start SMPTE `timecode`), and codestream header without decoding pixels |
 | `--json` | — | Emits machine-readable JSON when combined with `--info` |
 | `--raw-jxs` | `<in.jxs>` | Decodes a standalone TicoRAW R0 codestream to `.raw` or `.dng` |
 | `--extract-jxs` | `<in.NEV \| in.NEF>` | Extracts bare frame `--frame` TicoRAW codestream bytes to `.jxs` |
-| `--extract-preview` | `<in.NEV \| in.NEF \| in.ARW>` | Extracts embedded preview JPEG (`NCVW` or largest TIFF `Compression=6` SubIFD); add `--thumb` for thumbnail |
-| `--bench` | `<in.NEV \| in.ARW>` | Benchmarks `min(N, total_frames)` clip frames or `N` iterations of a single `.ARW` strip |
+| `--extract-audio` | `<in.NEV>` | Exports embedded QuickTime `lpcm` / PCM audio track as a standard RIFF `.wav` file to `-o <out.wav>` |
+| `--extract-preview` | `<in.NEV \| in.NEF \| in.ARW>` | Extracts embedded preview JPEG (`NCM1` / `NCVW` or largest TIFF `Compression=6` SubIFD); add `--thumb` for thumbnail |
+| `--bench` | `<in.NEV \| in.ARW>` | Benchmarks `min(N, total_frames)` clip frames or `N` iterations of a single `.ARW`/`.jxs` using a persistent `DecoderSession` |
 | `--frames` | `<N>` | Frame count for `--bench` (default `20`) |
 
 ### Exit Codes
@@ -134,68 +138,91 @@ done
 
 ---
 
-## 4. C++17 Static Library (`nijinWVDC_core`) Example
+## 4. C++17 Stateful Pipeline (`MediaReader` + `DecoderSession`) & Pure C99 ABI (`nijinWVDC_c.h`)
 
-Link against `nijinWVDC_core` via CMake and include [`include/nijinWVDC.h`](../include/nijinWVDC.h):
+Link via CMake using `find_package(nijinWVDC CONFIG REQUIRED)` against either `nijinWVDC::static` or `nijinWVDC::shared`:
+
+```cmake
+find_package(nijinWVDC CONFIG REQUIRED)
+target_link_libraries(my_app PRIVATE nijinWVDC::shared) # or nijinWVDC::static
+```
+
+### 4.1 High-Throughput Video/Frame, Audio & Float-Plane C++17 Example (`include/nijinWVDC.h`)
 
 ```cpp
 #include "nijinWVDC.h"
-#include <cstdio>
 #include <vector>
 
-int decode_one_frame(const std::string& input_path, const std::string& out_dng) {
-    std::string err;
-    nijinwvdc::NevClipInfo clip;
-    if (!nijinwvdc::parse_nev_clip(input_path, clip, err)) {
-        std::fprintf(stderr, "parse failed: %s\n", err.c_str());
-        return 1;
+bool process_clip(const std::string& path, const std::string& out_wav, std::string& err) {
+    nijinwvdc::MediaReader reader;
+    if (!reader.open_file(path, err)) return false;
+
+    // Optional synced audio export from .NEV clips
+    if (reader.audio_info().available) {
+        if (!reader.export_audio_wav(out_wav, err)) return false;
     }
 
-    nijinwvdc::NevFrameMeta meta;
-    std::vector<uint8_t> payload;
-    if (!nijinwvdc::read_nev_frame_meta_and_codestream(clip, 0, meta, &payload, err)) {
-        std::fprintf(stderr, "read frame failed: %s\n", err.c_str());
-        return 1;
-    }
+    // Reuse one DecoderSession across frames to amortize worker-pool & arena allocations
+    nijinwvdc::DecoderSession session(/*num_threads=*/0);
+    nijinwvdc::DecodeOptions opts;
+    opts.apply_active_crop = true;
 
     std::vector<uint16_t> bayer;
-    nijinwvdc::DngWriteOptions opts;
-    uint32_t raw_w = 0, raw_h = 0;
+    nijinwvdc::DecodedFrameInfo info;
+    for (uint32_t f = 0; f < reader.frame_count(); ++f) {
+        if (!session.decode_frame(reader, f, opts, bayer, info, err)) return false;
 
-    if (clip.major_brand == "ARW") {
-        nijinwvdc::Arw6Info arw6;
-        if (!nijinwvdc::decode_arw6_bayer(payload.data(), payload.size(), 8, bayer, arw6, err)) {
-            std::fprintf(stderr, "arw6 decode failed: %s\n", err.c_str());
-            return 1;
-        }
-        nijinwvdc::build_dng_options_from_clip_and_frame(clip, meta, arw6, /*apply_active_crop=*/true, 0, opts);
-        raw_w = arw6.width;
-        raw_h = arw6.height;
-    } else {
-        nijinwvdc::TicoRawInfo jxs;
-        if (!nijinwvdc::decode_ticoraw_bayer(payload.data(), payload.size(), 8, bayer, jxs, err)) {
-            std::fprintf(stderr, "ticoraw decode failed: %s\n", err.c_str());
-            return 1;
-        }
-        nijinwvdc::build_dng_options_from_clip_and_frame(clip, meta, jxs, /*apply_active_crop=*/true, 0, opts);
-        raw_w = jxs.width;
-        raw_h = jxs.height;
+        // Example: extract normalized [0, 1] planar float RAW tensor for GPU/ML pipelines
+        const float blk[4] = {
+            static_cast<float>(info.meta.black[0]), static_cast<float>(info.meta.black[1]),
+            static_cast<float>(info.meta.black[2]), static_cast<float>(info.meta.black[3])
+        };
+        const float white = (info.meta.white_level > 0)
+                                ? static_cast<float>(info.meta.white_level)
+                                : static_cast<float>((1u << info.bit_depth) - 1u);
+        std::vector<float> norm(static_cast<size_t>(info.output_width) * info.output_height);
+        nijinwvdc::normalize_bayer_to_float(
+            bayer.data(), 0, info.output_width, info.output_height, blk, white, true, norm.data(), 0);
     }
+    return true;
+}
+```
 
-    std::vector<uint16_t> cropped;
-    const uint16_t* pix = bayer.data();
-    if (meta.has_crop &&
-        nijinwvdc::apply_bayer_crop(bayer.data(), raw_w, raw_h, meta.crop, opts.cfa_pattern, cropped, opts.cfa_pattern)) {
-        pix = cropped.data();
-        opts.width = meta.crop[2];
-        opts.height = meta.crop[3];
-        opts.has_crop = false;
-    }
+> **Note**: Custom I/O sources (`.NEV`, `.NEF`, `.ARW`, bare `.jxs`/`"A000"`) can open via `reader.open_memory(...)` or `reader.open_callbacks(...)`, and callers can supply strided destination buffers via `session.decode_frame_into(...)` or split 2x2 Bayer planes via `split_bayer_cfa_planes(...)`. All legacy free functions (`parse_nev_clip`, `read_nev_frame_meta_and_codestream`, `decode_ticoraw_bayer`, `decode_arw6_bayer`, `apply_bayer_crop`, `write_cfa_dng`) remain preserved in [`include/nijinWVDC.h`](../include/nijinWVDC.h).
 
-    if (!nijinwvdc::write_cfa_dng(out_dng, pix, opts, err)) {
-        std::fprintf(stderr, "write dng failed: %s\n", err.c_str());
-        return 1;
+### 4.2 Pure C99 FFI Example (`include/nijinWVDC_c.h`)
+
+```c
+#include "nijinWVDC_c.h"
+#include <stdlib.h>
+
+nijin_status_t decode_first_frame_c(const char* path, const char* out_dng) {
+    nijin_reader_t* reader = nijin_reader_create();
+    nijin_decoder_t* dec = nijin_decoder_create(0);
+    nijin_clip_info_t clip;
+    nijin_decode_options_t dopts;
+    nijin_decoded_info_t dinfo;
+    nijin_dng_options_t dng_opts;
+    uint16_t* bayer = NULL;
+    nijin_status_t st;
+
+    st = nijin_reader_open_file(reader, path);
+    if (st != NIJIN_OK) goto done;
+    st = nijin_reader_get_clip_info(reader, &clip);
+    if (st != NIJIN_OK) goto done;
+
+    bayer = (uint16_t*)malloc((size_t)clip.width * clip.height * sizeof(uint16_t));
+    nijin_decode_options_init(&dopts);
+    dopts.apply_active_crop = 1;
+    st = nijin_decoder_decode_frame(dec, reader, 0u, &dopts, bayer, 0u, clip.height, &dinfo);
+    if (st == NIJIN_OK) {
+        nijin_dng_options_from_clip(reader, 0u, &dinfo, 1, 0u, &dng_opts);
+        st = nijin_write_dng_file(out_dng, bayer, 0u, &dng_opts, NULL, 0u);
     }
-    return 0;
+done:
+    free(bayer);
+    nijin_decoder_destroy(dec);
+    nijin_reader_destroy(reader);
+    return st;
 }
 ```

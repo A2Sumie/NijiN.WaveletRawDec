@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "../include/nijinWVDC.h"
+#include "codec_internal.h"
+#include "simd_platform.h"
+#include "worker_pool.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <mutex>
 #include <thread>
 #include <vector>
 
 namespace nijinwvdc {
 namespace {
+
+using detail::rd_be64_fast;
+using detail::clz64_nz;
 
 inline uint16_t rd_be16(const uint8_t* p) {
     return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
@@ -31,17 +38,6 @@ inline uint32_t rd_le32(const uint8_t* p) {
 inline uint64_t rd_le64(const uint8_t* p) {
     return static_cast<uint64_t>(rd_le32(p)) |
            (static_cast<uint64_t>(rd_le32(p + 4)) << 32);
-}
-
-inline uint64_t rd_be64_aligned_buf(const uint8_t* p) {
-    return (static_cast<uint64_t>(p[0]) << 56) |
-           (static_cast<uint64_t>(p[1]) << 48) |
-           (static_cast<uint64_t>(p[2]) << 40) |
-           (static_cast<uint64_t>(p[3]) << 32) |
-           (static_cast<uint64_t>(p[4]) << 24) |
-           (static_cast<uint64_t>(p[5]) << 16) |
-           (static_cast<uint64_t>(p[6]) << 8) |
-           static_cast<uint64_t>(p[7]);
 }
 
 // 12-bit to 15-bit inverse non-linear tone mapping table (linear below 1428, smooth highlight expansion to 39002)
@@ -390,57 +386,73 @@ static const uint16_t kArw6NltLut[4096] = {
     38829, 38886, 38944, 39002
 };
 
-// MSB-first 64-bit word bitreader mirroring the even-word (16-byte) stream framing.
+// Pre-shifted 14-bit clamped inverse NLT LUT for inner-loop lookups without shift/clamp per pixel.
+const uint16_t* get_arw6_nlt_lut14() {
+    static const std::array<uint16_t, 4096> lut14 = []() {
+        std::array<uint16_t, 4096> t;
+        for (size_t i = 0; i < 4096u; ++i) {
+            uint16_t v = static_cast<uint16_t>(kArw6NltLut[i] >> 1);
+            t[i] = (v > 0x4000u) ? static_cast<uint16_t>(0x4000u) : v;
+        }
+        return t;
+    }();
+    return lut14.data();
+}
+
+// MSB-first 64-bit word bitreader mirroring the even-word (16-byte) stream framing with zero allocation.
 struct WordBitReader {
-    const uint8_t* ptr = nullptr;
+    const uint8_t* fast_ptr = nullptr;
+    const uint8_t* fast_end = nullptr;
     uint64_t word = 0;
     int32_t bits_left = 0;
-    int32_t words_rem = 0;
     uint32_t err = 0;
-    std::vector<uint8_t> padded;
+    uint64_t tail_words[2] = {0ULL, 0ULL};
+    int32_t tail_idx = 0;
+    int32_t tail_cnt = 0;
 
     void init(const uint8_t* data, size_t len) {
-        word = 0;
+        word = 0ULL;
         bits_left = 0;
         err = 0;
         if (len == 0 || !data) {
-            words_rem = 0;
-            ptr = nullptr;
+            fast_ptr = nullptr;
+            fast_end = nullptr;
+            tail_idx = 0;
+            tail_cnt = 0;
             return;
         }
-        uint32_t wc = (static_cast<uint32_t>((len + 7u) >> 3) + 1u) & ~1u;
-        padded.assign(static_cast<size_t>(wc) * 8u + 8u, 0);
-        std::memcpy(padded.data(), data, len);
-        ptr = padded.data() - 8;
-        words_rem = static_cast<int32_t>(wc);
+        const uint32_t wc = (static_cast<uint32_t>((len + 7u) >> 3) + 1u) & ~1u;
+        const size_t full_words = len >> 3;
+        fast_ptr = data;
+        fast_end = data + (full_words << 3);
+        tail_idx = 0;
+        tail_cnt = static_cast<int32_t>(static_cast<size_t>(wc) - full_words);
+        tail_words[0] = 0ULL;
+        tail_words[1] = 0ULL;
+        const size_t rem_bytes = len & 7u;
+        if (rem_bytes > 0u) {
+            uint8_t tmp[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            std::memcpy(tmp, fast_end, rem_bytes);
+            tail_words[0] = rd_be64_fast(tmp);
+        }
     }
 
-    void init_raw_direct(const uint8_t* data, size_t len) {
-        word = 0;
-        bits_left = 0;
-        err = 0;
-        if (len == 0 || !data) {
-            words_rem = 0;
-            ptr = nullptr;
-            return;
-        }
-        uint32_t wc = (static_cast<uint32_t>((len + 7u) >> 3) + 1u) & ~1u;
-        padded.assign(static_cast<size_t>(wc) * 8u + 8u, 0);
-        std::memcpy(padded.data(), data, len);
-        ptr = padded.data() - 8;
-        words_rem = static_cast<int32_t>(wc);
+    inline void init_raw_direct(const uint8_t* data, size_t len) {
+        init(data, len);
     }
 
     inline bool refill_word() {
-        if (words_rem <= 0) {
-            --words_rem;
-            err = 2;
-            return false;
+        if (fast_ptr < fast_end) {
+            word = rd_be64_fast(fast_ptr);
+            fast_ptr += 8;
+            return true;
         }
-        --words_rem;
-        ptr += 8;
-        word = rd_be64_aligned_buf(ptr);
-        return true;
+        if (tail_idx < tail_cnt) {
+            word = tail_words[tail_idx++];
+            return true;
+        }
+        err = 2;
+        return false;
     }
 
     inline uint32_t read_bits(int n) {
@@ -450,30 +462,30 @@ struct WordBitReader {
             bits_left = 0;
             return 0;
         }
-        int32_t rem = bits_left - n;
+        const int32_t rem = bits_left - n;
         if (rem >= 0) {
             bits_left = rem;
-            uint64_t mask = (1ULL << n) - 1ULL;
+            const uint64_t mask = (1ULL << n) - 1ULL;
             return static_cast<uint32_t>((word >> rem) & mask);
         }
-        uint64_t prev = word;
+        const uint64_t prev = word;
         if (!refill_word()) {
             bits_left = 0;
             return 0;
         }
-        int32_t need_hi = -rem;
+        const int32_t need_hi = -rem;
         bits_left = 64 + rem;
         uint64_t val = (bits_left < 64) ? (word >> bits_left) : 0ULL;
         if (need_hi < 64) {
             val |= (prev << need_hi);
         }
-        uint64_t mask = (1ULL << n) - 1ULL;
+        const uint64_t mask = (1ULL << n) - 1ULL;
         return static_cast<uint32_t>(val & mask);
     }
 
     inline uint32_t read_bit() {
         if (err != 0) return 0;
-        int32_t rem = bits_left - 1;
+        const int32_t rem = bits_left - 1;
         if (rem >= 0) {
             bits_left = rem;
             return static_cast<uint32_t>((word >> rem) & 1ULL);
@@ -489,7 +501,7 @@ struct WordBitReader {
     // Count '0' bits until encountering a terminating '1' bit (consumes terminating '1').
     inline int32_t read_unary_zeros() {
         int32_t zeros = 0;
-        uint64_t rem_bits = (bits_left == 0) ? 0ULL
+        uint64_t rem_bits = (bits_left <= 0) ? 0ULL
                             : ((bits_left >= 64) ? word : (word & ((1ULL << bits_left) - 1ULL)));
         while (rem_bits == 0ULL) {
             zeros += bits_left;
@@ -500,13 +512,7 @@ struct WordBitReader {
             bits_left = 64;
             rem_bits = word;
         }
-        // Position of highest set bit from LSB (0..63)
-        int32_t pos = 0;
-        uint64_t v = rem_bits;
-        while (v > 1ULL) {
-            v >>= 1;
-            ++pos;
-        }
+        const int32_t pos = 63 - clz64_nz(rem_bits);
         zeros += bits_left - pos - 1;
         bits_left = pos;
         return zeros;
@@ -515,32 +521,74 @@ struct WordBitReader {
 
 // Predictive Golomb-Rice parameter tracking across 4-coefficient quads.
 inline void update_k(WordBitReader& br, int32_t& k) {
-    uint32_t first = br.read_bit();
-    if (br.err != 0 || first == 0) {
+    if (br.err == 0 && br.bits_left >= 2) {
+        const uint32_t top2 = static_cast<uint32_t>(br.word >> (br.bits_left - 2)) & 3u;
+        if ((top2 & 2u) == 0u) {
+            --br.bits_left;
+            return;
+        }
+        br.bits_left -= 2;
+        if (top2 == 2u) {
+            const int32_t z = br.read_unary_zeros();
+            k += z + 1;
+            return;
+        }
+        if (k <= 1) {
+            k = 0;
+            return;
+        }
+        const int32_t max_z = k - 1;
+        if (br.bits_left >= max_z) {
+            const uint64_t top_aligned = (br.bits_left == 64) ? br.word : (br.word << (64 - br.bits_left));
+            const int32_t lz = (top_aligned != 0ULL) ? clz64_nz(top_aligned) : 64;
+            if (lz >= max_z) {
+                br.bits_left -= max_z;
+                k = 0;
+            } else {
+                br.bits_left -= (lz + 1);
+                k -= (lz + 1);
+            }
+            return;
+        }
+        for (int32_t z = 0; z < max_z; ++z) {
+            const uint32_t b = br.read_bit();
+            if (br.err != 0) {
+                k = 0;
+                return;
+            }
+            if (b != 0u) {
+                k -= (z + 1);
+                return;
+            }
+        }
+        k = 0;
         return;
     }
-    uint32_t second = br.read_bit();
+
+    const uint32_t first = br.read_bit();
+    if (br.err != 0 || first == 0u) {
+        return;
+    }
+    const uint32_t second = br.read_bit();
     if (br.err != 0) {
         return;
     }
-    if (second == 0) {
-        // '10' + unary(z) -> k += z + 1
-        int32_t z = br.read_unary_zeros();
+    if (second == 0u) {
+        const int32_t z = br.read_unary_zeros();
         k += z + 1;
         return;
     }
-    // '11' + bounded unary decrement; at most (k - 1) zeros needed to reach 0
     if (k <= 1) {
         k = 0;
         return;
     }
     for (int32_t z = 0; z < k - 1; ++z) {
-        uint32_t b = br.read_bit();
+        const uint32_t b = br.read_bit();
         if (br.err != 0) {
             k = 0;
             return;
         }
-        if (b != 0) {
+        if (b != 0u) {
             k -= (z + 1);
             return;
         }
@@ -548,93 +596,115 @@ inline void update_k(WordBitReader& br, int32_t& k) {
     k = 0;
 }
 
-inline uint32_t dequant_mag(uint32_t m, int32_t shift) {
-    if (shift <= 0 || m == 0) {
-        return m;
-    }
-    return (((m << 1) | 1u) << static_cast<uint32_t>(shift - 1)) - (m & 1u);
+inline void store_coeff_val(int16_t& dst, uint32_t val_u) {
+    dst = static_cast<int16_t>(static_cast<uint16_t>(val_u));
 }
 
+inline void store_coeff_val(int32_t& dst, uint32_t val_u) {
+    dst = static_cast<int32_t>(val_u);
+}
+
+template <typename OutT>
 void decode_subband_row(
     WordBitReader& br,
     int32_t shift,
     int32_t num_quads,
-    int32_t* out_coeffs) {
+    OutT* out_coeffs) {
     if (num_quads <= 0) {
         return;
     }
     if (br.err != 0) {
-        std::memset(out_coeffs, 0, static_cast<size_t>(num_quads) * 4u * sizeof(int32_t));
+        std::memset(out_coeffs, 0, static_cast<size_t>(num_quads) * 4u * sizeof(OutT));
         return;
     }
 
     int32_t k = 0;
     update_k(br, k);
     if (br.err != 0 || k < 0 || k > 19) {
-        std::memset(out_coeffs, 0, static_cast<size_t>(num_quads) * 4u * sizeof(int32_t));
+        std::memset(out_coeffs, 0, static_cast<size_t>(num_quads) * 4u * sizeof(OutT));
         return;
     }
 
+    const bool has_shift = (shift > 0);
+    const uint32_t shift_m1 = has_shift ? static_cast<uint32_t>(shift - 1) : 0u;
+
     for (int32_t q = 0; q < num_quads; ++q) {
         if (k == 0) {
-            int32_t rem = num_quads - q;
-            int32_t run = 0;
+            const int32_t rem = num_quads - q;
             if (rem < 2) {
                 std::memset(out_coeffs + static_cast<size_t>(q) * 4u, 0,
-                            static_cast<size_t>(rem) * 4u * sizeof(int32_t));
+                            static_cast<size_t>(rem) * 4u * sizeof(OutT));
                 return;
             }
             int32_t z = 0;
             int32_t base = 1;
             for (;;) {
-                uint32_t b = br.read_bit();
-                if (b != 0) {
+                const uint32_t b = br.read_bit();
+                if (b != 0u) {
                     break;
                 }
                 ++z;
                 base = 1 << z;
                 if (base >= rem) {
                     std::memset(out_coeffs + static_cast<size_t>(q) * 4u, 0,
-                                static_cast<size_t>(rem) * 4u * sizeof(int32_t));
+                                static_cast<size_t>(rem) * 4u * sizeof(OutT));
                     return;
                 }
             }
             if (base >= rem) {
                 std::memset(out_coeffs + static_cast<size_t>(q) * 4u, 0,
-                            static_cast<size_t>(rem) * 4u * sizeof(int32_t));
+                            static_cast<size_t>(rem) * 4u * sizeof(OutT));
                 return;
             }
-            uint32_t suffix = br.read_bits(z);
-            run = base + static_cast<int32_t>(suffix);
+            const uint32_t suffix = br.read_bits(z);
+            const int32_t run = base + static_cast<int32_t>(suffix);
             if (run >= rem) {
                 std::memset(out_coeffs + static_cast<size_t>(q) * 4u, 0,
-                            static_cast<size_t>(rem) * 4u * sizeof(int32_t));
+                            static_cast<size_t>(rem) * 4u * sizeof(OutT));
                 return;
             }
             std::memset(out_coeffs + static_cast<size_t>(q) * 4u, 0,
-                        static_cast<size_t>(run) * 4u * sizeof(int32_t));
+                        static_cast<size_t>(run) * 4u * sizeof(OutT));
             q += run;
 
-            int32_t zk = br.read_unary_zeros();
+            const int32_t zk = br.read_unary_zeros();
             k = zk + 1;
             if (br.err != 0 || k > 19) {
-                int32_t left = num_quads - q;
+                const int32_t left = num_quads - q;
                 std::memset(out_coeffs + static_cast<size_t>(q) * 4u, 0,
-                            static_cast<size_t>(left) * 4u * sizeof(int32_t));
+                            static_cast<size_t>(left) * 4u * sizeof(OutT));
                 return;
             }
         }
 
-        uint32_t m0 = br.read_bits(k);
-        uint32_t m1 = br.read_bits(k);
-        uint32_t m2 = br.read_bits(k);
-        uint32_t m3 = br.read_bits(k);
-        uint32_t mag[4] = {
-            dequant_mag(m0, shift),
-            dequant_mag(m1, shift),
-            dequant_mag(m2, shift),
-            dequant_mag(m3, shift)
-        };
+        uint32_t m0, m1, m2, m3;
+        const int32_t k4 = k * 4;
+        if (br.err == 0 && br.bits_left >= k4) {
+            int32_t bl = br.bits_left - k;
+            const uint64_t mask = (1ULL << k) - 1ULL;
+            const uint64_t w = br.word;
+            m0 = static_cast<uint32_t>((w >> bl) & mask);
+            bl -= k;
+            m1 = static_cast<uint32_t>((w >> bl) & mask);
+            bl -= k;
+            m2 = static_cast<uint32_t>((w >> bl) & mask);
+            bl -= k;
+            m3 = static_cast<uint32_t>((w >> bl) & mask);
+            br.bits_left = bl;
+        } else {
+            m0 = br.read_bits(k);
+            m1 = br.read_bits(k);
+            m2 = br.read_bits(k);
+            m3 = br.read_bits(k);
+        }
+
+        uint32_t mag0 = m0, mag1 = m1, mag2 = m2, mag3 = m3;
+        if (has_shift) {
+            if (m0 != 0u) mag0 = (((m0 << 1) | 1u) << shift_m1) - (m0 & 1u);
+            if (m1 != 0u) mag1 = (((m1 << 1) | 1u) << shift_m1) - (m1 & 1u);
+            if (m2 != 0u) mag2 = (((m2 << 1) | 1u) << shift_m1) - (m2 & 1u);
+            if (m3 != 0u) mag3 = (((m3 << 1) | 1u) << shift_m1) - (m3 & 1u);
+        }
 
         // Update predictor state before reading sign bits of the current quad.
         if (q < num_quads - 1) {
@@ -644,19 +714,42 @@ void decode_subband_row(
             }
         }
 
-        int32_t* dst = out_coeffs + static_cast<size_t>(q) * 4u;
-        for (int i = 0; i < 4; ++i) {
-            if (mag[i] > 0) {
-                uint32_t sgn = br.read_bit();
-                dst[i] = sgn ? static_cast<int32_t>(0u - mag[i]) : static_cast<int32_t>(mag[i]);
-            } else {
-                dst[i] = 0;
+        OutT* const dst = out_coeffs + static_cast<size_t>(q) * 4u;
+        const uint32_t mags[4] = {mag0, mag1, mag2, mag3};
+        if ((mag0 | mag1 | mag2 | mag3) == 0u) {
+            dst[0] = 0;
+            dst[1] = 0;
+            dst[2] = 0;
+            dst[3] = 0;
+        } else if (br.err == 0 && br.bits_left >= 4) {
+            int32_t bl = br.bits_left;
+            const uint64_t w = br.word;
+            for (int i = 0; i < 4; ++i) {
+                const uint32_t mg = mags[i];
+                if (mg > 0u) {
+                    --bl;
+                    const uint32_t sgn = static_cast<uint32_t>((w >> bl) & 1ULL);
+                    store_coeff_val(dst[i], sgn ? (0u - mg) : mg);
+                } else {
+                    dst[i] = 0;
+                }
+            }
+            br.bits_left = bl;
+        } else {
+            for (int i = 0; i < 4; ++i) {
+                const uint32_t mg = mags[i];
+                if (mg > 0u) {
+                    const uint32_t sgn = br.read_bit();
+                    store_coeff_val(dst[i], sgn ? (0u - mg) : mg);
+                } else {
+                    dst[i] = 0;
+                }
             }
         }
         if (br.err != 0) {
-            int32_t left = num_quads - q - 1;
+            const int32_t left = num_quads - q - 1;
             if (left > 0) {
-                std::memset(dst + 4, 0, static_cast<size_t>(left) * 4u * sizeof(int32_t));
+                std::memset(dst + 4, 0, static_cast<size_t>(left) * 4u * sizeof(OutT));
             }
             return;
         }
@@ -924,7 +1017,7 @@ void build_component_geometry(
                 sb.chunk_y_off = off;
             }
             if (sb.w > 0 && sb.h > 0) {
-                sb.data.assign(static_cast<size_t>(sb.w) * static_cast<size_t>(sb.h), 0);
+                sb.data.resize(static_cast<size_t>(sb.w) * static_cast<size_t>(sb.h));
             }
         }
     }
@@ -942,17 +1035,24 @@ void decode_single_band_rows(
     if (sb.w <= 0 || sb.h <= 0) {
         return;
     }
-    int32_t y_beg = std::max(sb.y0, sb.chunk_y_off + chunk_rows * chunk_idx);
-    int32_t y_end = std::min(sb.y1, sb.chunk_y_off + chunk_rows * (chunk_idx + 1));
+    const int32_t y_beg = std::max(sb.y0, sb.chunk_y_off + chunk_rows * chunk_idx);
+    const int32_t y_end = std::min(sb.y1, sb.chunk_y_off + chunk_rows * (chunk_idx + 1));
     if (y_beg >= y_end) {
         return;
     }
-    int32_t num_quads = (sb.w + 3) >> 2;
-    row_work.resize(static_cast<size_t>(num_quads) * 4u + 4u);
-    int32_t shift = cm.shift[shift_idx];
+    const int32_t num_quads = (sb.w + 3) >> 2;
+    const int32_t shift = cm.shift[shift_idx];
 
+    if (!apply_dpcm && (sb.w & 3) == 0) {
+        for (int32_t y = y_beg; y < y_end; ++y) {
+            decode_subband_row<int16_t>(br, shift, num_quads, sb.row_ptr(y));
+        }
+        return;
+    }
+
+    row_work.resize(static_cast<size_t>(num_quads) * 4u + 4u);
     for (int32_t y = y_beg; y < y_end; ++y) {
-        decode_subband_row(br, shift, num_quads, row_work.data());
+        decode_subband_row<int32_t>(br, shift, num_quads, row_work.data());
         if (apply_dpcm) {
             ll0_horiz_dpcm(row_work.data(), sb.w);
         }
@@ -963,161 +1063,974 @@ void decode_single_band_rows(
     }
 }
 
-void idwt_53_horiz_row(
+#if NIJIN_X86_64
+inline __m128i sse2_halve_floor_epi16(__m128i a, __m128i b) {
+    return _mm_add_epi16(_mm_and_si128(a, b), _mm_srai_epi16(_mm_xor_si128(a, b), 1));
+}
+
+inline __m128i sse2_quarter_round2_epi16(__m128i a, __m128i b) {
+    const __m128i h = sse2_halve_floor_epi16(a, b);
+    return _mm_sub_epi16(h, _mm_srai_epi16(h, 1));
+}
+
+NIJIN_TARGET_AVX2 inline __m256i avx2_halve_floor_epi16(__m256i a, __m256i b) {
+    return _mm256_add_epi16(_mm256_and_si256(a, b), _mm256_srai_epi16(_mm256_xor_si256(a, b), 1));
+}
+
+NIJIN_TARGET_AVX2 inline __m256i avx2_quarter_round2_epi16(__m256i a, __m256i b) {
+    const __m256i h = avx2_halve_floor_epi16(a, b);
+    return _mm256_sub_epi16(h, _mm256_srai_epi16(h, 1));
+}
+
+NIJIN_NOINLINE NIJIN_TARGET_AVX2 void vert_even_update_seg_avx2(
+    const int16_t* src_even,
+    const int16_t* rt,
+    const int16_t* rbot,
+    int16_t* dst,
+    int32_t len) {
+    int32_t x = 0;
+    for (; x + 16 <= len; x += 16) {
+        const __m256i t = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(rt + x));
+        const __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(rbot + x));
+        const __m256i delta = avx2_quarter_round2_epi16(t, b);
+        const __m256i s = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src_even + x));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + x), _mm256_sub_epi16(s, delta));
+    }
+    for (; x + 8 <= len; x += 8) {
+        const __m128i t = _mm_loadu_si128(reinterpret_cast<const __m128i*>(rt + x));
+        const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(rbot + x));
+        const __m128i delta = sse2_quarter_round2_epi16(t, b);
+        const __m128i s = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_even + x));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + x), _mm_sub_epi16(s, delta));
+    }
+    for (; x < len; ++x) {
+        const uint32_t s = static_cast<uint32_t>(
+            (static_cast<int32_t>(rt[x]) + static_cast<int32_t>(rbot[x])) * 0x4000 + 0x8000);
+        dst[x] = static_cast<int16_t>(
+            static_cast<uint16_t>(static_cast<uint32_t>(static_cast<uint16_t>(src_even[x])) - (s >> 16)));
+    }
+}
+
+NIJIN_NOINLINE NIJIN_TARGET_AVX2 void vert_odd_predict_seg_avx2(
+    const int16_t* src_odd,
+    const int16_t* rt,
+    const int16_t* rbot,
+    int16_t* dst,
+    int32_t len) {
+    int32_t x = 0;
+    for (; x + 16 <= len; x += 16) {
+        const __m256i t = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(rt + x));
+        const __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(rbot + x));
+        const __m256i pred = avx2_halve_floor_epi16(t, b);
+        const __m256i s = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src_odd + x));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + x), _mm256_add_epi16(s, pred));
+    }
+    for (; x + 8 <= len; x += 8) {
+        const __m128i t = _mm_loadu_si128(reinterpret_cast<const __m128i*>(rt + x));
+        const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(rbot + x));
+        const __m128i pred = sse2_halve_floor_epi16(t, b);
+        const __m128i s = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_odd + x));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + x), _mm_add_epi16(s, pred));
+    }
+    for (; x < len; ++x) {
+        const uint32_t s = static_cast<uint32_t>(
+            static_cast<int32_t>(rt[x]) + static_cast<int32_t>(rbot[x]));
+        dst[x] = static_cast<int16_t>(
+            static_cast<uint16_t>(static_cast<uint32_t>(static_cast<uint16_t>(src_odd[x])) + (s >> 1)));
+    }
+}
+#endif
+
+inline void neon_vert_even_update_seg(
+    const int16_t* src_even,
+    const int16_t* rt,
+    const int16_t* rbot,
+    int16_t* dst,
+    int32_t len) {
+#if NIJIN_X86_64
+    if (detail::cpu_has_avx2()) {
+        vert_even_update_seg_avx2(src_even, rt, rbot, dst, len);
+        return;
+    }
+#endif
+    int32_t x = 0;
+#if NIJIN_ARM_NEON
+    const int16x8_t zero = vdupq_n_s16(0);
+    for (; x + 8 <= len; x += 8) {
+        const int16x8_t t = vld1q_s16(rt + x);
+        const int16x8_t b = vld1q_s16(rbot + x);
+        const int16x8_t delta = vrhaddq_s16(vhaddq_s16(t, b), zero);
+        const uint16x8_t s = vreinterpretq_u16_s16(vld1q_s16(src_even + x));
+        vst1q_s16(dst + x, vreinterpretq_s16_u16(vsubq_u16(s, vreinterpretq_u16_s16(delta))));
+    }
+#elif NIJIN_X86_64
+    for (; x + 8 <= len; x += 8) {
+        const __m128i t = _mm_loadu_si128(reinterpret_cast<const __m128i*>(rt + x));
+        const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(rbot + x));
+        const __m128i delta = sse2_quarter_round2_epi16(t, b);
+        const __m128i s = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_even + x));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + x), _mm_sub_epi16(s, delta));
+    }
+#endif
+    for (; x < len; ++x) {
+        const uint32_t s = static_cast<uint32_t>(
+            (static_cast<int32_t>(rt[x]) + static_cast<int32_t>(rbot[x])) * 0x4000 + 0x8000);
+        dst[x] = static_cast<int16_t>(
+            static_cast<uint16_t>(static_cast<uint32_t>(static_cast<uint16_t>(src_even[x])) - (s >> 16)));
+    }
+}
+
+inline void neon_vert_odd_predict_seg(
+    const int16_t* src_odd,
+    const int16_t* rt,
+    const int16_t* rbot,
+    int16_t* dst,
+    int32_t len) {
+#if NIJIN_X86_64
+    if (detail::cpu_has_avx2()) {
+        vert_odd_predict_seg_avx2(src_odd, rt, rbot, dst, len);
+        return;
+    }
+#endif
+    int32_t x = 0;
+#if NIJIN_ARM_NEON
+    for (; x + 8 <= len; x += 8) {
+        const int16x8_t t = vld1q_s16(rt + x);
+        const int16x8_t b = vld1q_s16(rbot + x);
+        const int16x8_t pred = vhaddq_s16(t, b);
+        const uint16x8_t s = vreinterpretq_u16_s16(vld1q_s16(src_odd + x));
+        vst1q_s16(dst + x, vreinterpretq_s16_u16(vaddq_u16(s, vreinterpretq_u16_s16(pred))));
+    }
+#elif NIJIN_X86_64
+    for (; x + 8 <= len; x += 8) {
+        const __m128i t = _mm_loadu_si128(reinterpret_cast<const __m128i*>(rt + x));
+        const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(rbot + x));
+        const __m128i pred = sse2_halve_floor_epi16(t, b);
+        const __m128i s = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_odd + x));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + x), _mm_add_epi16(s, pred));
+    }
+#endif
+    for (; x < len; ++x) {
+        const uint32_t s = static_cast<uint32_t>(
+            static_cast<int32_t>(rt[x]) + static_cast<int32_t>(rbot[x]));
+        dst[x] = static_cast<int16_t>(
+            static_cast<uint16_t>(static_cast<uint32_t>(static_cast<uint16_t>(src_odd[x])) + (s >> 1)));
+    }
+}
+
+#if NIJIN_X86_64
+NIJIN_NOINLINE NIJIN_TARGET_AVX2 void idwt_53_horiz_row_avx2(
     const int16_t* low,
     int32_t w_low,
     const int16_t* high,
     int32_t w_high,
-    int16_t* dst) {
-    for (int32_t i = 0; i < w_low; ++i) {
-        dst[2 * i] = low[i];
+    int16_t* dst,
+    int16_t* even_buf) {
+    const int32_t total = w_low + w_high;
+    const int32_t safe_even = (w_low < w_high) ? w_low : w_high;
+    int32_t i = 1;
+    for (; i + 16 <= safe_even; i += 16) {
+        const __m256i left = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(high + i - 1));
+        const __m256i right = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(high + i));
+        const __m256i delta = avx2_quarter_round2_epi16(left, right);
+        const __m256i lv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(low + i));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(even_buf + i), _mm256_sub_epi16(lv, delta));
     }
-    for (int32_t i = 0; i < w_high; ++i) {
-        dst[2 * i + 1] = high[i];
+    for (; i + 8 <= safe_even; i += 8) {
+        const __m128i left = _mm_loadu_si128(reinterpret_cast<const __m128i*>(high + i - 1));
+        const __m128i right = _mm_loadu_si128(reinterpret_cast<const __m128i*>(high + i));
+        const __m128i delta = sse2_quarter_round2_epi16(left, right);
+        const __m128i lv = _mm_loadu_si128(reinterpret_cast<const __m128i*>(low + i));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(even_buf + i), _mm_sub_epi16(lv, delta));
     }
-    int32_t total = w_low + w_high;
-    if (total < 2) {
+    for (; i < w_low; ++i) {
+        const int32_t left = high[i - 1];
+        const int32_t right = (2 * i + 1 < total) ? high[i] : left;
+        const uint32_t s = static_cast<uint32_t>((left + right) * 0x4000 + 0x8000);
+        even_buf[i] = static_cast<int16_t>(
+            static_cast<uint16_t>(static_cast<uint32_t>(static_cast<uint16_t>(low[i])) - (s >> 16)));
+    }
+
+    const int32_t safe_odd = std::min<int32_t>(w_high, w_low - 1);
+    int32_t k = 0;
+    for (; k + 16 <= safe_odd; k += 16) {
+        const __m256i ev0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(even_buf + k));
+        const __m256i ev1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(even_buf + k + 1));
+        const __m256i hv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(high + k));
+        const __m256i odd_v = _mm256_add_epi16(hv, avx2_halve_floor_epi16(ev0, ev1));
+        const __m256i lo = _mm256_unpacklo_epi16(ev0, odd_v);
+        const __m256i hi = _mm256_unpackhi_epi16(ev0, odd_v);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + 2 * k), _mm256_permute2x128_si256(lo, hi, 0x20));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + 2 * k + 16), _mm256_permute2x128_si256(lo, hi, 0x31));
+    }
+    for (; k + 8 <= safe_odd; k += 8) {
+        const __m128i ev0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(even_buf + k));
+        const __m128i ev1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(even_buf + k + 1));
+        const __m128i hv = _mm_loadu_si128(reinterpret_cast<const __m128i*>(high + k));
+        const __m128i odd_v = _mm_add_epi16(hv, sse2_halve_floor_epi16(ev0, ev1));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 2 * k), _mm_unpacklo_epi16(ev0, odd_v));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 2 * k + 8), _mm_unpackhi_epi16(ev0, odd_v));
+    }
+    for (; k < safe_odd; ++k) {
+        const int32_t left = even_buf[k];
+        const int32_t right = even_buf[k + 1];
+        const uint32_t s = static_cast<uint32_t>(left + right);
+        dst[2 * k] = even_buf[k];
+        dst[2 * k + 1] = static_cast<int16_t>(
+            static_cast<uint16_t>(static_cast<uint32_t>(static_cast<uint16_t>(high[k])) + (s >> 1)));
+    }
+    for (; k < w_high; ++k) {
+        if (k < w_low) dst[2 * k] = even_buf[k];
+        const int32_t left = (k < w_low) ? even_buf[k] : 0;
+        if (2 * k + 2 < total && (k + 1) < w_low) {
+            const int32_t right = even_buf[k + 1];
+            const uint32_t s = static_cast<uint32_t>(left + right);
+            dst[2 * k + 1] = static_cast<int16_t>(
+                static_cast<uint16_t>(static_cast<uint32_t>(static_cast<uint16_t>(high[k])) + (s >> 1)));
+        } else {
+            dst[2 * k + 1] = static_cast<int16_t>(
+                static_cast<uint16_t>(static_cast<uint32_t>(static_cast<uint16_t>(high[k])) + static_cast<uint32_t>(left)));
+        }
+    }
+    for (int32_t j = k; j < w_low; ++j) {
+        dst[2 * j] = even_buf[j];
+    }
+}
+#endif
+
+void idwt_53_horiz_row_fast(
+    const int16_t* low,
+    int32_t w_low,
+    const int16_t* high,
+    int32_t w_high,
+    int16_t* dst,
+    int16_t* even_buf) {
+    const int32_t total = w_low + w_high;
+    if (total <= 0) {
+        return;
+    }
+    if (total == 1) {
+        if (w_low == 1) {
+            dst[0] = low[0];
+        } else if (w_high == 1) {
+            dst[0] = high[0];
+        }
+        return;
+    }
+    if (w_low <= 0 || w_high <= 0) {
+        for (int32_t i = 0; i < w_low; ++i) dst[2 * i] = low[i];
+        for (int32_t i = 0; i < w_high; ++i) dst[2 * i + 1] = high[i];
         return;
     }
 
-    // Even samples update step
+    // Even samples update into contiguous L1 even_buf[0..w_low)
     {
-        uint32_t s = static_cast<uint32_t>(static_cast<int32_t>(dst[1]) * 0x8000 + 0x8000);
-        dst[0] = static_cast<int16_t>(static_cast<uint16_t>(static_cast<uint32_t>(static_cast<uint16_t>(dst[0])) - (s >> 16)));
+        const uint32_t s0 = static_cast<uint32_t>(static_cast<int32_t>(high[0]) * 0x8000 + 0x8000);
+        even_buf[0] = static_cast<int16_t>(
+            static_cast<uint16_t>(static_cast<uint32_t>(static_cast<uint16_t>(low[0])) - (s0 >> 16)));
     }
-    for (int32_t i = 1; i < w_low; ++i) {
-        int32_t left = dst[2 * i - 1];
-        int32_t right = (2 * i + 1 < total) ? dst[2 * i + 1] : left;
-        uint32_t s = static_cast<uint32_t>((left + right) * 0x4000 + 0x8000);
-        dst[2 * i] = static_cast<int16_t>(static_cast<uint16_t>(static_cast<uint32_t>(static_cast<uint16_t>(dst[2 * i])) - (s >> 16)));
+#if NIJIN_X86_64
+    if (detail::cpu_has_avx2()) {
+        idwt_53_horiz_row_avx2(low, w_low, high, w_high, dst, even_buf);
+        return;
+    }
+#endif
+    const int32_t safe_even = (w_low < w_high) ? w_low : w_high;
+    int32_t i = 1;
+#if NIJIN_ARM_NEON
+    const int16x8_t zero_v = vdupq_n_s16(0);
+    for (; i + 8 <= safe_even; i += 8) {
+        const int16x8_t left = vld1q_s16(high + i - 1);
+        const int16x8_t right = vld1q_s16(high + i);
+        const int16x8_t delta = vrhaddq_s16(vhaddq_s16(left, right), zero_v);
+        const uint16x8_t lv = vreinterpretq_u16_s16(vld1q_s16(low + i));
+        vst1q_s16(even_buf + i, vreinterpretq_s16_u16(vsubq_u16(lv, vreinterpretq_u16_s16(delta))));
+    }
+#elif NIJIN_X86_64
+    for (; i + 8 <= safe_even; i += 8) {
+        const __m128i left = _mm_loadu_si128(reinterpret_cast<const __m128i*>(high + i - 1));
+        const __m128i right = _mm_loadu_si128(reinterpret_cast<const __m128i*>(high + i));
+        const __m128i delta = sse2_quarter_round2_epi16(left, right);
+        const __m128i lv = _mm_loadu_si128(reinterpret_cast<const __m128i*>(low + i));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(even_buf + i), _mm_sub_epi16(lv, delta));
+    }
+#endif
+    for (; i < w_low; ++i) {
+        const int32_t left = high[i - 1];
+        const int32_t right = (2 * i + 1 < total) ? high[i] : left;
+        const uint32_t s = static_cast<uint32_t>((left + right) * 0x4000 + 0x8000);
+        even_buf[i] = static_cast<int16_t>(
+            static_cast<uint16_t>(static_cast<uint32_t>(static_cast<uint16_t>(low[i])) - (s >> 16)));
     }
 
-    // Odd samples predict step
-    for (int32_t i = 0; i < w_high; ++i) {
-        int32_t left = dst[2 * i];
-        if (2 * i + 2 < total) {
-            int32_t right = dst[2 * i + 2];
-            uint32_t s = static_cast<uint32_t>(left + right);
-            dst[2 * i + 1] = static_cast<int16_t>(static_cast<uint16_t>(static_cast<uint32_t>(static_cast<uint16_t>(dst[2 * i + 1])) + (s >> 1)));
+    // Odd samples predict + SIMD interleave directly to dst
+    const int32_t safe_odd = std::min<int32_t>(w_high, w_low - 1);
+    int32_t k = 0;
+#if NIJIN_ARM_NEON
+    for (; k + 8 <= safe_odd; k += 8) {
+        const int16x8_t ev0 = vld1q_s16(even_buf + k);
+        const int16x8_t ev1 = vld1q_s16(even_buf + k + 1);
+        const int16x8_t hv = vld1q_s16(high + k);
+        const int16x8_t odd_v = vreinterpretq_s16_u16(
+            vaddq_u16(vreinterpretq_u16_s16(hv), vreinterpretq_u16_s16(vhaddq_s16(ev0, ev1))));
+        int16x8x2_t pair;
+        pair.val[0] = ev0;
+        pair.val[1] = odd_v;
+        vst2q_s16(dst + 2 * k, pair);
+    }
+#elif NIJIN_X86_64
+    for (; k + 8 <= safe_odd; k += 8) {
+        const __m128i ev0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(even_buf + k));
+        const __m128i ev1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(even_buf + k + 1));
+        const __m128i hv = _mm_loadu_si128(reinterpret_cast<const __m128i*>(high + k));
+        const __m128i odd_v = _mm_add_epi16(hv, sse2_halve_floor_epi16(ev0, ev1));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 2 * k), _mm_unpacklo_epi16(ev0, odd_v));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 2 * k + 8), _mm_unpackhi_epi16(ev0, odd_v));
+    }
+#endif
+    for (; k < safe_odd; ++k) {
+        const int32_t left = even_buf[k];
+        const int32_t right = even_buf[k + 1];
+        const uint32_t s = static_cast<uint32_t>(left + right);
+        dst[2 * k] = even_buf[k];
+        dst[2 * k + 1] = static_cast<int16_t>(
+            static_cast<uint16_t>(static_cast<uint32_t>(static_cast<uint16_t>(high[k])) + (s >> 1)));
+    }
+    for (; k < w_high; ++k) {
+        if (k < w_low) {
+            dst[2 * k] = even_buf[k];
+        }
+        const int32_t left = (k < w_low) ? even_buf[k] : 0;
+        if (2 * k + 2 < total && (k + 1) < w_low) {
+            const int32_t right = even_buf[k + 1];
+            const uint32_t s = static_cast<uint32_t>(left + right);
+            dst[2 * k + 1] = static_cast<int16_t>(
+                static_cast<uint16_t>(static_cast<uint32_t>(static_cast<uint16_t>(high[k])) + (s >> 1)));
         } else {
-            dst[2 * i + 1] = static_cast<int16_t>(static_cast<uint16_t>(static_cast<uint32_t>(static_cast<uint16_t>(dst[2 * i + 1])) + static_cast<uint32_t>(left)));
+            dst[2 * k + 1] = static_cast<int16_t>(
+                static_cast<uint16_t>(static_cast<uint32_t>(static_cast<uint16_t>(high[k])) + static_cast<uint32_t>(left)));
+        }
+    }
+    for (int32_t j = k; j < w_low; ++j) {
+        dst[2 * j] = even_buf[j];
+    }
+}
+
+void idwt_2d_level_fallback(
+    const ResolutionBox& rb,
+    const int16_t* ll_ptr,
+    int32_t ll_w,
+    int32_t ll_y0,
+    std::vector<int16_t>& vert_buf,
+    std::vector<int16_t>& next_ll,
+    std::vector<int16_t>& even_buf) {
+    const SubbandBox& hl = rb.sb[1];
+    const SubbandBox& lh = rb.sb[2];
+    const SubbandBox& hh = rb.sb[3];
+
+    const size_t plane_elems = static_cast<size_t>(rb.w) * static_cast<size_t>(rb.h);
+    vert_buf.assign(plane_elems, 0);
+    next_ll.assign(plane_elems, 0);
+    even_buf.resize(static_cast<size_t>(rb.w) + 8u);
+
+    for (int32_t y = rb.y0; y < rb.y1; ++y) {
+        int16_t* vrow = vert_buf.data() + static_cast<size_t>(y - rb.y0) * static_cast<size_t>(rb.w);
+        const int32_t half_y = y >> 1;
+        if ((y & 1) == 0) {
+            const int16_t* lptr = ll_ptr + static_cast<size_t>(half_y - ll_y0) * static_cast<size_t>(ll_w);
+            const int16_t* hptr = hl.row_ptr(half_y);
+            const int32_t copy_l = (ll_w <= rb.w) ? ll_w : rb.w;
+            if (copy_l > 0) std::memcpy(vrow, lptr, static_cast<size_t>(copy_l) * sizeof(int16_t));
+            const int32_t copy_h = (ll_w + hl.w <= rb.w) ? hl.w : (rb.w - ll_w);
+            if (copy_h > 0 && hptr) std::memcpy(vrow + ll_w, hptr, static_cast<size_t>(copy_h) * sizeof(int16_t));
+        } else {
+            const int16_t* lptr = lh.row_ptr(half_y);
+            const int16_t* hptr = hh.row_ptr(half_y);
+            const int32_t copy_l = (lh.w <= rb.w) ? lh.w : rb.w;
+            if (copy_l > 0 && lptr) std::memcpy(vrow, lptr, static_cast<size_t>(copy_l) * sizeof(int16_t));
+            const int32_t copy_h = (lh.w + hh.w <= rb.w) ? hh.w : (rb.w - lh.w);
+            if (copy_h > 0 && hptr) std::memcpy(vrow + lh.w, hptr, static_cast<size_t>(copy_h) * sizeof(int16_t));
+        }
+    }
+
+    if (rb.h >= 2) {
+        for (int32_t y = rb.y0; y < rb.y1; ++y) {
+            if ((y & 1) == 0) {
+                const int32_t yt = (y - 1 >= rb.y0) ? (y - 1) : (y + 1);
+                const int32_t yb = (y + 1 < rb.y1) ? (y + 1) : (y - 1);
+                const int16_t* rt = vert_buf.data() + static_cast<size_t>(yt - rb.y0) * static_cast<size_t>(rb.w);
+                const int16_t* rbot = vert_buf.data() + static_cast<size_t>(yb - rb.y0) * static_cast<size_t>(rb.w);
+                int16_t* rc = vert_buf.data() + static_cast<size_t>(y - rb.y0) * static_cast<size_t>(rb.w);
+                neon_vert_even_update_seg(rc, rt, rbot, rc, rb.w);
+            }
+        }
+        for (int32_t y = rb.y0; y < rb.y1; ++y) {
+            if ((y & 1) != 0) {
+                const int32_t yt = (y - 1 >= rb.y0) ? (y - 1) : (y + 1);
+                const int32_t yb = (y + 1 < rb.y1) ? (y + 1) : (y - 1);
+                const int16_t* rt = vert_buf.data() + static_cast<size_t>(yt - rb.y0) * static_cast<size_t>(rb.w);
+                const int16_t* rbot = vert_buf.data() + static_cast<size_t>(yb - rb.y0) * static_cast<size_t>(rb.w);
+                int16_t* rc = vert_buf.data() + static_cast<size_t>(y - rb.y0) * static_cast<size_t>(rb.w);
+                neon_vert_odd_predict_seg(rc, rt, rbot, rc, rb.w);
+            }
+        }
+    }
+
+    for (int32_t y = rb.y0; y < rb.y1; ++y) {
+        const int16_t* vrow = vert_buf.data() + static_cast<size_t>(y - rb.y0) * static_cast<size_t>(rb.w);
+        int16_t* dst_row = next_ll.data() + static_cast<size_t>(y - rb.y0) * static_cast<size_t>(rb.w);
+        const int32_t w_low = ((y & 1) == 0) ? ll_w : lh.w;
+        const int32_t w_high = ((y & 1) == 0) ? hl.w : hh.w;
+        if (w_low + w_high == rb.w) {
+            idwt_53_horiz_row_fast(vrow, w_low, vrow + w_low, w_high, dst_row, even_buf.data());
         }
     }
 }
 
-void idwt_2d_component(
-    const ComponentStream& comp,
-    std::vector<int16_t>& out_plane) {
-    const ResolutionBox& top = comp.res[comp.max_res];
-    out_plane.assign(static_cast<size_t>(top.w) * static_cast<size_t>(top.h), 0);
+struct Arw6WorkerWork {
+    std::vector<int32_t> dpcm_row;
+    std::vector<int16_t> ev0;
+    std::vector<int16_t> ev1;
+    std::vector<int16_t> odd_row;
+    std::vector<int16_t> horiz_even;
+    std::vector<int16_t> g0_a;
+    std::vector<int16_t> g0_b;
+    WordBitReader br;
 
-    if (comp.max_res == 0) {
-        const SubbandBox& sb = top.sb[0];
-        if (sb.w > 0 && sb.h > 0 && sb.data.size() == out_plane.size()) {
-            std::memcpy(out_plane.data(), sb.data.data(), sb.data.size() * sizeof(int16_t));
+    void ensure_idwt_row_cap(int32_t w) {
+        const size_t need = static_cast<size_t>(w) + 8u;
+        if (ev0.size() < need) ev0.resize(need);
+        if (ev1.size() < need) ev1.resize(need);
+        if (odd_row.size() < need) odd_row.resize(need);
+        if (horiz_even.size() < need) horiz_even.resize(need);
+    }
+
+    void ensure_g0_cap(uint32_t w_comp) {
+        const size_t need = static_cast<size_t>(w_comp) + 8u;
+        if (g0_a.size() < need) g0_a.resize(need);
+        if (g0_b.size() < need) g0_b.resize(need);
+    }
+};
+
+struct Arw6ArenaImpl {
+    std::array<ComponentStream, 4> comps;
+    std::array<std::vector<int16_t>, 3> idwt_ping;
+    std::array<std::vector<int16_t>, 3> idwt_pong;
+    std::vector<int16_t> fallback_vert;
+    std::array<std::array<ParsedResStream, 4>, 4> parsed_streams;
+    std::vector<Arw6WorkerWork> workers;
+
+    void ensure_workers(int n) {
+        if (static_cast<int>(workers.size()) < n) {
+            workers.resize(static_cast<size_t>(n));
         }
+    }
+};
+
+inline std::mutex& global_arw6_arena_mutex() {
+    static std::mutex mtx;
+    return mtx;
+}
+
+inline Arw6ArenaImpl& global_arw6_arena_instance() {
+    static Arw6ArenaImpl arena;
+    return arena;
+}
+
+struct Arw6ArenaLease {
+    std::unique_lock<std::mutex> global_lk;
+    std::unique_ptr<Arw6ArenaImpl> local_arena;
+    Arw6ArenaImpl* ptr = nullptr;
+
+    explicit Arw6ArenaLease(Arw6ArenaImpl* external) {
+        if (external != nullptr) {
+            ptr = external;
+            return;
+        }
+        std::unique_lock<std::mutex> lk(global_arw6_arena_mutex(), std::try_to_lock);
+        if (lk.owns_lock()) {
+            global_lk = std::move(lk);
+            ptr = &global_arw6_arena_instance();
+        } else {
+            local_arena.reset(new Arw6ArenaImpl());
+            ptr = local_arena.get();
+        }
+    }
+};
+
+void idwt_2d_level_strip(
+    const ResolutionBox& rb,
+    const int16_t* ll_ptr,
+    int32_t ll_w,
+    int32_t ll_y0,
+    int32_t y_beg,
+    int32_t y_end,
+    int16_t* next_ll_data,
+    Arw6WorkerWork& ww) {
+    const SubbandBox& hl = rb.sb[1];
+    const SubbandBox& lh = rb.sb[2];
+    const SubbandBox& hh = rb.sb[3];
+
+    ww.ensure_idwt_row_cap(rb.w);
+    int16_t* const ev_buf[2] = {ww.ev0.data(), ww.ev1.data()};
+    int32_t ev_y[2] = {-1, -1};
+    int16_t* const odd_buf = ww.odd_row.data();
+    int16_t* const horiz_even = ww.horiz_even.data();
+
+    auto compute_v_even = [&](int32_t ye, int16_t* out) {
+        const int32_t half_y = ye >> 1;
+        const int32_t yt = (ye - 1 >= rb.y0) ? (ye - 1) : (ye + 1);
+        const int32_t yb = (ye + 1 < rb.y1) ? (ye + 1) : (ye - 1);
+        const int32_t hy_t = yt >> 1;
+        const int32_t hy_b = yb >> 1;
+        const int16_t* l_src = ll_ptr + static_cast<size_t>(half_y - ll_y0) * static_cast<size_t>(ll_w);
+        neon_vert_even_update_seg(l_src, lh.row_ptr(hy_t), lh.row_ptr(hy_b), out, ll_w);
+        neon_vert_even_update_seg(hl.row_ptr(half_y), hh.row_ptr(hy_t), hh.row_ptr(hy_b), out + ll_w, hl.w);
+    };
+
+    for (int32_t y = y_beg; y < y_end; ++y) {
+        int16_t* const dst_row = next_ll_data + static_cast<size_t>(y - rb.y0) * static_cast<size_t>(rb.w);
+        if ((y & 1) == 0) {
+            const int32_t slot = (y >> 1) & 1;
+            if (ev_y[slot] != y) {
+                compute_v_even(y, ev_buf[slot]);
+                ev_y[slot] = y;
+            }
+            const int16_t* erow = ev_buf[slot];
+            idwt_53_horiz_row_fast(erow, ll_w, erow + ll_w, hl.w, dst_row, horiz_even);
+        } else {
+            const int32_t yt = (y - 1 >= rb.y0) ? (y - 1) : (y + 1);
+            const int32_t yb = (y + 1 < rb.y1) ? (y + 1) : (y - 1);
+            const int32_t slot_t = (yt >> 1) & 1;
+            if (ev_y[slot_t] != yt) {
+                compute_v_even(yt, ev_buf[slot_t]);
+                ev_y[slot_t] = yt;
+            }
+            const int32_t slot_b = (yb >> 1) & 1;
+            if (ev_y[slot_b] != yb) {
+                compute_v_even(yb, ev_buf[slot_b]);
+                ev_y[slot_b] = yb;
+            }
+            const int32_t half_y = y >> 1;
+            neon_vert_odd_predict_seg(lh.row_ptr(half_y), ev_buf[slot_t], ev_buf[slot_b], odd_buf, lh.w);
+            neon_vert_odd_predict_seg(hh.row_ptr(half_y), ev_buf[slot_t] + lh.w, ev_buf[slot_b] + lh.w, odd_buf + lh.w, hh.w);
+            idwt_53_horiz_row_fast(odd_buf, lh.w, odd_buf + lh.w, hh.w, dst_row, horiz_even);
+        }
+    }
+}
+
+#if NIJIN_X86_64
+NIJIN_NOINLINE NIJIN_TARGET_AVX2 void synthesize_g0_row_avx2(
+    const int16_t* h_prev,
+    const int16_t* h_curr,
+    const int16_t* l_curr,
+    int16_t* g0_out,
+    uint32_t w_comp) {
+    uint32_t c = 0u;
+    const __m256i mask16 = _mm256_set1_epi32(0xFFFF);
+    for (; c + 9u <= w_comp; c += 8u) {
+        const __m256i hp0 = _mm256_cvtepi16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(h_prev + c)));
+        const __m256i hp1 = _mm256_cvtepi16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(h_prev + c + 1)));
+        const __m256i hc0 = _mm256_cvtepi16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(h_curr + c)));
+        const __m256i hc1 = _mm256_cvtepi16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(h_curr + c + 1)));
+        const __m256i sum4 = _mm256_add_epi32(_mm256_add_epi32(hp0, hp1), _mm256_add_epi32(hc0, hc1));
+        const __m256i q = _mm256_srli_epi32(sum4, 2);
+        const __m256i gl = _mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(l_curr + c))), 1);
+        const __m256i res = _mm256_and_si256(_mm256_srli_epi32(_mm256_sub_epi32(gl, q), 1), mask16);
+        const __m256i pk = _mm256_permute4x64_epi64(_mm256_packus_epi32(res, res), 0xD8);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(g0_out + c), _mm256_castsi256_si128(pk));
+    }
+    for (; c + 1u < w_comp; ++c) {
+        const uint32_t sum4 = static_cast<uint32_t>(
+            static_cast<int32_t>(h_prev[c]) + static_cast<int32_t>(h_prev[c + 1]) +
+            static_cast<int32_t>(h_curr[c]) + static_cast<int32_t>(h_curr[c + 1]));
+        const uint32_t twice_gl = static_cast<uint32_t>(static_cast<uint16_t>(l_curr[c])) << 1;
+        g0_out[c] = static_cast<int16_t>((twice_gl - (sum4 >> 2)) >> 1);
+    }
+    const uint32_t last = w_comp - 1u;
+    const uint32_t sum2 = static_cast<uint32_t>(
+        static_cast<int32_t>(h_prev[last]) + static_cast<int32_t>(h_curr[last]));
+    const uint32_t twice_gl = static_cast<uint32_t>(static_cast<uint16_t>(l_curr[last])) << 1;
+    g0_out[last] = static_cast<int16_t>((twice_gl - (sum2 >> 1)) >> 1);
+}
+
+NIJIN_NOINLINE NIJIN_TARGET_AVX2 void reconstruct_bayer_row_avx2(
+    const int16_t* e_curr,
+    const int16_t* e_next,
+    const int16_t* h_curr,
+    const int16_t* r_curr,
+    const int16_t* b_curr,
+    uint16_t* dst0,
+    uint16_t* dst1,
+    uint32_t w_comp,
+    const uint16_t* lut14) {
+    uint32_t c = 1u;
+    const __m256i mask16 = _mm256_set1_epi32(0xFFFF);
+    const __m256i zero_v = _mm256_setzero_si256();
+    const __m256i bias_v = _mm256_set1_epi16(2048);
+    const __m256i max_v = _mm256_set1_epi16(4095);
+
+    for (; c + 16u <= w_comp; c += 16u) {
+        const __m256i ec0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(e_curr + c - 1));
+        const __m256i ec1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(e_curr + c));
+        const __m256i en0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(e_next + c - 1));
+        const __m256i en1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(e_next + c));
+        const __m256i hc_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(h_curr + c));
+        const __m256i rc_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(r_curr + c));
+        const __m256i bc_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_curr + c));
+
+        const __m256i s_lo = _mm256_add_epi32(
+            _mm256_add_epi32(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(ec0)),
+                             _mm256_cvtepi16_epi32(_mm256_castsi256_si128(ec1))),
+            _mm256_add_epi32(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(en0)),
+                             _mm256_cvtepi16_epi32(_mm256_castsi256_si128(en1))));
+        const __m256i s_hi = _mm256_add_epi32(
+            _mm256_add_epi32(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(ec0, 1)),
+                             _mm256_cvtepi16_epi32(_mm256_extracti128_si256(ec1, 1))),
+            _mm256_add_epi32(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(en0, 1)),
+                             _mm256_cvtepi16_epi32(_mm256_extracti128_si256(en1, 1))));
+        const __m256i q_lo = _mm256_and_si256(_mm256_srli_epi32(s_lo, 2), mask16);
+        const __m256i q_hi = _mm256_and_si256(_mm256_srli_epi32(s_hi, 2), mask16);
+        const __m256i q16 = _mm256_permute4x64_epi64(_mm256_packus_epi32(q_lo, q_hi), 0xD8);
+        const __m256i g1_wav = _mm256_add_epi16(hc_v, q16);
+
+        const __m256i ug1 = _mm256_min_epi16(_mm256_max_epi16(_mm256_adds_epi16(bias_v, g1_wav), zero_v), max_v);
+        const __m256i ug0 = _mm256_min_epi16(_mm256_max_epi16(_mm256_adds_epi16(bias_v, ec1), zero_v), max_v);
+        const __m256i g_avg = avx2_halve_floor_epi16(ug1, ug0);
+
+        const __m256i ur = _mm256_min_epi16(_mm256_max_epi16(_mm256_adds_epi16(g_avg, _mm256_adds_epi16(rc_v, rc_v)), zero_v), max_v);
+        const __m256i ub = _mm256_min_epi16(_mm256_max_epi16(_mm256_adds_epi16(g_avg, _mm256_adds_epi16(bc_v, bc_v)), zero_v), max_v);
+
+        int16_t idx_r[16], idx_g0[16], idx_g1[16], idx_b[16];
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(idx_r), ur);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(idx_g0), ug0);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(idx_g1), ug1);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(idx_b), ub);
+
+        uint16_t vr[16], vg0[16], vg1[16], vb[16];
+        for (int i = 0; i < 16; ++i) {
+            vr[i]  = lut14[idx_r[i]];
+            vg0[i] = lut14[idx_g0[i]];
+            vg1[i] = lut14[idx_g1[i]];
+            vb[i]  = lut14[idx_b[i]];
+        }
+
+        const __m256i r_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(vr));
+        const __m256i g0_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(vg0));
+        const __m256i g1_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(vg1));
+        const __m256i b_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(vb));
+
+        const __m256i ev_lo = _mm256_unpacklo_epi16(r_v, g0_v);
+        const __m256i ev_hi = _mm256_unpackhi_epi16(r_v, g0_v);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst0 + 2u * c), _mm256_permute2x128_si256(ev_lo, ev_hi, 0x20));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst0 + 2u * c + 16u), _mm256_permute2x128_si256(ev_lo, ev_hi, 0x31));
+
+        const __m256i od_lo = _mm256_unpacklo_epi16(g1_v, b_v);
+        const __m256i od_hi = _mm256_unpackhi_epi16(g1_v, b_v);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst1 + 2u * c), _mm256_permute2x128_si256(od_lo, od_hi, 0x20));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst1 + 2u * c + 16u), _mm256_permute2x128_si256(od_lo, od_hi, 0x31));
+    }
+
+    for (; c < w_comp; ++c) {
+        const int16_t g0_wav = e_curr[c];
+        const uint32_t sum4 = static_cast<uint32_t>(
+            static_cast<int32_t>(e_curr[c - 1]) + static_cast<int32_t>(e_curr[c]) +
+            static_cast<int32_t>(e_next[c - 1]) + static_cast<int32_t>(e_next[c]));
+        const int16_t g1_wav = static_cast<int16_t>(static_cast<uint16_t>(h_curr[c]) + (sum4 >> 2));
+
+        const int32_t ug1 = std::max<int32_t>(0, std::min<int32_t>(2048 + static_cast<int32_t>(g1_wav), 4095));
+        const int32_t ug0 = std::max<int32_t>(0, std::min<int32_t>(2048 + static_cast<int32_t>(g0_wav), 4095));
+        const int32_t g_avg = (ug1 + ug0) >> 1;
+
+        const int32_t ur = std::max<int32_t>(0, std::min<int32_t>(g_avg + 2 * static_cast<int32_t>(r_curr[c]), 4095));
+        const int32_t ub = std::max<int32_t>(0, std::min<int32_t>(g_avg + 2 * static_cast<int32_t>(b_curr[c]), 4095));
+
+        dst0[2u * c]      = lut14[ur];
+        dst0[2u * c + 1u] = lut14[ug0];
+        dst1[2u * c]      = lut14[ug1];
+        dst1[2u * c + 1u] = lut14[ub];
+    }
+}
+#endif
+
+inline void synthesize_g0_row(
+    const int16_t* h_prev,
+    const int16_t* h_curr,
+    const int16_t* l_curr,
+    int16_t* g0_out,
+    uint32_t w_comp) {
+    if (w_comp == 0u) {
         return;
     }
+#if NIJIN_X86_64
+    if (detail::cpu_has_avx2()) {
+        synthesize_g0_row_avx2(h_prev, h_curr, l_curr, g0_out, w_comp);
+        return;
+    }
+#endif
+    uint32_t c = 0u;
+#if NIJIN_ARM_NEON
+    for (; c + 9u <= w_comp; c += 8u) {
+        const int16x8_t hp0 = vld1q_s16(h_prev + c);
+        const int16x8_t hp1 = vld1q_s16(h_prev + c + 1);
+        const int16x8_t hc0 = vld1q_s16(h_curr + c);
+        const int16x8_t hc1 = vld1q_s16(h_curr + c + 1);
+        const uint16x8_t gl = vreinterpretq_u16_s16(vld1q_s16(l_curr + c));
 
-    const ResolutionBox& r0 = comp.res[0];
-    std::vector<int16_t> ll_cur = r0.sb[0].data;
-    int32_t ll_w = r0.sb[0].w;
-    int32_t ll_h = r0.sb[0].h;
-    int32_t ll_x0 = r0.sb[0].x0;
-    int32_t ll_y0 = r0.sb[0].y0;
-    (void)ll_x0;
-    (void)ll_h;
+        const int32x4_t s_lo = vaddq_s32(
+            vaddl_s16(vget_low_s16(hp0), vget_low_s16(hp1)),
+            vaddl_s16(vget_low_s16(hc0), vget_low_s16(hc1)));
+        const int32x4_t s_hi = vaddq_s32(
+            vaddl_s16(vget_high_s16(hp0), vget_high_s16(hp1)),
+            vaddl_s16(vget_high_s16(hc0), vget_high_s16(hc1)));
 
-    std::vector<int16_t> vert_buf;
-    std::vector<int16_t> next_ll;
-    for (int32_t r = 1; r <= comp.max_res; ++r) {
-        const ResolutionBox& rb = comp.res[r];
-        const SubbandBox& hl = rb.sb[1];
-        const SubbandBox& lh = rb.sb[2];
-        const SubbandBox& hh = rb.sb[3];
+        const uint32x4_t q_lo = vshrq_n_u32(vreinterpretq_u32_s32(s_lo), 2);
+        const uint32x4_t q_hi = vshrq_n_u32(vreinterpretq_u32_s32(s_hi), 2);
 
-        const size_t plane_elems = static_cast<size_t>(rb.w) * static_cast<size_t>(rb.h);
-        vert_buf.assign(plane_elems, 0);
-        next_ll.assign(plane_elems, 0);
+        const uint32x4_t res_lo = vshrq_n_u32(vsubq_u32(vshll_n_u16(vget_low_u16(gl), 1), q_lo), 1);
+        const uint32x4_t res_hi = vshrq_n_u32(vsubq_u32(vshll_n_u16(vget_high_u16(gl), 1), q_hi), 1);
 
-        for (int32_t y = rb.y0; y < rb.y1; ++y) {
-            int16_t* vrow = vert_buf.data() + static_cast<size_t>(y - rb.y0) * static_cast<size_t>(rb.w);
-            int32_t half_y = y >> 1;
-            if ((y & 1) == 0) {
-                const int16_t* lptr = ll_cur.data() + static_cast<size_t>(half_y - ll_y0) * static_cast<size_t>(ll_w);
-                const int16_t* hptr = hl.row_ptr(half_y);
-                int32_t copy_l = (ll_w <= rb.w) ? ll_w : rb.w;
-                if (copy_l > 0) {
-                    std::memcpy(vrow, lptr, static_cast<size_t>(copy_l) * sizeof(int16_t));
-                }
-                int32_t copy_h = (ll_w + hl.w <= rb.w) ? hl.w : (rb.w - ll_w);
-                if (copy_h > 0 && hptr) {
-                    std::memcpy(vrow + ll_w, hptr, static_cast<size_t>(copy_h) * sizeof(int16_t));
-                }
-            } else {
-                const int16_t* lptr = lh.row_ptr(half_y);
-                const int16_t* hptr = hh.row_ptr(half_y);
-                int32_t copy_l = (lh.w <= rb.w) ? lh.w : rb.w;
-                if (copy_l > 0 && lptr) {
-                    std::memcpy(vrow, lptr, static_cast<size_t>(copy_l) * sizeof(int16_t));
-                }
-                int32_t copy_h = (lh.w + hh.w <= rb.w) ? hh.w : (rb.w - lh.w);
-                if (copy_h > 0 && hptr) {
-                    std::memcpy(vrow + lh.w, hptr, static_cast<size_t>(copy_h) * sizeof(int16_t));
-                }
-            }
-        }
+        const uint16x8_t res = vcombine_u16(vmovn_u32(res_lo), vmovn_u32(res_hi));
+        vst1q_s16(g0_out + c, vreinterpretq_s16_u16(res));
+    }
+#elif NIJIN_X86_64
+    const __m128i zero16 = _mm_setzero_si128();
+    for (; c + 9u <= w_comp; c += 8u) {
+        const __m128i hp0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(h_prev + c));
+        const __m128i hp1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(h_prev + c + 1));
+        const __m128i hc0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(h_curr + c));
+        const __m128i hc1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(h_curr + c + 1));
+        const __m128i gl = _mm_loadu_si128(reinterpret_cast<const __m128i*>(l_curr + c));
 
-        // 1D vertical 5/3 IDWT first on [LL|HL] / [LH|HH] rows in [rb.y0, rb.y1)
-        if (rb.h >= 2) {
-            for (int32_t y = rb.y0; y < rb.y1; ++y) {
-                if ((y & 1) == 0) {
-                    int32_t yt = (y - 1 >= rb.y0) ? (y - 1) : (y + 1);
-                    int32_t yb = (y + 1 < rb.y1) ? (y + 1) : (y - 1);
-                    const int16_t* rt = vert_buf.data() + static_cast<size_t>(yt - rb.y0) * static_cast<size_t>(rb.w);
-                    const int16_t* rbot = vert_buf.data() + static_cast<size_t>(yb - rb.y0) * static_cast<size_t>(rb.w);
-                    int16_t* rc = vert_buf.data() + static_cast<size_t>(y - rb.y0) * static_cast<size_t>(rb.w);
-                    for (int32_t x = 0; x < rb.w; ++x) {
-                        uint32_t s = static_cast<uint32_t>((static_cast<int32_t>(rt[x]) + static_cast<int32_t>(rbot[x])) * 0x4000 + 0x8000);
-                        rc[x] = static_cast<int16_t>(static_cast<uint16_t>(static_cast<uint32_t>(static_cast<uint16_t>(rc[x])) - (s >> 16)));
-                    }
-                }
-            }
-            for (int32_t y = rb.y0; y < rb.y1; ++y) {
-                if ((y & 1) != 0) {
-                    int32_t yt = (y - 1 >= rb.y0) ? (y - 1) : (y + 1);
-                    int32_t yb = (y + 1 < rb.y1) ? (y + 1) : (y - 1);
-                    const int16_t* rt = vert_buf.data() + static_cast<size_t>(yt - rb.y0) * static_cast<size_t>(rb.w);
-                    const int16_t* rbot = vert_buf.data() + static_cast<size_t>(yb - rb.y0) * static_cast<size_t>(rb.w);
-                    int16_t* rc = vert_buf.data() + static_cast<size_t>(y - rb.y0) * static_cast<size_t>(rb.w);
-                    for (int32_t x = 0; x < rb.w; ++x) {
-                        uint32_t s = static_cast<uint32_t>(static_cast<int32_t>(rt[x]) + static_cast<int32_t>(rbot[x]));
-                        rc[x] = static_cast<int16_t>(static_cast<uint16_t>(static_cast<uint32_t>(static_cast<uint16_t>(rc[x])) + (s >> 1)));
-                    }
-                }
-            }
-        }
+        const __m128i hp0_s = _mm_srai_epi16(hp0, 15);
+        const __m128i hp1_s = _mm_srai_epi16(hp1, 15);
+        const __m128i hc0_s = _mm_srai_epi16(hc0, 15);
+        const __m128i hc1_s = _mm_srai_epi16(hc1, 15);
 
-        // 1D horizontal 5/3 IDWT second into next_ll
-        for (int32_t y = rb.y0; y < rb.y1; ++y) {
-            const int16_t* vrow = vert_buf.data() + static_cast<size_t>(y - rb.y0) * static_cast<size_t>(rb.w);
-            int16_t* dst_row = next_ll.data() + static_cast<size_t>(y - rb.y0) * static_cast<size_t>(rb.w);
-            int32_t w_low = ((y & 1) == 0) ? ll_w : lh.w;
-            int32_t w_high = ((y & 1) == 0) ? hl.w : hh.w;
-            if (w_low + w_high == rb.w) {
-                idwt_53_horiz_row(vrow, w_low, vrow + w_low, w_high, dst_row);
-            }
-        }
+        const __m128i s_lo = _mm_add_epi32(
+            _mm_add_epi32(_mm_unpacklo_epi16(hp0, hp0_s), _mm_unpacklo_epi16(hp1, hp1_s)),
+            _mm_add_epi32(_mm_unpacklo_epi16(hc0, hc0_s), _mm_unpacklo_epi16(hc1, hc1_s)));
+        const __m128i s_hi = _mm_add_epi32(
+            _mm_add_epi32(_mm_unpackhi_epi16(hp0, hp0_s), _mm_unpackhi_epi16(hp1, hp1_s)),
+            _mm_add_epi32(_mm_unpackhi_epi16(hc0, hc0_s), _mm_unpackhi_epi16(hc1, hc1_s)));
 
-        ll_cur.swap(next_ll);
-        ll_w = rb.w;
-        ll_h = rb.h;
-        ll_x0 = rb.x0;
-        ll_y0 = rb.y0;
-        (void)ll_h;
+        const __m128i gl_lo = _mm_slli_epi32(_mm_unpacklo_epi16(gl, zero16), 1);
+        const __m128i gl_hi = _mm_slli_epi32(_mm_unpackhi_epi16(gl, zero16), 1);
+        const __m128i r_lo = _mm_srli_epi32(_mm_sub_epi32(gl_lo, _mm_srli_epi32(s_lo, 2)), 1);
+        const __m128i r_hi = _mm_srli_epi32(_mm_sub_epi32(gl_hi, _mm_srli_epi32(s_hi, 2)), 1);
+
+        const __m128i pk = _mm_packs_epi32(
+            _mm_srai_epi32(_mm_slli_epi32(r_lo, 16), 16),
+            _mm_srai_epi32(_mm_slli_epi32(r_hi, 16), 16));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(g0_out + c), pk);
+    }
+#endif
+    for (; c + 1u < w_comp; ++c) {
+        const uint32_t sum4 = static_cast<uint32_t>(
+            static_cast<int32_t>(h_prev[c]) + static_cast<int32_t>(h_prev[c + 1]) +
+            static_cast<int32_t>(h_curr[c]) + static_cast<int32_t>(h_curr[c + 1]));
+        const uint32_t twice_gl = static_cast<uint32_t>(static_cast<uint16_t>(l_curr[c])) << 1;
+        g0_out[c] = static_cast<int16_t>((twice_gl - (sum4 >> 2)) >> 1);
+    }
+    const uint32_t last = w_comp - 1u;
+    const uint32_t sum2 = static_cast<uint32_t>(
+        static_cast<int32_t>(h_prev[last]) + static_cast<int32_t>(h_curr[last]));
+    const uint32_t twice_gl = static_cast<uint32_t>(static_cast<uint16_t>(l_curr[last])) << 1;
+    g0_out[last] = static_cast<int16_t>((twice_gl - (sum2 >> 1)) >> 1);
+}
+
+inline void reconstruct_bayer_row(
+    const int16_t* e_curr,
+    const int16_t* e_next,
+    const int16_t* h_curr,
+    const int16_t* r_curr,
+    const int16_t* b_curr,
+    uint16_t* dst0,
+    uint16_t* dst1,
+    uint32_t w_comp,
+    int32_t nlt_bits,
+    const uint16_t* lut14) {
+    if (w_comp == 0u) {
+        return;
+    }
+    const int32_t nlt_bias = 1 << (nlt_bits - 1);
+    const int32_t nlt_max = (1 << nlt_bits) - 1;
+
+    // c = 0 boundary column
+    {
+        const int16_t g0_wav = e_curr[0];
+        const uint32_t sum2 = static_cast<uint32_t>(
+            static_cast<int32_t>(e_curr[0]) + static_cast<int32_t>(e_next[0]));
+        const int16_t g1_wav = static_cast<int16_t>(static_cast<uint16_t>(h_curr[0]) + (sum2 >> 1));
+
+        const int32_t ug1 = std::max<int32_t>(0, std::min<int32_t>(nlt_bias + static_cast<int32_t>(g1_wav), nlt_max));
+        const int32_t ug0 = std::max<int32_t>(0, std::min<int32_t>(nlt_bias + static_cast<int32_t>(g0_wav), nlt_max));
+        const int32_t g_avg = (ug1 + ug0) >> 1;
+
+        const int32_t ur = std::max<int32_t>(0, std::min<int32_t>(g_avg + 2 * static_cast<int32_t>(r_curr[0]), nlt_max));
+        const int32_t ub = std::max<int32_t>(0, std::min<int32_t>(g_avg + 2 * static_cast<int32_t>(b_curr[0]), nlt_max));
+
+        dst0[0] = lut14[ur];
+        dst0[1] = lut14[ug0];
+        dst1[0] = lut14[ug1];
+        dst1[1] = lut14[ub];
     }
 
-    out_plane.swap(ll_cur);
+#if NIJIN_X86_64
+    if (nlt_bits == 12 && detail::cpu_has_avx2()) {
+        reconstruct_bayer_row_avx2(e_curr, e_next, h_curr, r_curr, b_curr, dst0, dst1, w_comp, lut14);
+        return;
+    }
+#endif
+
+    uint32_t c = 1u;
+#if NIJIN_ARM_NEON
+    if (nlt_bits == 12) {
+        const int16x8_t zero_v = vdupq_n_s16(0);
+        const int16x8_t bias_v = vdupq_n_s16(2048);
+        const int16x8_t max_v = vdupq_n_s16(4095);
+        for (; c + 8u <= w_comp; c += 8u) {
+            const int16x8_t ec0 = vld1q_s16(e_curr + c - 1);
+            const int16x8_t ec1 = vld1q_s16(e_curr + c);
+            const int16x8_t en0 = vld1q_s16(e_next + c - 1);
+            const int16x8_t en1 = vld1q_s16(e_next + c);
+            const int16x8_t hc_v = vld1q_s16(h_curr + c);
+            const int16x8_t rc_v = vld1q_s16(r_curr + c);
+            const int16x8_t bc_v = vld1q_s16(b_curr + c);
+
+            const int32x4_t s_lo = vaddq_s32(
+                vaddl_s16(vget_low_s16(ec0), vget_low_s16(ec1)),
+                vaddl_s16(vget_low_s16(en0), vget_low_s16(en1)));
+            const int32x4_t s_hi = vaddq_s32(
+                vaddl_s16(vget_high_s16(ec0), vget_high_s16(ec1)),
+                vaddl_s16(vget_high_s16(en0), vget_high_s16(en1)));
+
+            const uint16x8_t q16 = vcombine_u16(
+                vmovn_u32(vshrq_n_u32(vreinterpretq_u32_s32(s_lo), 2)),
+                vmovn_u32(vshrq_n_u32(vreinterpretq_u32_s32(s_hi), 2)));
+            const int16x8_t g1_wav = vreinterpretq_s16_u16(vaddq_u16(vreinterpretq_u16_s16(hc_v), q16));
+
+            const int16x8_t ug1 = vminq_s16(vmaxq_s16(vqaddq_s16(bias_v, g1_wav), zero_v), max_v);
+            const int16x8_t ug0 = vminq_s16(vmaxq_s16(vqaddq_s16(bias_v, ec1), zero_v), max_v);
+            const int16x8_t g_avg = vhaddq_s16(ug1, ug0);
+
+            const int16x8_t ur = vminq_s16(vmaxq_s16(vqaddq_s16(g_avg, vqaddq_s16(rc_v, rc_v)), zero_v), max_v);
+            const int16x8_t ub = vminq_s16(vmaxq_s16(vqaddq_s16(g_avg, vqaddq_s16(bc_v, bc_v)), zero_v), max_v);
+
+            uint16x8_t r_out = vdupq_n_u16(0);
+            uint16x8_t g0_out = vdupq_n_u16(0);
+            uint16x8_t g1_out = vdupq_n_u16(0);
+            uint16x8_t b_out = vdupq_n_u16(0);
+
+#define ARW6_LUT_LANE(LANE)                                                     \
+            r_out  = vsetq_lane_u16(lut14[vgetq_lane_s16(ur, LANE)], r_out, LANE); \
+            g0_out = vsetq_lane_u16(lut14[vgetq_lane_s16(ug0, LANE)], g0_out, LANE); \
+            g1_out = vsetq_lane_u16(lut14[vgetq_lane_s16(ug1, LANE)], g1_out, LANE); \
+            b_out  = vsetq_lane_u16(lut14[vgetq_lane_s16(ub, LANE)], b_out, LANE);
+
+            ARW6_LUT_LANE(0)
+            ARW6_LUT_LANE(1)
+            ARW6_LUT_LANE(2)
+            ARW6_LUT_LANE(3)
+            ARW6_LUT_LANE(4)
+            ARW6_LUT_LANE(5)
+            ARW6_LUT_LANE(6)
+            ARW6_LUT_LANE(7)
+#undef ARW6_LUT_LANE
+
+            uint16x8x2_t row0_pair;
+            row0_pair.val[0] = r_out;
+            row0_pair.val[1] = g0_out;
+            vst2q_u16(dst0 + 2u * c, row0_pair);
+
+            uint16x8x2_t row1_pair;
+            row1_pair.val[0] = g1_out;
+            row1_pair.val[1] = b_out;
+            vst2q_u16(dst1 + 2u * c, row1_pair);
+        }
+    }
+#elif NIJIN_X86_64
+    if (nlt_bits == 12) {
+        const __m128i zero_v = _mm_setzero_si128();
+        const __m128i bias_v = _mm_set1_epi16(2048);
+        const __m128i max_v = _mm_set1_epi16(4095);
+        for (; c + 8u <= w_comp; c += 8u) {
+            const __m128i ec0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(e_curr + c - 1));
+            const __m128i ec1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(e_curr + c));
+            const __m128i en0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(e_next + c - 1));
+            const __m128i en1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(e_next + c));
+            const __m128i hc_v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(h_curr + c));
+            const __m128i rc_v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(r_curr + c));
+            const __m128i bc_v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b_curr + c));
+
+            const __m128i ec0_s = _mm_srai_epi16(ec0, 15);
+            const __m128i ec1_s = _mm_srai_epi16(ec1, 15);
+            const __m128i en0_s = _mm_srai_epi16(en0, 15);
+            const __m128i en1_s = _mm_srai_epi16(en1, 15);
+            const __m128i s_lo = _mm_add_epi32(
+                _mm_add_epi32(_mm_unpacklo_epi16(ec0, ec0_s), _mm_unpacklo_epi16(ec1, ec1_s)),
+                _mm_add_epi32(_mm_unpacklo_epi16(en0, en0_s), _mm_unpacklo_epi16(en1, en1_s)));
+            const __m128i s_hi = _mm_add_epi32(
+                _mm_add_epi32(_mm_unpackhi_epi16(ec0, ec0_s), _mm_unpackhi_epi16(ec1, ec1_s)),
+                _mm_add_epi32(_mm_unpackhi_epi16(en0, en0_s), _mm_unpackhi_epi16(en1, en1_s)));
+            const __m128i q_lo = _mm_srli_epi32(s_lo, 2);
+            const __m128i q_hi = _mm_srli_epi32(s_hi, 2);
+            const __m128i q16 = _mm_packs_epi32(
+                _mm_srai_epi32(_mm_slli_epi32(q_lo, 16), 16),
+                _mm_srai_epi32(_mm_slli_epi32(q_hi, 16), 16));
+            const __m128i g1_wav = _mm_add_epi16(hc_v, q16);
+
+            const __m128i ug1 = _mm_min_epi16(_mm_max_epi16(_mm_adds_epi16(bias_v, g1_wav), zero_v), max_v);
+            const __m128i ug0 = _mm_min_epi16(_mm_max_epi16(_mm_adds_epi16(bias_v, ec1), zero_v), max_v);
+            const __m128i g_avg = sse2_halve_floor_epi16(ug1, ug0);
+
+            const __m128i ur = _mm_min_epi16(_mm_max_epi16(_mm_adds_epi16(g_avg, _mm_adds_epi16(rc_v, rc_v)), zero_v), max_v);
+            const __m128i ub = _mm_min_epi16(_mm_max_epi16(_mm_adds_epi16(g_avg, _mm_adds_epi16(bc_v, bc_v)), zero_v), max_v);
+
+            int16_t idx_r[8], idx_g0[8], idx_g1[8], idx_b[8];
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(idx_r), ur);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(idx_g0), ug0);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(idx_g1), ug1);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(idx_b), ub);
+
+            uint16_t vr[8], vg0[8], vg1[8], vb[8];
+            for (int i = 0; i < 8; ++i) {
+                vr[i]  = lut14[idx_r[i]];
+                vg0[i] = lut14[idx_g0[i]];
+                vg1[i] = lut14[idx_g1[i]];
+                vb[i]  = lut14[idx_b[i]];
+            }
+            const __m128i r_v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(vr));
+            const __m128i g0_v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(vg0));
+            const __m128i g1_v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(vg1));
+            const __m128i b_v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(vb));
+
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst0 + 2u * c), _mm_unpacklo_epi16(r_v, g0_v));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst0 + 2u * c + 8u), _mm_unpackhi_epi16(r_v, g0_v));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst1 + 2u * c), _mm_unpacklo_epi16(g1_v, b_v));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst1 + 2u * c + 8u), _mm_unpackhi_epi16(g1_v, b_v));
+        }
+    }
+#endif
+    for (; c < w_comp; ++c) {
+        const int16_t g0_wav = e_curr[c];
+        const uint32_t sum4 = static_cast<uint32_t>(
+            static_cast<int32_t>(e_curr[c - 1]) + static_cast<int32_t>(e_curr[c]) +
+            static_cast<int32_t>(e_next[c - 1]) + static_cast<int32_t>(e_next[c]));
+        const int16_t g1_wav = static_cast<int16_t>(static_cast<uint16_t>(h_curr[c]) + (sum4 >> 2));
+
+        const int32_t ug1 = std::max<int32_t>(0, std::min<int32_t>(nlt_bias + static_cast<int32_t>(g1_wav), nlt_max));
+        const int32_t ug0 = std::max<int32_t>(0, std::min<int32_t>(nlt_bias + static_cast<int32_t>(g0_wav), nlt_max));
+        const int32_t g_avg = (ug1 + ug0) >> 1;
+
+        const int32_t ur = std::max<int32_t>(0, std::min<int32_t>(g_avg + 2 * static_cast<int32_t>(r_curr[c]), nlt_max));
+        const int32_t ub = std::max<int32_t>(0, std::min<int32_t>(g_avg + 2 * static_cast<int32_t>(b_curr[c]), nlt_max));
+
+        dst0[2u * c]      = lut14[ur];
+        dst0[2u * c + 1u] = lut14[ug0];
+        dst1[2u * c]      = lut14[ug1];
+        dst1[2u * c + 1u] = lut14[ub];
+    }
 }
 
 bool decode_arw6_codestream_internal(
@@ -1128,9 +2041,12 @@ bool decode_arw6_codestream_internal(
     uint32_t tile_y,
     uint32_t full_w,
     uint32_t full_h,
-    std::vector<uint16_t>& bayer_out,
+    uint16_t* dst_base,
+    size_t dst_stride_u16,
     Arw6Info& info,
-    std::string& err) {
+    std::string& err,
+    detail::WorkerPool* external_pool,
+    Arw6ArenaImpl* external_arena) {
     if (!probe_arw6_codestream(cs, cs_len, info, err)) {
         return false;
     }
@@ -1149,8 +2065,11 @@ bool decode_arw6_codestream_internal(
         return false;
     }
 
+    Arw6ArenaLease arena_lease(external_arena);
+    Arw6ArenaImpl& arena = *arena_lease.ptr;
+
     // 4 internal wavelet components: [0]=G_L (4 res), [1]=R (4 res), [2]=B (4 res), [3]=G_H (1 res)
-    std::array<ComponentStream, 4> comps;
+    std::array<ComponentStream, 4>& comps = arena.comps;
     build_component_geometry(w_comp, h_half, info.decomp_levels, info.decomp_levels, comps[0]);
     build_component_geometry(w_comp, h_half, info.decomp_levels, info.decomp_levels, comps[1]);
     build_component_geometry(w_comp, h_half, info.decomp_levels, info.decomp_levels, comps[2]);
@@ -1163,21 +2082,45 @@ bool decode_arw6_codestream_internal(
         const ParsedResStream* stream = nullptr;
     };
 
-    std::array<std::array<ParsedResStream, 4>, 4> parsed_streams;
+    std::array<std::array<ParsedResStream, 4>, 4>& parsed_streams = arena.parsed_streams;
     std::vector<DecodeTask> tasks;
+    tasks.reserve(3500u);
     for (int c = 0; c < 4; ++c) {
-        int max_r = (c == 3) ? 0 : 3;
+        const int max_r = (c == 3) ? 0 : 3;
         for (int r = 0; r <= max_r; ++r) {
             const StreamSlice& sl = comp_res_slices[c][r];
             if (static_cast<uint64_t>(sl.offset) + sl.size > cs_len) {
                 err = "ARW6 resolution stream exceeds codestream bounds";
                 return false;
             }
-            int32_t expected_nb = (r == 0) ? 1 : 3;
+            const int32_t expected_nb = (r == 0) ? 1 : 3;
             if (!parse_chunk_directory(cs + sl.offset, sl.size, expected_nb, parsed_streams[c][r], err)) {
                 return false;
             }
             const ParsedResStream& prs = parsed_streams[c][r];
+            const int32_t crows = (r == 0) ? ((c == 3) ? 8 : 1) : (1 << (r - 1));
+            const int32_t b_start = (r == 0) ? 0 : 1;
+            const int32_t b_end = (r == 0) ? 1 : 4;
+            for (int32_t b = b_start; b < b_end; ++b) {
+                SubbandBox& sb = comps[c].res[r].sb[b];
+                if (sb.w <= 0 || sb.h <= 0) {
+                    continue;
+                }
+                const int32_t cov_y0 = std::max(sb.y0, sb.chunk_y_off);
+                const int32_t cov_y1 = std::min(sb.y1, sb.chunk_y_off + crows * static_cast<int32_t>(prs.chunks.size()));
+                if (cov_y0 > cov_y1) {
+                    std::memset(sb.data.data(), 0, sb.data.size() * sizeof(int16_t));
+                } else {
+                    if (cov_y0 > sb.y0) {
+                        std::memset(sb.row_ptr(sb.y0), 0,
+                                    static_cast<size_t>(cov_y0 - sb.y0) * static_cast<size_t>(sb.w) * sizeof(int16_t));
+                    }
+                    if (cov_y1 < sb.y1) {
+                        std::memset(sb.row_ptr(cov_y1), 0,
+                                    static_cast<size_t>(sb.y1 - cov_y1) * static_cast<size_t>(sb.w) * sizeof(int16_t));
+                    }
+                }
+            }
             for (size_t ci = 0; ci < prs.chunks.size(); ++ci) {
                 DecodeTask t;
                 t.comp_idx = static_cast<uint8_t>(c);
@@ -1189,172 +2132,160 @@ bool decode_arw6_codestream_internal(
         }
     }
 
-    int workers = num_threads;
-    if (workers <= 0) {
-        unsigned hw = std::thread::hardware_concurrency();
-        workers = hw > 0 ? static_cast<int>(hw) : 4;
-    }
-    workers = std::max(1, std::min<int>(workers, static_cast<int>(std::max<size_t>(1, tasks.size()))));
+    int workers = detail::resolve_worker_count(num_threads);
+    workers = std::max(1, std::min<int>(workers, static_cast<int>(std::max<size_t>(1u, tasks.size()))));
+    arena.ensure_workers(workers);
 
-    auto run_entropy_slice = [&](size_t tid, size_t total_workers) {
-        WordBitReader br;
-        std::vector<int32_t> row_work;
-        for (size_t idx = tid; idx < tasks.size(); idx += total_workers) {
+    detail::PoolLease pool(workers, external_pool);
+
+    // Stage 1: Dynamic chunk-stealing entropy decode into subband buffers.
+    pool.parallel_chunks(tasks.size(), 4u, workers, [&](size_t beg, size_t end, int worker_idx) {
+        Arw6WorkerWork& ww = arena.workers[static_cast<size_t>(worker_idx)];
+        WordBitReader& br = ww.br;
+        for (size_t idx = beg; idx < end; ++idx) {
             const DecodeTask& t = tasks[idx];
             ComponentStream& comp = comps[t.comp_idx];
             ResolutionBox& rb = comp.res[t.res_idx];
             const ChunkMeta& cm = t.stream->chunks[t.chunk_idx];
             br.init(cm.ptr, cm.len);
             if (t.res_idx == 0) {
-                int32_t crows = (comp.max_res == 0) ? 8 : 1;
-                bool apply_dpcm = (comp.max_res != 0);
-                decode_single_band_rows(cm, br, 0, t.chunk_idx, crows, apply_dpcm, rb.sb[0], row_work);
+                const int32_t crows = (comp.max_res == 0) ? 8 : 1;
+                const bool apply_dpcm = (comp.max_res != 0);
+                decode_single_band_rows(cm, br, 0, t.chunk_idx, crows, apply_dpcm, rb.sb[0], ww.dpcm_row);
             } else {
-                int32_t crows = 1 << (t.res_idx - 1);
+                const int32_t crows = 1 << (t.res_idx - 1);
                 for (int b = 1; b <= 3; ++b) {
-                    decode_single_band_rows(cm, br, b - 1, t.chunk_idx, crows, false, rb.sb[b], row_work);
+                    decode_single_band_rows(cm, br, b - 1, t.chunk_idx, crows, false, rb.sb[b], ww.dpcm_row);
                 }
             }
         }
+    });
+
+    // Stage 2: All-core fused L1-ring vertical-first / horizontal-second 5/3 IDWT on (G_L, R, B).
+    // G_H (component 3) is already at max_res=0 and is read directly with zero copy.
+    int32_t ll_w[3] = {comps[0].res[0].sb[0].w, comps[1].res[0].sb[0].w, comps[2].res[0].sb[0].w};
+    int32_t ll_y0[3] = {comps[0].res[0].sb[0].y0, comps[1].res[0].sb[0].y0, comps[2].res[0].sb[0].y0};
+    const int16_t* ll_ptrs[3] = {
+        comps[0].res[0].sb[0].data.data(),
+        comps[1].res[0].sb[0].data.data(),
+        comps[2].res[0].sb[0].data.data()
     };
 
-    if (workers == 1 || tasks.size() <= 1) {
-        run_entropy_slice(0, 1);
-    } else {
-        std::vector<std::thread> pool;
-        pool.reserve(static_cast<size_t>(workers));
-        for (int t = 0; t < workers; ++t) {
-            pool.emplace_back([&, t, workers]() { run_entropy_slice(static_cast<size_t>(t), static_cast<size_t>(workers)); });
+    const int32_t max_res = info.decomp_levels;
+    for (int32_t r = 1; r <= max_res; ++r) {
+        struct IdwtStripTask {
+            int comp_idx = 0;
+            int32_t y_beg = 0;
+            int32_t y_end = 0;
+        };
+        std::vector<IdwtStripTask> idwt_tasks;
+        for (int c = 0; c < 3; ++c) {
+            const ResolutionBox& rb = comps[c].res[r];
+            const size_t plane_elems = static_cast<size_t>(rb.w) * static_cast<size_t>(rb.h);
+            arena.idwt_pong[c].resize(plane_elems);
+
+            const bool can_fuse =
+                (rb.h >= 2 && rb.w >= 2 &&
+                 ll_w[c] > 0 && rb.sb[1].w > 0 &&
+                 ll_w[c] == rb.sb[2].w && rb.sb[1].w == rb.sb[3].w &&
+                 ll_w[c] + rb.sb[1].w == rb.w);
+            if (!can_fuse) {
+                idwt_2d_level_fallback(
+                    rb, ll_ptrs[c], ll_w[c], ll_y0[c],
+                    arena.fallback_vert, arena.idwt_pong[c], arena.workers[0].horiz_even);
+                continue;
+            }
+            const int32_t max_strips = std::max<int32_t>(1, rb.h / 32);
+            const int32_t n_strips = (workers <= 1) ? 1 : std::min<int32_t>(max_strips, std::max<int32_t>(1, (workers * 4) / 3));
+            for (int32_t s = 0; s < n_strips; ++s) {
+                IdwtStripTask st;
+                st.comp_idx = c;
+                st.y_beg = rb.y0 + (s * rb.h) / n_strips;
+                st.y_end = rb.y0 + ((s + 1) * rb.h) / n_strips;
+                if (st.y_beg < st.y_end) {
+                    idwt_tasks.push_back(st);
+                }
+            }
         }
-        for (auto& th : pool) {
-            th.join();
+
+        if (!idwt_tasks.empty()) {
+            pool.parallel_chunks(idwt_tasks.size(), 1u, workers, [&](size_t beg, size_t end, int worker_idx) {
+                Arw6WorkerWork& ww = arena.workers[static_cast<size_t>(worker_idx)];
+                for (size_t idx = beg; idx < end; ++idx) {
+                    const IdwtStripTask& st = idwt_tasks[idx];
+                    const int c = st.comp_idx;
+                    idwt_2d_level_strip(
+                        comps[c].res[r], ll_ptrs[c], ll_w[c], ll_y0[c],
+                        st.y_beg, st.y_end, arena.idwt_pong[c].data(), ww);
+                }
+            });
+        }
+
+        for (int c = 0; c < 3; ++c) {
+            arena.idwt_ping[c].swap(arena.idwt_pong[c]);
+            ll_ptrs[c] = arena.idwt_ping[c].data();
+            ll_w[c] = comps[c].res[r].w;
+            ll_y0[c] = comps[c].res[r].y0;
         }
     }
 
-    // Run 2D 5/3 IDWT on all 4 internal components in parallel.
-    std::array<std::vector<int16_t>, 4> planes;
-    if (workers == 1) {
-        for (int c = 0; c < 4; ++c) {
-            idwt_2d_component(comps[c], planes[c]);
-        }
-    } else {
-        std::vector<std::thread> pool;
-        for (int c = 0; c < 4; ++c) {
-            pool.emplace_back([&, c]() { idwt_2d_component(comps[c], planes[c]); });
-        }
-        for (auto& th : pool) {
-            th.join();
-        }
-    }
-
-    const std::vector<int16_t>& gl = planes[0];
-    const std::vector<int16_t>& rp = planes[1];
-    const std::vector<int16_t>& bp = planes[2];
-    const std::vector<int16_t>& gh = planes[3];
     const size_t expected_comp_sz = static_cast<size_t>(w_comp) * static_cast<size_t>(h_half);
-    if (gl.size() != expected_comp_sz || rp.size() != expected_comp_sz ||
-        bp.size() != expected_comp_sz || gh.size() != expected_comp_sz) {
+    const SubbandBox& gh_sb = comps[3].res[0].sb[0];
+    if (arena.idwt_ping[0].size() != expected_comp_sz ||
+        arena.idwt_ping[1].size() != expected_comp_sz ||
+        arena.idwt_ping[2].size() != expected_comp_sz ||
+        gh_sb.data.size() != expected_comp_sz) {
         err = "Internal ARW6 decoded component dimension mismatch";
         return false;
     }
 
-    // Quincunx 5/3 diamond green synthesis + 12-to-15-bit inverse NLT + green-predicted chroma + RGGB stitch.
-    // Even rows and odd rows are independent in both the Quincunx update step (using G_H[y-1], G_H[y]) and
-    // the predict step (using G0[y], G0[y+1]). Compute G0 in a parallel strip first, then stitch full rows!
-    std::vector<int16_t> g0_plane(expected_comp_sz, 0);
+    const int16_t* const gl_ptr = arena.idwt_ping[0].data();
+    const int16_t* const rp_ptr = arena.idwt_ping[1].data();
+    const int16_t* const bp_ptr = arena.idwt_ping[2].data();
+    const int16_t* const gh_ptr = gh_sb.data.data();
 
-    auto synthesize_g0_rows = [&](uint32_t r0, uint32_t r1) {
-        for (uint32_t r = r0; r < r1; ++r) {
-            const int16_t* h_prev = gh.data() + static_cast<size_t>(r == 0 ? 0 : r - 1) * w_comp;
-            const int16_t* h_curr = gh.data() + static_cast<size_t>(r) * w_comp;
-            const int16_t* l_curr = gl.data() + static_cast<size_t>(r) * w_comp;
-            int16_t* g0_out = g0_plane.data() + static_cast<size_t>(r) * w_comp;
-            for (uint32_t c = 0; c + 1 < w_comp; ++c) {
-                uint32_t sum4 = static_cast<uint32_t>(
-                    static_cast<int32_t>(h_prev[c]) + static_cast<int32_t>(h_prev[c + 1]) +
-                    static_cast<int32_t>(h_curr[c]) + static_cast<int32_t>(h_curr[c + 1]));
-                uint32_t twice_gl = static_cast<uint32_t>(static_cast<uint16_t>(l_curr[c])) << 1;
-                g0_out[c] = static_cast<int16_t>((twice_gl - (sum4 >> 2)) >> 1);
-            }
-            if (w_comp > 0) {
-                uint32_t c = w_comp - 1;
-                uint32_t sum2 = static_cast<uint32_t>(static_cast<int32_t>(h_prev[c]) + static_cast<int32_t>(h_curr[c]));
-                uint32_t twice_gl = static_cast<uint32_t>(static_cast<uint16_t>(l_curr[c])) << 1;
-                g0_out[c] = static_cast<int16_t>((twice_gl - (sum2 >> 1)) >> 1);
-            }
-        }
-    };
-
+    // Stage 3: Fused strip-ring Quincunx diamond green synthesis + pre-shifted NLT LUT + NEON RGGB output.
     const int32_t nlt_bits = info.internal_depth; // 12
-    const int32_t nlt_bias = 1 << (nlt_bits - 1); // 2048
-    const int32_t nlt_max = (1 << nlt_bits) - 1;  // 4095
+    const uint16_t* const lut14 = get_arw6_nlt_lut14();
 
-    auto reconstruct_row_range = [&](uint32_t r0, uint32_t r1) {
+    auto run_quincunx_strip = [&](size_t r0_s, size_t r1_s, int worker_idx) {
+        const uint32_t r0 = static_cast<uint32_t>(r0_s);
+        const uint32_t r1 = static_cast<uint32_t>(r1_s);
+        Arw6WorkerWork& ww = arena.workers[static_cast<size_t>(worker_idx)];
+        ww.ensure_g0_cap(w_comp);
+        int16_t* e_curr = ww.g0_a.data();
+        int16_t* e_next = ww.g0_b.data();
+
+        {
+            const int16_t* const hp = gh_ptr + static_cast<size_t>(r0 == 0u ? 0u : r0 - 1u) * w_comp;
+            const int16_t* const hc = gh_ptr + static_cast<size_t>(r0) * w_comp;
+            const int16_t* const lc = gl_ptr + static_cast<size_t>(r0) * w_comp;
+            synthesize_g0_row(hp, hc, lc, e_curr, w_comp);
+        }
+
         for (uint32_t r = r0; r < r1; ++r) {
-            const int16_t* e_curr = g0_plane.data() + static_cast<size_t>(r) * w_comp;
-            const int16_t* e_next = g0_plane.data() + static_cast<size_t>((r + 1 < h_half) ? (r + 1) : r) * w_comp;
-            const int16_t* h_curr = gh.data() + static_cast<size_t>(r) * w_comp;
-            const int16_t* r_curr = rp.data() + static_cast<size_t>(r) * w_comp;
-            const int16_t* b_curr = bp.data() + static_cast<size_t>(r) * w_comp;
+            const int16_t* e_next_ptr = e_curr;
+            if (r + 1u < h_half) {
+                const int16_t* const hc_n = gh_ptr + static_cast<size_t>(r + 1u) * w_comp;
+                const int16_t* const lc_n = gl_ptr + static_cast<size_t>(r + 1u) * w_comp;
+                synthesize_g0_row(gh_ptr + static_cast<size_t>(r) * w_comp, hc_n, lc_n, e_next, w_comp);
+                e_next_ptr = e_next;
+            }
 
-            uint16_t* dst0 = bayer_out.data() + static_cast<size_t>(tile_y + r * 2) * full_w + tile_x;
-            uint16_t* dst1 = bayer_out.data() + static_cast<size_t>(tile_y + r * 2 + 1) * full_w + tile_x;
+            const size_t row_off = static_cast<size_t>(r) * w_comp;
+            uint16_t* const dst0 = dst_base + static_cast<size_t>(tile_y + r * 2u) * dst_stride_u16 + tile_x;
+            uint16_t* const dst1 = dst_base + static_cast<size_t>(tile_y + r * 2u + 1u) * dst_stride_u16 + tile_x;
+            reconstruct_bayer_row(
+                e_curr, e_next_ptr, gh_ptr + row_off, rp_ptr + row_off, bp_ptr + row_off,
+                dst0, dst1, w_comp, nlt_bits, lut14);
 
-            for (uint32_t c = 0; c < w_comp; ++c) {
-                int16_t g0_wav = e_curr[c];
-                int16_t g1_wav;
-                if (c == 0) {
-                    uint32_t sum2 = static_cast<uint32_t>(static_cast<int32_t>(e_curr[0]) + static_cast<int32_t>(e_next[0]));
-                    g1_wav = static_cast<int16_t>(static_cast<uint16_t>(h_curr[0]) + (sum2 >> 1));
-                } else {
-                    uint32_t sum4 = static_cast<uint32_t>(
-                        static_cast<int32_t>(e_curr[c - 1]) + static_cast<int32_t>(e_curr[c]) +
-                        static_cast<int32_t>(e_next[c - 1]) + static_cast<int32_t>(e_next[c]));
-                    g1_wav = static_cast<int16_t>(static_cast<uint16_t>(h_curr[c]) + (sum4 >> 2));
-                }
-
-                int32_t ug1 = std::max<int32_t>(0, std::min<int32_t>(nlt_bias + static_cast<int32_t>(g1_wav), nlt_max));
-                int32_t ug0 = std::max<int32_t>(0, std::min<int32_t>(nlt_bias + static_cast<int32_t>(g0_wav), nlt_max));
-                int32_t g_avg = (ug1 + ug0) >> 1;
-
-                int32_t ur = std::max<int32_t>(0, std::min<int32_t>(g_avg + 2 * static_cast<int32_t>(r_curr[c]), nlt_max));
-                int32_t ub = std::max<int32_t>(0, std::min<int32_t>(g_avg + 2 * static_cast<int32_t>(b_curr[c]), nlt_max));
-
-                uint16_t r_val = kArw6NltLut[ur] >> 1;
-                uint16_t g0_val = kArw6NltLut[ug0] >> 1;
-                uint16_t g1_val = kArw6NltLut[ug1] >> 1;
-                uint16_t b_val = kArw6NltLut[ub] >> 1;
-
-                dst0[2 * c]     = std::min<uint16_t>(r_val, 0x4000u);
-                dst0[2 * c + 1] = std::min<uint16_t>(g0_val, 0x4000u);
-                dst1[2 * c]     = std::min<uint16_t>(g1_val, 0x4000u);
-                dst1[2 * c + 1] = std::min<uint16_t>(b_val, 0x4000u);
+            if (r + 1u < h_half) {
+                std::swap(e_curr, e_next);
             }
         }
     };
 
-    if (workers == 1 || h_half < 64) {
-        synthesize_g0_rows(0, h_half);
-        reconstruct_row_range(0, h_half);
-    } else {
-        auto run_rows = [&](auto&& fn) {
-            std::vector<std::thread> pool;
-            uint32_t step = (h_half + static_cast<uint32_t>(workers) - 1u) / static_cast<uint32_t>(workers);
-            for (int t = 0; t < workers; ++t) {
-                uint32_t r0 = static_cast<uint32_t>(t) * step;
-                uint32_t r1 = std::min<uint32_t>(h_half, r0 + step);
-                if (r0 < r1) {
-                    pool.emplace_back([&, r0, r1]() { fn(r0, r1); });
-                }
-            }
-            for (auto& th : pool) {
-                th.join();
-            }
-        };
-        run_rows(synthesize_g0_rows);
-        run_rows(reconstruct_row_range);
-    }
-
+    pool.parallel_strips(h_half, 32u, workers, run_quincunx_strip);
     return true;
 }
 
@@ -1482,6 +2413,115 @@ bool probe_arw6_strip(
     return true;
 }
 
+namespace detail {
+
+Arw6Arena* create_arw6_arena() {
+    return reinterpret_cast<Arw6Arena*>(new Arw6ArenaImpl());
+}
+
+void destroy_arw6_arena(Arw6Arena* arena) {
+    delete reinterpret_cast<Arw6ArenaImpl*>(arena);
+}
+
+bool decode_arw6_tile_strided(
+    const uint8_t* cs_data,
+    size_t cs_len,
+    int num_threads,
+    uint32_t tile_x,
+    uint32_t tile_y,
+    uint32_t full_w,
+    uint32_t full_h,
+    uint16_t* dst,
+    size_t dst_stride_u16,
+    size_t dst_height_capacity,
+    Arw6Info& tile_info_out,
+    std::string& err,
+    WorkerPool* external_pool,
+    Arw6Arena* external_arena) {
+    if (!cs_data || cs_len < 16) {
+        err = "Empty ARW6 tile codestream";
+        return false;
+    }
+    Arw6Info probed;
+    if (!probe_arw6_codestream(cs_data, cs_len, probed, err)) {
+        return false;
+    }
+    const uint32_t tw = (full_w == 0) ? probed.width : full_w;
+    const uint32_t th = (full_h == 0) ? probed.height : full_h;
+    if (!dst || dst_stride_u16 < tw || dst_height_capacity < th) {
+        err = "Destination Bayer buffer too small for ARW6 tile";
+        return false;
+    }
+    return decode_arw6_codestream_internal(
+        cs_data, cs_len, num_threads, tile_x, tile_y, tw, th,
+        dst, dst_stride_u16, tile_info_out, err,
+        external_pool, reinterpret_cast<Arw6ArenaImpl*>(external_arena));
+}
+
+bool decode_arw6_bayer_strided(
+    const uint8_t* strip_data,
+    size_t strip_len,
+    int num_threads,
+    uint16_t* dst,
+    size_t dst_stride_u16,
+    size_t dst_height_capacity,
+    Arw6Info& info_out,
+    std::string& err,
+    WorkerPool* external_pool,
+    Arw6Arena* external_arena) {
+    if (!probe_arw6_strip(strip_data, strip_len, info_out, err)) {
+        return false;
+    }
+    if (!dst || dst_stride_u16 < info_out.width || dst_height_capacity < info_out.height) {
+        err = "Destination Bayer buffer too small for ARW6 frame";
+        return false;
+    }
+    const size_t total_px = static_cast<size_t>(info_out.width) * static_cast<size_t>(info_out.height);
+    bool clean_partition = false;
+    if (info_out.tiles.size() == 1u &&
+        info_out.tiles[0].x == 0u && info_out.tiles[0].y == 0u &&
+        info_out.tiles[0].width == info_out.width && info_out.tiles[0].height == info_out.height) {
+        clean_partition = true;
+    } else if (!info_out.tiles.empty()) {
+        uint64_t area_sum = 0u;
+        clean_partition = true;
+        for (size_t i = 0; i < info_out.tiles.size() && clean_partition; ++i) {
+            const Arw6TileInfo& a = info_out.tiles[i];
+            area_sum += static_cast<uint64_t>(a.width) * static_cast<uint64_t>(a.height);
+            for (size_t j = i + 1; j < info_out.tiles.size(); ++j) {
+                const Arw6TileInfo& b = info_out.tiles[j];
+                const bool ox = (a.x < b.x + b.width) && (b.x < a.x + a.width);
+                const bool oy = (a.y < b.y + b.height) && (b.y < a.y + a.height);
+                if (ox && oy) {
+                    clean_partition = false;
+                    break;
+                }
+            }
+        }
+        clean_partition = clean_partition && (area_sum == total_px);
+    }
+    if (!clean_partition) {
+        for (uint32_t r = 0; r < info_out.height; ++r) {
+            std::memset(dst + static_cast<size_t>(r) * dst_stride_u16, 0,
+                        static_cast<size_t>(info_out.width) * sizeof(uint16_t));
+        }
+    }
+    Arw6ArenaImpl* arena_ptr = reinterpret_cast<Arw6ArenaImpl*>(external_arena);
+    for (size_t i = 0; i < info_out.tiles.size(); ++i) {
+        const Arw6TileInfo& ti = info_out.tiles[i];
+        Arw6Info tinfo;
+        if (!decode_arw6_codestream_internal(
+                strip_data + ti.rel_offset, ti.data_size, num_threads,
+                ti.x, ti.y, info_out.width, info_out.height,
+                dst, dst_stride_u16, tinfo, err, external_pool, arena_ptr)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace detail
+
 bool decode_arw6_tile(
     const uint8_t* cs_data,
     size_t cs_len,
@@ -1506,8 +2546,9 @@ bool decode_arw6_tile(
     if (bayer_out.size() != static_cast<size_t>(tw) * th) {
         bayer_out.assign(static_cast<size_t>(tw) * th, 0);
     }
-    return decode_arw6_codestream_internal(
-        cs_data, cs_len, num_threads, tile_x, tile_y, tw, th, bayer_out, tile_info_out, err);
+    return detail::decode_arw6_tile_strided(
+        cs_data, cs_len, num_threads, tile_x, tile_y, tw, th,
+        bayer_out.data(), tw, th, tile_info_out, err, nullptr, nullptr);
 }
 
 bool decode_arw6_bayer(
@@ -1520,17 +2561,13 @@ bool decode_arw6_bayer(
     if (!probe_arw6_strip(strip_data, strip_len, info_out, err)) {
         return false;
     }
-    bayer_out.assign(static_cast<size_t>(info_out.width) * static_cast<size_t>(info_out.height), 0);
-    for (size_t i = 0; i < info_out.tiles.size(); ++i) {
-        const Arw6TileInfo& ti = info_out.tiles[i];
-        Arw6Info tinfo;
-        if (!decode_arw6_codestream_internal(
-                strip_data + ti.rel_offset, ti.data_size, num_threads,
-                ti.x, ti.y, info_out.width, info_out.height, bayer_out, tinfo, err)) {
-            return false;
-        }
+    const size_t total_px = static_cast<size_t>(info_out.width) * static_cast<size_t>(info_out.height);
+    if (bayer_out.size() != total_px) {
+        bayer_out.assign(total_px, 0);
     }
-    return true;
+    return detail::decode_arw6_bayer_strided(
+        strip_data, strip_len, num_threads,
+        bayer_out.data(), info_out.width, info_out.height, info_out, err, nullptr, nullptr);
 }
 
 } // namespace nijinwvdc

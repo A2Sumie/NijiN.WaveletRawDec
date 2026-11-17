@@ -19,9 +19,9 @@ This document specifies the **Nikon `.NEV` ISOBMFF/QuickTime container**, **Niko
 
 ### 1.2 Media Tracks & `moov/udta/NCDT` Metadata
 
-- **Video Track (`vide` / `stsd` FourCC = `NRAW`)**: Uses `stts` for frame deltas, `stsz` for per-sample outer `NRAW` box byte counts (supporting both fixed and variable frame sizes), and `co64` / `stco` + `stsc` for `O(1)` 64-bit random frame access (`fseeko`, supporting clips beyond `4 GiB`).
-- **Audio Track (`soun` / QuickTime Sound Sample Description v2 `lpcm`)**: Parses the 72-byte v2 sample entry (`float64` big-endian `sampleRate`, e.g., `48000.0 Hz`, `numAudioChannels`, `bitsPerChannel`, `bytesPerPacket`), with fallback support for v0/v1 sound sample descriptions.
-- **Timecode Track (`tmcd`)**: Extracts QuickTime Timecode flags, timescale, frame duration, and `number_of_frames` from sample entry bytes `+20..32`.
+- **Video Track (`vide` / `stsd` FourCC = `NRAW`)**: Uses `stts` runs for exact per-frame PTS/duration, `stsz` for per-sample outer `NRAW` box byte counts (supporting both fixed and variable frame sizes), and `co64` / `stco` + `stsc` for `O(1)` 64-bit random frame access via `RandomAccessReader` (`pread` on POSIX, `OVERLAPPED ReadFile` via UTF-16 `CreateFileW` on Windows, memory spans, and `IoCallbacks`, supporting clips well beyond `4 GiB`).
+- **Audio Track (`soun` / QuickTime Sound Sample Description v0/v1/v2 `lpcm`)**: Parses the 72-byte v2 sample entry (`float64` big-endian `sampleRate`, e.g., `48000.0 Hz`, `numAudioChannels`, `bitsPerChannel`, `formatFlags` endianness/signed/float/packed flags, `bytesPerPacket`), indexes chunk-frame prefix sums (`O(log C)` random seeking across chunks), and streams standard RIFF `.wav` output with big-to-little endian conversion when required.
+- **Timecode Track (`tmcd`)**: Extracts QuickTime Timecode flags, timescale, frame duration, `number_of_frames`, and 32-bit big-endian `tmcd` frame counts, computing SMPTE 12M drop-frame (`;FF`) and non-drop (`:FF`) formatted strings.
 - **`udta/NCDT` Global Block**:
   - `NCTG`: Sequential big-endian tag stream (`tag(u32 BE) + dtype(u16 BE) + count(u16 BE) + payload`), carrying Make/Model/Firmware strings, frame rate rational, active frame size, `0x0110*` exposure/lens tags, and global Picture Control tag `0x02000023`.
   - `NCTH` / `NCVW` / `NCM1`: Embedded JPEG blobs (thumbnail, camera-rendered preview such as `1920x1080` Rec.2020 N-Log JPEG, and reference preview).
@@ -58,7 +58,7 @@ Each video sample inside `mdat` is a self-contained `NRAW` box:
 
 ## 2. Nikon `.NEF` (`HE` / `HE*`) TIFF Layout & `"Nikon\0"` MakerNote
 
-When the input starts with a standard TIFF header (`II*\0` or `MM\0*`), `parse_nev_clip` dispatches to `parse_nef_he_clip`:
+When the input starts with a standard TIFF header (`II*\0` or `MM\0*`), `parse_nev_clip` (and `MediaReader`) dispatches to `parse_tiff_raw_clip`:
 
 1. **`IFD0`**: Extracts `Make (271)`, `Model (272)`, `Orientation (274)`, `Software (305)`, `DateTime (306)`, `SubIFDs (330)`, `ExifIFD (34665)`, and optional `IFD0` thumbnail JPEG offsets (`513` / `514`).
 2. **`SubIFDs` Selection**: Scans every SubIFD to locate the Bayer CFA entry with `Compression (259) == 34713`, `PhotometricInterpretation (262) == 32803`, and strip payload starting with TicoRAW `SOC (0xFF10)` (recording the largest `Compression == 6` JPEG SubIFD as preview `ncvw`). Legacy `34713` files lacking the `0xFF10` signature return an explicit format-classification error.
@@ -123,7 +123,7 @@ Nikon N-RAW (`.NEV`) and HE / HE\* (`.NEF`) share the **wavelet-subband + block-
 
 ### 5.1 TIFF Container Selection & Calibration Tags (`src/arw_container.cpp`)
 
-When a TIFF input carries `Make` containing `"SONY"` or contains a Bayer `SubIFD` with `Compression (259) == 32766`, `parse_nev_clip` dispatches to `parse_sony_arw_tiff`:
+When a TIFF input carries `Make` containing `"SONY"` or contains a Bayer `SubIFD` with `Compression (259) == 32766`, `parse_tiff_raw_clip` dispatches to `parse_sony_arw_tiff_reader`:
 
 1. **`SubIFDs` & Compression Selection**: Scans `IFD0`, `SubIFDs`, and `IFD1` for a CFA image directory (`PhotometricInterpretation == 32803` or `0`) matching `Compression (259) == 32766` and `SonyRawFileType (0x7000) == 6` (covering both **Compressed (HQ)** and **Compressed** wavelet modes across Full-Frame and APS-C geometries), verifying an embedded `"A000"` signature at the first tile's `rel_offset`. Legacy Sony ARW modes (such as `Compression=32767`) return an explicit unsupported-format error.
 2. **Sony Sensor Calibration & Crop Tags**:
@@ -197,3 +197,11 @@ Each tile points to a big-endian `"A000"` wavelet codestream:
 - **Active Crop & CFA Modulo Rotation (`apply_bayer_crop`)**: When trimming margins to Nikon MakerNote `CropArea` or Sony `DefaultCrop = [x0, y0, w, h]`, shifts the `2x2` Bayer pattern according to `dst_cfa[ry*2 + rx] = src_cfa[((ry ^ (y0 & 1)) * 2) + (rx ^ (x0 & 1))]`; otherwise emits the full decoded buffer with `DefaultCropOrigin (50719)` and `DefaultCropSize (50720)`.
 - **Scalar `BlackLevel (50714)` Convention**: When all 4 CFA channels share one black level (e.g., Nikon `1008`, Sony `512`), omits `BlackLevelRepeatDim (50713)` and writes scalar `BlackLevel (50714) RATIONAL[1]` alongside `WhiteLevel (50717) = 16383`, ensuring uniform black-level attribution across `LibRaw` and standard DNG readers. Distinct per-channel black levels emit `BlackLevelRepeatDim = [2, 2]` and 4 rationals.
 - **Built-In D65 `ColorMatrix1 (50721)`**: Embeds CIE XYZ(D65)-to-camera matrices for Nikon (`Z 8`, `Z 9`, `Z6 III`, `ZR`, `Z f`, `Z50 II`, `Z5 II`) and Sony Alpha (`ILCE-7M5`, `ILCE-7RM6`, `ILCE-7RM5`, `ILCE-7M4`, `ILCE-7CR`, `ILCE-7CM2`, `ILCE-1M2`, `ILCE-1`, `ILCE-9M3`, `ZV-E1`, `ILME-FX3`), falling back cleanly per make for unlisted models.
+- **In-Memory & Strided Export**: `build_cfa_dng_header` and `encode_cfa_dng_memory` emit calibrated DNG 1.4 byte streams without disk I/O alongside SIMD-accelerated `split_bayer_cfa_planes` and `normalize_bayer_to_float`.
+
+---
+
+## 7. Cross-Architecture SIMD & Work-Stealing Execution
+
+- **Persistent Work-Stealing Pool & Reusable Arenas (`src/worker_pool.h`, `src/codec_internal.h`)**: `DecoderSession` retains one work-stealing `WorkerPool` and opaque `TicoArena` / `Arw6Arena` allocations across sequential frames, eliminating per-frame thread spawn and scratch heap allocation overhead while writing directly into strided caller buffers (`dst_row_stride_bytes`) when uncropped.
+- **ARM64 NEON & x86-64 AVX2 / SSE2**: Both wavelet pipelines (`src/ticoraw_dec.cpp`, `src/arw6_dec.cpp`) and Bayer post-processing kernels (`src/session_api.cpp`) implement ARM64 NEON vector paths, runtime-dispatched x86-64 AVX2 kernels (`CPUID` leaf 1 + leaf 7 + `XGETBV` OSXSAVE verification in `src/simd_platform.h`), and pure SSE2 baselines. `arw6_dec.cpp` further uses 64-bit SWAR bit-matrix transposition for zero-run predictive Golomb-Rice decoding and L1/L2 ring-buffered vertical-first/horizontal-second 5/3 lifting.

@@ -1,9 +1,9 @@
 # NijiN.WaveletRawDec
 
-**Clean-Room Multi-Threaded C++17 Decoder for Wavelet-Compressed Camera & Cinema RAW Formats**  
-(`Apache-2.0` · `C++17` · `POSIX Threads` · `Zero External Dependencies`)
+**Clean-Room Multi-Threaded C++17 & C99 Decoder for Wavelet-Compressed Camera & Cinema RAW Formats**  
+(`Apache-2.0` · `C++17` / `C99 ABI` · `ARM64 NEON` & `x86-64 AVX2/SSE2` · `Zero External Dependencies`)
 
-`NijiN.WaveletRawDec` (library `nijinWVDC_core` / CLI `nijinWVDC`) is purpose-built for the **two modern 2D-wavelet camera RAW codec families** whose open-source ecosystem support has historically been absent or incomplete:
+`NijiN.WaveletRawDec` (libraries `nijinWVDC::static` / `nijinWVDC::shared` · CMake / pkg-config `nijinWVDC` · CLI `nijinWVDC`) is purpose-built for the **two modern 2D-wavelet camera RAW codec families** whose open-source ecosystem support has historically been absent or incomplete:
 
 1. **TicoRAW R0 (`5H+1V` LeGall 5/3 lifting + Star-Tetrix RCT + Fliproot NLT)** — Nikon N-RAW video (`.NEV`), Nikon High Efficiency stills (`.NEF` `HE` / `HE*`), and bare `.jxs` codestreams.
 2. **Sony ARW 6.0 `"A000"` (`3`-level 5/3 lifting + Quincunx diamond green synthesis + 12-to-15-bit NLT)** — Sony `Compressed (HQ)` and `Compressed` stills (`.ARW`, `Compression=32766`, `SonyRawFileType=6`).
@@ -67,73 +67,107 @@ Designed with clean separation between container demuxing, parallel entropy/wave
 | Trailing-tile edge case (`H % 64 == 0`) | `512 x 512` synthetic stream | **`0`** | **`0`** | **`0`** |
 | Trailing-tile edge case (`H % 64 == 4`) | `512 x 516` synthetic stream | **`0`** | **`0`** | **`0`** |
 
-Single-threaded and multi-threaded runs (`1 / 4 / 8` threads) produce bit-identical outputs (`b1 == b4`, `b1 == b8`).
+Single-threaded and multi-threaded runs (`1 / 4 / 8 / 16` threads) produce bit-identical outputs (`b1 == b4 == b8 == b16`) across ARM64 NEON, x86-64 SSE2, and x86-64 AVX2 (`AppleClang`, `GCC`, and `MSVC`).
 
-### 2. Apple Silicon Multi-Threaded Benchmark (`45.6 MP` `.NEV` & `33.0 MP` `.ARW`, 20-frame average)
+### 2. Cross-Platform Decode Throughput (`v0.2.0`, 40-frame steady-state session average)
 
-| Format / Resolution | Threads | Decode Only (`ms/frame`) | Decode Throughput (`fps`) | Read + Decode E2E (`ms/frame`) | E2E Throughput (`fps`) |
-|---|---:|---:|---:|---:|---:|
-| Nikon `.NEV` (`45.6 MP`, `1.50 bpp`) | `1` | `291.74` | `3.43` | `293.55` | `3.41` |
-| Nikon `.NEV` (`45.6 MP`, `1.50 bpp`) | `4` | `81.30` | `12.30` | `82.56` | `12.11` |
-| Nikon `.NEV` (`45.6 MP`, `1.50 bpp`) | **`8`** | **`49.67`** | **`20.13`** | **`50.95`** | **`19.63`** |
-| Sony `.ARW` (`ARW6`, `7040 x 4688`) | `1` | `399.22` | `2.50` | `402.28` | `2.49` |
-| Sony `.ARW` (`ARW6`, `7040 x 4688`) | `4` | `97.56` | `10.25` | `100.20` | `9.98` |
-| Sony `.ARW` (`ARW6`, `7040 x 4688`) | **`8`** | **`72.38`** | **`13.82`** | **`74.65`** | **`13.40`** |
+| Platform / Compiler / ISA | Format (`W x H`) | Threads | Decode Only (`ms/frame`) | Decode Throughput (`fps`) |
+|---|---|---:|---:|---:|
+| **Apple M1 Max** (`AppleClang 21`, `NEON`) | Sony ARW6 (`7040 x 4688`) | `1` | `163.33` | `6.12` |
+| **Apple M1 Max** (`AppleClang 21`, `NEON`) | Sony ARW6 (`7040 x 4688`) | `auto` | **`25.16`** | **`39.74`** |
+| **Apple M1 Max** (`AppleClang 21`, `NEON`) | Nikon `.NEV` (`8268 x 5512`) | `1` | `212.75` | `4.70` |
+| **Apple M1 Max** (`AppleClang 21`, `NEON`) | Nikon `.NEV` (`8268 x 5512`) | `auto` | **`35.83`** | **`27.91`** |
+| **AMD Ryzen 7 5800X3D** (`Linux GCC 11.4`, `AVX2`) | Sony ARW6 (`7040 x 4688`) | `1` | `192.05` | `5.21` |
+| **AMD Ryzen 7 5800X3D** (`Linux GCC 11.4`, `AVX2`) | Sony ARW6 (`7040 x 4688`) | `8` | `34.85` | `28.70` |
+| **AMD Ryzen 7 5800X3D** (`Linux GCC 11.4`, `AVX2`) | Sony ARW6 (`7040 x 4688`) | `16` | **`28.98`** | **`34.50`** |
+| **AMD Ryzen 7 5800X3D** (`Linux GCC 11.4`, `AVX2`) | Nikon `.jxs` (`8268 x 5512`) | `1` | `219.76` | `4.55` |
+| **AMD Ryzen 7 5800X3D** (`Linux GCC 11.4`, `AVX2`) | Nikon `.jxs` (`8268 x 5512`) | `8` | `49.40` | `20.24` |
+| **AMD Ryzen 7 5800X3D** (`Linux GCC 11.4`, `AVX2`) | Nikon `.jxs` (`8268 x 5512`) | `16` | **`45.22`** | **`22.11`** |
+| **AMD Ryzen 7 5800X3D** (`Windows MSVC 19.44`, `AVX2`) | Sony ARW6 (`7040 x 4688`) | `1` | `248.76` | `4.02` |
+| **AMD Ryzen 7 5800X3D** (`Windows MSVC 19.44`, `AVX2`) | Sony ARW6 (`7040 x 4688`) | `8` | `41.23` | `24.25` |
+| **AMD Ryzen 7 5800X3D** (`Windows MSVC 19.44`, `AVX2`) | Sony ARW6 (`7040 x 4688`) | `16` | **`31.72`** | **`31.52`** |
+| **AMD Ryzen 7 5800X3D** (`Windows MSVC 19.44`, `AVX2`) | Nikon `.jxs` (`8268 x 5512`) | `1` | `301.72` | `3.31` |
+| **AMD Ryzen 7 5800X3D** (`Windows MSVC 19.44`, `AVX2`) | Nikon `.jxs` (`8268 x 5512`) | `8` | `55.34` | `18.07` |
+| **AMD Ryzen 7 5800X3D** (`Windows MSVC 19.44`, `AVX2`) | Nikon `.jxs` (`8268 x 5512`) | `16` | **`47.90`** | **`20.88`** |
+
+---
+
+## Prebuilt Releases (`v0.2.0`)
+
+Prebuilt SDK + CLI archives are published on [**GitHub Releases**](https://github.com/A2Sumie/NijiN.WaveletRawDec/releases). Every archive contains the `nijinWVDC` CLI, static + shared libraries, public C++17 & C99 headers, `pkg-config` (`.pc`), and CMake config packages (`nijinWVDC::static` / `nijinWVDC::shared`):
+
+| Platform Archive | Contents |
+|---|---|
+| `nijinWVDC-v0.2.0-macos-arm64.tar.gz` | Apple Silicon `arm64` static (`.a`), shared (`.dylib`), CLI, headers, CMake/pkg-config |
+| `nijinWVDC-v0.2.0-macos-x86_64.tar.gz` | Intel macOS `x86_64` static (`.a`), shared (`.dylib`), CLI, headers, CMake/pkg-config |
+| `nijinWVDC-v0.2.0-macos-universal2.tar.gz` | Universal fat binary (`arm64` + `x86_64`) static, shared, CLI, headers, CMake/pkg-config |
+| `nijinWVDC-v0.2.0-linux-x86_64.tar.gz` | Linux `x86_64` (SSE2 + runtime AVX2 dispatch) `.a`, `.so`, CLI, headers, CMake/pkg-config |
+| `nijinWVDC-v0.2.0-windows-x86_64.zip` | Windows `x64` (`nijinWVDC.dll` + import `.lib` + `nijinWVDC_static.lib`), `nijinWVDC.exe`, headers, CMake |
 
 ---
 
 ## Build & Quick Start
 
-Requires only a `C++17` compiler (Clang or GCC) and POSIX threads (`-lpthread`), with zero external third-party libraries.
+Requires only a `C++17` / `C11` compiler (`Clang`, `GCC`, or `MSVC 2022`), with zero external third-party libraries. x86-64 builds detect `AVX2` at runtime via `CPUID` + `XGETBV` and fall back automatically to pure `SSE2`.
 
-### Build & Test with Make (includes AddressSanitizer + UBSan)
+### Build & Test with Make (includes AddressSanitizer + UBSan & C11 ABI test)
 
 ```sh
-make clean all test
+make clean && make all test -j8
 ```
 
 Build outputs:
-- `build/nijinWVDC` (`-O3` release CLI)
-- `build/nijinWVDC_asan` (ASan + UBSan diagnostic CLI)
-- `build/test_nijinWVDC` / `build/test_nijinWVDC_asan` (standalone unit suite; optional `NIJINWVDC_TEST_NEV`, `NIJINWVDC_TEST_NEF`, and `NIJINWVDC_TEST_ARW` environment variables enable real-sample regression checks)
+- `build/nijinWVDC` (`-O3` release CLI) and `build/nijinWVDC_asan` (ASan + UBSan diagnostic CLI)
+- `build/libnijinWVDC.a` (static library) & `build/libnijinWVDC.dylib` / `.so` (shared library)
+- `build/test_nijinWVDC`, `build/test_c_api`, `build/test_nijinWVDC_asan`, `build/test_c_api_asan` (optional `NIJINWVDC_TEST_NEV`, `NIJINWVDC_TEST_NEF`, and `NIJINWVDC_TEST_ARW` enable real-sample checks)
 
-### Build with CMake
+### Build & Install with CMake
 
 ```sh
 cmake -S . -B cmake-build -DCMAKE_BUILD_TYPE=Release
 cmake --build cmake-build -j
 ctest --test-dir cmake-build --output-on-failure
+cmake --install cmake-build --prefix /usr/local
 ```
+
+### Library APIs (C++17 & Pure C99 FFI)
+
+- **`nijinwvdc::MediaReader` ([`include/nijinWVDC.h`](include/nijinWVDC.h))**: Thread-safe >4 GiB 64-bit random-access container reader (`open_file`, `open_memory`, `open_callbacks`), supporting `.NEV`, `.NEF`, `.ARW`, and bare `.jxs` / `"A000"` codestreams, exact `stts` PTS/duration + SMPTE `tmcd` timecode (`get_frame_timing`), `O(log C)` `lpcm` audio extraction & RIFF `.wav` export (`read_audio_pcm`, `export_audio_wav`), and JPEG preview extraction.
+- **`nijinwvdc::DecoderSession` ([`include/nijinWVDC.h`](include/nijinWVDC.h))**: Movable session owning a persistent work-stealing thread pool and reusable per-codec arena buffers for zero-reallocation NLE/video playback, strided caller-owned buffers (`decode_frame_into` / `decode_codestream_into`), and direct ROI / `--active-crop` decoding.
+- **SIMD Post-Processing & In-Memory DNG**: `split_bayer_cfa_planes`, `normalize_bayer_to_float`, `apply_bayer_crop_strided`, `build_cfa_dng_header`, and `encode_cfa_dng_memory`.
+- **Pure C99 / FFI ABI ([`include/nijinWVDC_c.h`](include/nijinWVDC_c.h))**: Exception-free opaque handle API (`nijin_reader_t*`, `nijin_decoder_t*`) for Rust, Python `ctypes`, Go `cgo`, and pure C11 applications linking against `libnijinWVDC` / `nijinWVDC.dll`.
 
 ### CLI Quick Start
 
 ```sh
-# 1. Inspect .NEV / .NEF / .ARW / .jxs headers, metadata, audio/timecode, and codestream parameters
+# 1. Inspect .NEV / .NEF / .ARW / .jxs headers, timecode, audio, and codestream parameters
+./build/nijinWVDC --version
 ./build/nijinWVDC --info clip.NEV
 ./build/nijinWVDC --info --json photo.NEF
 ./build/nijinWVDC --info --json photo.ARW
 
-# 2. Decode a frame to linear 14-bit-in-16-bit CFA DNG (full sensor buffer + DefaultCrop metadata)
+# 2. Extract embedded LPCM audio from a .NEV clip as RIFF WAV
+./build/nijinWVDC --extract-audio clip.NEV -o audio.wav
+
+# 3. Decode a frame to linear 14-bit-in-16-bit CFA DNG (full sensor buffer + DefaultCrop metadata)
 ./build/nijinWVDC clip.NEV --frame 0 -o frame_0000.dng --threads 8
 ./build/nijinWVDC photo.ARW -o sony_full.dng --threads 8
 
-# 3. Crop to camera active crop with CFA phase rotation -> .dng or 16-bit LE .raw
+# 4. Crop to camera active crop with CFA phase rotation -> .dng or 16-bit LE .raw
 ./build/nijinWVDC clip.NEV --frame 0 --active-crop -o frame_0000_crop.dng --threads 8
 ./build/nijinWVDC photo.NEF --active-crop -o photo_crop.dng --threads 8
 ./build/nijinWVDC photo.ARW --active-crop -o sony_crop.dng --threads 8
 ./build/nijinWVDC clip.NEV --frame 0 -o frame_0000.raw --threads 8
 
-# 4. Batch decode a frame range or entire clip into a directory
+# 5. Batch decode a frame range, extract bare .jxs / JPEG previews, or benchmark throughput
 ./build/nijinWVDC clip.NEV --frame 0-9 -o out_dng/ --active-crop --threads 8
-
-# 5. Extract/decode bare .jxs codestreams, embedded JPEG previews, or run a throughput benchmark
 ./build/nijinWVDC --extract-jxs clip.NEV --frame 0 -o frame_0000.jxs
 ./build/nijinWVDC --raw-jxs frame_0000.jxs -o frame_0000.dng --threads 8
 ./build/nijinWVDC --extract-preview clip.NEV -o preview.jpg
-./build/nijinWVDC --bench clip.NEV --frames 20 --threads 8
+./build/nijinWVDC --bench clip.NEV --frames 40 --threads 0
 ```
 
-See [**`docs/CLI.md`**](docs/CLI.md) for all flags, JSON fields, and C++17 `nijinWVDC_core` integration examples.
+See [**`docs/CLI.md`**](docs/CLI.md) for all flags, JSON schema, C++17 `MediaReader`/`DecoderSession`, and C99 `nijinWVDC_c.h` examples.
 
 ---
 
@@ -141,16 +175,20 @@ See [**`docs/CLI.md`**](docs/CLI.md) for all flags, JSON fields, and C++17 `niji
 
 | Path | Role |
 |---|---|
-| [`include/nijinWVDC.h`](include/nijinWVDC.h) | Public C++17 data structures and container, decode, crop, and DNG APIs |
-| [`src/tiff_internal.h`](src/tiff_internal.h) | Shared endian-aware TIFF IFD reader and Sony ARW dispatch helper |
-| [`src/nev_container.cpp`](src/nev_container.cpp) | 64-bit `.NEV` ISOBMFF/NCDT/NRFH/NRTH parser and `.NEF` HE/HE\* TIFF/MakerNote parser |
+| [`include/nijinWVDC.h`](include/nijinWVDC.h) | Public C++17 API (`MediaReader`, `DecoderSession`, post-processing, DNG & legacy functional APIs) |
+| [`include/nijinWVDC_c.h`](include/nijinWVDC_c.h) | Pure C99 shared-library FFI ABI (`nijin_reader_t`, `nijin_decoder_t`, caller-buffer APIs) |
+| [`include/nijinWVDC_export.h`](include/nijinWVDC_export.h) | Portable symbol visibility (`dllexport`/`dllimport`/hidden), version macros, and SIMD flags |
+| [`src/simd_platform.h`](src/simd_platform.h) · [`src/worker_pool.h`](src/worker_pool.h) | Portable intrinsics, x86-64 `CPUID`/`XGETBV` runtime AVX2 detection, and work-stealing thread pool |
+| [`src/codec_internal.h`](src/codec_internal.h) · [`src/tiff_internal.h`](src/tiff_internal.h) | Internal persistent-arena strided decoder interfaces and thread-safe 64-bit `RandomAccessReader` |
+| [`src/nev_container.cpp`](src/nev_container.cpp) | `.NEV` ISOBMFF/`NCTG`/`lpcm`/`tmcd`/`stts`/`NRFH` parser, `.NEF` TIFF/MakerNote, bare codestreams |
 | [`src/arw_container.cpp`](src/arw_container.cpp) | Sony `.ARW` (`ARW6` `Compressed HQ` / `Compressed`) TIFF `SubIFDs`, calibration tags, and JPEG preview parser |
-| [`src/ticoraw_dec.cpp`](src/ticoraw_dec.cpp) | Clean-room TicoRAW R0 parallel entropy decoder, 5/3 2D IDWT, Star-Tetrix RCT, and Fliproot NLT |
-| [`src/arw6_dec.cpp`](src/arw6_dec.cpp) | Clean-room Sony ARW6 (`"A000"`) multi-tile parser, chunk-parallel entropy decoder, vertical-first 5/3 IDWT, Quincunx synthesis, and NLT LUT |
-| [`src/dng_writer.cpp`](src/dng_writer.cpp) | Scalar `BlackLevel` DNG 1.4 writer, Nikon/Sony D65 `ColorMatrix1` lookup, and modulo CFA cropper |
-| [`src/main.cpp`](src/main.cpp) | CLI driver (`--info` / `--json` / batch decode / stream & preview extraction / `--bench`) |
-| [`tests/test_nijinWVDC.cpp`](tests/test_nijinWVDC.cpp) | Standalone negative container/stream checks, CFA phase rotation, DNG round-trip, and optional corpus hooks |
-| [`CMakeLists.txt`](CMakeLists.txt) · [`Makefile`](Makefile) | Zero-dependency build configuration (`nijinWVDC_core` static library, `nijinWVDC`, and tests) |
+| [`src/ticoraw_dec.cpp`](src/ticoraw_dec.cpp) | SIMD-accelerated TicoRAW R0 parallel entropy decoder, L1-fused 5/3 IDWT, Star-Tetrix RCT, and Fliproot NLT |
+| [`src/arw6_dec.cpp`](src/arw6_dec.cpp) | SIMD-accelerated Sony ARW6 (`"A000"`) SWAR transpose/entropy decoder, fused 5/3 IDWT, diamond synthesis, and NLT LUT |
+| [`src/session_api.cpp`](src/session_api.cpp) · [`src/c_api.cpp`](src/c_api.cpp) | `MediaReader`, `DecoderSession`, SIMD CFA-plane split & float normalizer, WAV exporter, and C99 ABI wrapper |
+| [`src/dng_writer.cpp`](src/dng_writer.cpp) | In-memory & file DNG 1.4 writer, D65 `ColorMatrix1` lookup, and strided modulo CFA cropper |
+| [`src/main.cpp`](src/main.cpp) | Cross-platform CLI driver (`--version` / `--info` / `--json` / batch decode / `--extract-audio` / `--bench`) |
+| [`tests/test_nijinWVDC.cpp`](tests/test_nijinWVDC.cpp) · [`tests/test_c_api.c`](tests/test_c_api.c) | C++17 & C11 shared-library unit, concurrency, strided/ROI, audio/timecode WAV, and corpus suites |
+| [`CMakeLists.txt`](CMakeLists.txt) · [`cmake/`](cmake) · [`Makefile`](Makefile) | Static + shared library targets, CMake package config, pkg-config, and [`release.yml`](.github/workflows/release.yml) CI |
 
 ---
 

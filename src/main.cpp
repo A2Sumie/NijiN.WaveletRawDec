@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "../include/nijinWVDC.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -11,17 +12,63 @@
 #include <sys/stat.h>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <direct.h>
+#include <windows.h>
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#endif
+#endif
+
 namespace {
 
+inline bool is_path_sep(char c) {
+#ifdef _WIN32
+    return c == '/' || c == '\\';
+#else
+    return c == '/';
+#endif
+}
+
+#ifdef _WIN32
+std::wstring utf8_to_wide_cli(const std::string& utf8) {
+    if (utf8.empty()) return std::wstring();
+    int n = MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
+    if (n <= 0) return std::wstring(utf8.begin(), utf8.end());
+    std::wstring w(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), &w[0], n);
+    return w;
+}
+#endif
+
 bool path_is_dir(const std::string& p) {
+#ifdef _WIN32
+    std::wstring w = utf8_to_wide_cli(p);
+    while (w.size() > 1 && (w.back() == L'/' || w.back() == L'\\')) {
+        if (w.size() == 3 && w[1] == L':') break;
+        w.pop_back();
+    }
+    struct _stat64 st{};
+    return _wstat64(w.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+#else
     struct stat st{};
     return stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+#endif
 }
 
 std::string parent_dir(const std::string& p) {
-    size_t pos = p.find_last_of('/');
+    size_t pos = p.find_last_of("/\\");
     if (pos == std::string::npos) return "";
     if (pos == 0) return "/";
+#ifdef _WIN32
+    if (pos == 2 && p.size() >= 3 && p[1] == ':') return p.substr(0, 3);
+#endif
     return p.substr(0, pos);
 }
 
@@ -30,8 +77,28 @@ bool mkdir_p(const std::string& path, std::string& err) {
     std::string cur;
     for (size_t i = 0; i < path.size(); ++i) {
         cur.push_back(path[i]);
-        if (path[i] == '/' || i + 1 == path.size()) {
-            if (cur == "/") continue;
+        if (is_path_sep(path[i]) || i + 1 == path.size()) {
+            if (cur == "/" || cur == "\\") continue;
+#ifdef _WIN32
+            if ((cur.size() == 2 && cur[1] == ':') ||
+                (cur.size() == 3 && cur[1] == ':' && is_path_sep(cur[2]))) {
+                continue;
+            }
+            std::wstring wcur = utf8_to_wide_cli(cur);
+            while (wcur.size() > 1 && (wcur.back() == L'/' || wcur.back() == L'\\')) {
+                wcur.pop_back();
+            }
+            struct _stat64 st{};
+            if (_wstat64(wcur.c_str(), &st) == 0) {
+                if (!S_ISDIR(st.st_mode)) {
+                    err = cur + " exists and is not a directory";
+                    return false;
+                }
+            } else if (_wmkdir(wcur.c_str()) != 0 && errno != EEXIST) {
+                err = std::strerror(errno);
+                return false;
+            }
+#else
             struct stat st{};
             if (stat(cur.c_str(), &st) == 0) {
                 if (!S_ISDIR(st.st_mode)) {
@@ -42,6 +109,7 @@ bool mkdir_p(const std::string& path, std::string& err) {
                 err = std::strerror(errno);
                 return false;
             }
+#endif
         }
     }
     return true;
@@ -49,7 +117,7 @@ bool mkdir_p(const std::string& path, std::string& err) {
 
 std::string join_path(const std::string& dir, const char* file) {
     if (dir.empty()) return file;
-    return (dir.back() == '/') ? (dir + file) : (dir + "/" + file);
+    return is_path_sep(dir.back()) ? (dir + file) : (dir + "/" + file);
 }
 
 bool ends_with_ci(const std::string& s, const char* suf) {
@@ -125,7 +193,11 @@ bool parse_frame_spec(const std::string& spec, size_t total_frames, std::vector<
 }
 
 bool write_raw_file(const std::string& path, const void* data, size_t bytes, std::string& err) {
+#ifdef _WIN32
+    FILE* fp = _wfopen(utf8_to_wide_cli(path).c_str(), L"wb");
+#else
     FILE* fp = std::fopen(path.c_str(), "wb");
+#endif
     if (!fp) {
         err = "Cannot open output for writing: " + path;
         return false;
@@ -140,11 +212,25 @@ bool write_raw_file(const std::string& path, const void* data, size_t bytes, std
 }
 
 bool read_file_bytes(const std::string& path, std::vector<uint8_t>& out, std::string& err) {
+#ifdef _WIN32
+    FILE* fp = _wfopen(utf8_to_wide_cli(path).c_str(), L"rb");
+#else
     FILE* fp = std::fopen(path.c_str(), "rb");
+#endif
     if (!fp) {
         err = "Cannot open input file: " + path;
         return false;
     }
+#ifdef _WIN32
+    _fseeki64(fp, 0, SEEK_END);
+    __int64 sz = _ftelli64(fp);
+    if (sz <= 0) {
+        std::fclose(fp);
+        err = "Input file is empty: " + path;
+        return false;
+    }
+    _fseeki64(fp, 0, SEEK_SET);
+#else
     std::fseek(fp, 0, SEEK_END);
     long sz = std::ftell(fp);
     if (sz <= 0) {
@@ -153,6 +239,7 @@ bool read_file_bytes(const std::string& path, std::vector<uint8_t>& out, std::st
         return false;
     }
     std::fseek(fp, 0, SEEK_SET);
+#endif
     out.resize(static_cast<size_t>(sz));
     size_t rd = std::fread(out.data(), 1, out.size(), fp);
     std::fclose(fp);
@@ -192,7 +279,11 @@ void print_info_common_tail(const nijinwvdc::NevFrameMeta& m0) {
                 m0.wb_rggb[0], m0.wb_rggb[1], m0.wb_rggb[2], m0.wb_rggb[3], m0.wb_mode.c_str(), m0.color_temp);
 }
 
-void print_info_human(const nijinwvdc::NevClipInfo& clip, const nijinwvdc::NevFrameMeta& m0, const nijinwvdc::TicoRawInfo& jxs) {
+void print_info_human(
+    const nijinwvdc::NevClipInfo& clip,
+    const nijinwvdc::NevFrameMeta& m0,
+    const nijinwvdc::VideoFrameTiming& t0,
+    const nijinwvdc::TicoRawInfo& jxs) {
     print_info_common_header(clip, m0);
     if (clip.major_brand == "NEF") {
         const char* fmt_str = (!clip.tracks.empty() && !clip.tracks[0].format.empty())
@@ -218,8 +309,14 @@ void print_info_human(const nijinwvdc::NevClipInfo& clip, const nijinwvdc::NevFr
                         tr.format.c_str(), tr.audio_sample_rate, tr.audio_channels,
                         tr.audio_bits_per_channel, tr.sample_count);
         } else if (tr.handler_type == "tmcd") {
-            std::printf("Timecode:      %s ts=%u dur=%u nf=%u\n",
-                        tr.format.c_str(), tr.tmcd_timescale, tr.tmcd_frame_duration, tr.tmcd_num_frames);
+            if (t0.has_timecode) {
+                std::printf("Timecode:      %s ts=%u dur=%u nf=%u, start=%s\n",
+                            tr.format.c_str(), tr.tmcd_timescale, tr.tmcd_frame_duration,
+                            tr.tmcd_num_frames, t0.timecode_str);
+            } else {
+                std::printf("Timecode:      %s ts=%u dur=%u nf=%u\n",
+                            tr.format.c_str(), tr.tmcd_timescale, tr.tmcd_frame_duration, tr.tmcd_num_frames);
+            }
         }
     }
     if (clip.ncvw_size > 0) {
@@ -244,7 +341,12 @@ void print_info_arw6_human(const nijinwvdc::NevClipInfo& clip, const nijinwvdc::
     }
 }
 
-void print_info_json_prefix(const nijinwvdc::NevClipInfo& clip, const nijinwvdc::NevFrameMeta& m0, uint32_t cs_w, uint32_t cs_h) {
+void print_info_json_prefix(
+    const nijinwvdc::NevClipInfo& clip,
+    const nijinwvdc::NevFrameMeta& m0,
+    const nijinwvdc::VideoFrameTiming& t0,
+    uint32_t cs_w,
+    uint32_t cs_h) {
     std::printf("{\n");
     std::printf("  \"file\": \"%s\",\n", json_escape(clip.file_path).c_str());
     std::printf("  \"file_size\": %llu,\n", static_cast<unsigned long long>(clip.file_size));
@@ -255,6 +357,9 @@ void print_info_json_prefix(const nijinwvdc::NevClipInfo& clip, const nijinwvdc:
     std::printf("  \"lens\": \"%s\",\n", json_escape(clip.lens_model).c_str());
     std::printf("  \"frames\": %zu,\n", clip.video_samples.size());
     std::printf("  \"fps\": %.6f,\n", clip.fps);
+    if (t0.has_timecode) {
+        std::printf("  \"timecode\": \"%s\",\n", json_escape(t0.timecode_str).c_str());
+    }
     std::printf("  \"codestream_width\": %u,\n", cs_w);
     std::printf("  \"codestream_height\": %u,\n", cs_h);
     std::printf("  \"active_crop\": [%u, %u, %u, %u],\n", m0.crop[0], m0.crop[1], m0.crop[2], m0.crop[3]);
@@ -268,8 +373,12 @@ void print_info_json_prefix(const nijinwvdc::NevClipInfo& clip, const nijinwvdc:
     std::printf("  \"nef_compression\": %u,\n", m0.nef_compression);
 }
 
-void print_info_json(const nijinwvdc::NevClipInfo& clip, const nijinwvdc::NevFrameMeta& m0, const nijinwvdc::TicoRawInfo& jxs) {
-    print_info_json_prefix(clip, m0, jxs.width, jxs.height);
+void print_info_json(
+    const nijinwvdc::NevClipInfo& clip,
+    const nijinwvdc::NevFrameMeta& m0,
+    const nijinwvdc::VideoFrameTiming& t0,
+    const nijinwvdc::TicoRawInfo& jxs) {
+    print_info_json_prefix(clip, m0, t0, jxs.width, jxs.height);
     std::printf("  \"ticoraw\": {\n");
     std::printf("    \"lcod\": %u,\n", jxs.lcod);
     std::printf("    \"in_bitdepth\": %d,\n", jxs.in_bitdepth);
@@ -285,8 +394,12 @@ void print_info_json(const nijinwvdc::NevClipInfo& clip, const nijinwvdc::NevFra
     std::printf("}\n");
 }
 
-void print_info_arw6_json(const nijinwvdc::NevClipInfo& clip, const nijinwvdc::NevFrameMeta& m0, const nijinwvdc::Arw6Info& arw6) {
-    print_info_json_prefix(clip, m0, arw6.width, arw6.height);
+void print_info_arw6_json(
+    const nijinwvdc::NevClipInfo& clip,
+    const nijinwvdc::NevFrameMeta& m0,
+    const nijinwvdc::VideoFrameTiming& t0,
+    const nijinwvdc::Arw6Info& arw6) {
+    print_info_json_prefix(clip, m0, t0, arw6.width, arw6.height);
     std::printf("  \"arw6\": {\n");
     std::printf("    \"strip_bytes\": %u,\n", arw6.codestream_size);
     std::printf("    \"tiles\": %zu,\n", arw6.tiles.size());
@@ -302,10 +415,12 @@ void print_info_arw6_json(const nijinwvdc::NevClipInfo& clip, const nijinwvdc::N
 void print_usage(const char* prog) {
     std::fprintf(stderr,
         "Usage:\n"
+        "  %s --version\n"
         "  %s --info [--json] <in.NEV | in.NEF | in.ARW | in.jxs>\n"
         "  %s <in.NEV | in.NEF | in.ARW> [--frame <N|start-end|all>] -o <out.dng|out.raw|dir/> [options]\n"
         "  %s --raw-jxs <in.jxs> -o <out.raw|out.dng> [options]\n"
         "  %s --extract-jxs <in.NEV | in.NEF> [--frame <N>] -o <out.jxs>\n"
+        "  %s --extract-audio <in.NEV> -o <out.wav>\n"
         "  %s --extract-preview <in.NEV | in.NEF | in.ARW> [--thumb] -o <out.jpg>\n"
         "  %s --bench <in.NEV | in.ARW> [--frames N] [--threads N]\n\n"
         "Options:\n"
@@ -313,7 +428,7 @@ void print_usage(const char* prog) {
         "  --active-crop           Crop sensor margins to camera active crop area\n"
         "  --orientation <1..8>    Override TIFF Orientation\n"
         "  --threads <N>           Worker threads (default: hardware concurrency)\n",
-        prog, prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 } // namespace
@@ -323,6 +438,7 @@ int main(int argc, char** argv) {
     bool json_mode = false;
     bool raw_jxs_mode = false;
     bool extract_jxs_mode = false;
+    bool extract_audio_mode = false;
     bool extract_preview_mode = false;
     bool extract_thumb = false;
     bool bench_mode = false;
@@ -349,6 +465,9 @@ int main(int argc, char** argv) {
         if (std::strcmp(a, "-h") == 0 || std::strcmp(a, "--help") == 0) {
             print_usage(argv[0]);
             return 0;
+        } else if (std::strcmp(a, "-V") == 0 || std::strcmp(a, "--version") == 0) {
+            std::printf("nijinWVDC %s\n", nijinwvdc::version_string());
+            return 0;
         } else if (std::strcmp(a, "--info") == 0) {
             info_mode = true;
         } else if (std::strcmp(a, "--json") == 0) {
@@ -357,6 +476,8 @@ int main(int argc, char** argv) {
             raw_jxs_mode = true;
         } else if (std::strcmp(a, "--extract-jxs") == 0) {
             extract_jxs_mode = true;
+        } else if (std::strcmp(a, "--extract-audio") == 0) {
+            extract_audio_mode = true;
         } else if (std::strcmp(a, "--extract-preview") == 0) {
             extract_preview_mode = true;
         } else if (std::strcmp(a, "--thumb") == 0) {
@@ -444,28 +565,35 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // NEV clip modes
-    nijinwvdc::NevClipInfo clip;
-    if (!nijinwvdc::parse_nev_clip(input_path, clip, err)) {
+    // Container / clip modes via MediaReader + DecoderSession
+    nijinwvdc::MediaReader reader;
+    if (!reader.open_file(input_path, err)) {
         std::fprintf(stderr, "Error: %s\n", err.c_str());
         return 1;
     }
+    const nijinwvdc::NevClipInfo& clip = reader.clip_info();
 
     if (info_mode) {
         nijinwvdc::NevFrameMeta m0;
         std::vector<uint8_t> cs0;
-        if (!nijinwvdc::read_nev_frame_meta_and_codestream(clip, 0, m0, &cs0, err)) {
+        if (!reader.read_frame_packet(0, m0, &cs0, err)) {
             std::fprintf(stderr, "Error: %s\n", err.c_str());
             return 1;
         }
-        if (clip.major_brand == "ARW") {
+        nijinwvdc::VideoFrameTiming t0;
+        std::string t_err;
+        reader.get_frame_timing(0, t0, t_err);
+        if (clip.codec_family == nijinwvdc::CodecFamily::Arw6) {
             nijinwvdc::Arw6Info arw6;
-            if (!nijinwvdc::probe_arw6_strip(cs0.data(), cs0.size(), arw6, err)) {
+            const bool ok = (cs0.size() >= 16 && std::memcmp(cs0.data(), "A000", 4) == 0)
+                                ? nijinwvdc::probe_arw6_codestream(cs0.data(), cs0.size(), arw6, err)
+                                : nijinwvdc::probe_arw6_strip(cs0.data(), cs0.size(), arw6, err);
+            if (!ok) {
                 std::fprintf(stderr, "Error: %s\n", err.c_str());
                 return 1;
             }
             if (json_mode) {
-                print_info_arw6_json(clip, m0, arw6);
+                print_info_arw6_json(clip, m0, t0, arw6);
             } else {
                 print_info_arw6_human(clip, m0, arw6);
             }
@@ -477,10 +605,26 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (json_mode) {
-            print_info_json(clip, m0, jxs);
+            print_info_json(clip, m0, t0, jxs);
         } else {
-            print_info_human(clip, m0, jxs);
+            print_info_human(clip, m0, t0, jxs);
         }
+        return 0;
+    }
+
+    if (extract_audio_mode) {
+        if (output_path.empty()) {
+            std::fprintf(stderr, "Error: --extract-audio requires -o <out.wav>\n");
+            return 2;
+        }
+        const auto ainfo = reader.audio_info();
+        if (!reader.export_audio_wav(output_path, err)) {
+            std::fprintf(stderr, "Error: %s\n", err.c_str());
+            return 1;
+        }
+        std::printf("Extracted %llu audio frames (%.0f Hz, %u ch, %u-bit) to %s\n",
+                    static_cast<unsigned long long>(ainfo.total_frames),
+                    ainfo.sample_rate, ainfo.channels, ainfo.bits_per_channel, output_path.c_str());
         return 0;
     }
 
@@ -489,20 +633,26 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "Error: --extract-preview requires -o <out.jpg>\n");
             return 2;
         }
-        uint64_t off = extract_thumb ? clip.ncth_offset : clip.ncvw_offset;
-        uint32_t sz = extract_thumb ? clip.ncth_size : clip.ncvw_size;
         std::vector<uint8_t> blob;
-        if (!nijinwvdc::extract_nev_blob(clip.file_path, off, sz, blob, err) ||
-            !write_raw_file(output_path, blob.data(), blob.size(), err)) {
+        if (extract_thumb) {
+            if (!nijinwvdc::extract_nev_blob(clip.file_path, clip.ncth_offset, clip.ncth_size, blob, err)) {
+                std::fprintf(stderr, "Error: %s\n", err.c_str());
+                return 1;
+            }
+        } else if (!reader.extract_preview_jpeg(blob, err)) {
             std::fprintf(stderr, "Error: %s\n", err.c_str());
             return 1;
         }
-        std::printf("Extracted %u bytes to %s\n", sz, output_path.c_str());
+        if (!write_raw_file(output_path, blob.data(), blob.size(), err)) {
+            std::fprintf(stderr, "Error: %s\n", err.c_str());
+            return 1;
+        }
+        std::printf("Extracted %zu bytes to %s\n", blob.size(), output_path.c_str());
         return 0;
     }
 
     if (extract_jxs_mode) {
-        if (clip.major_brand == "ARW") {
+        if (clip.codec_family == nijinwvdc::CodecFamily::Arw6) {
             std::fprintf(stderr, "Error: --extract-jxs applies to Nikon TicoRAW (.NEV/.NEF), not Sony ARW6\n");
             return 2;
         }
@@ -511,13 +661,13 @@ int main(int argc, char** argv) {
             return 2;
         }
         std::vector<uint32_t> frames;
-        if (!parse_frame_spec(frame_spec, clip.video_samples.size(), frames, err) || frames.size() != 1) {
+        if (!parse_frame_spec(frame_spec, reader.frame_count(), frames, err) || frames.size() != 1) {
             std::fprintf(stderr, "Error: --extract-jxs requires a single valid --frame index (%s)\n", err.c_str());
             return 2;
         }
         nijinwvdc::NevFrameMeta meta;
         std::vector<uint8_t> cs;
-        if (!nijinwvdc::read_nev_frame_meta_and_codestream(clip, frames[0], meta, &cs, err) ||
+        if (!reader.read_frame_packet(frames[0], meta, &cs, err) ||
             !write_raw_file(output_path, cs.data(), cs.size(), err)) {
             std::fprintf(stderr, "Error: %s\n", err.c_str());
             return 1;
@@ -526,45 +676,21 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    auto decode_clip_sample = [&](const nijinwvdc::NevFrameMeta& meta,
-                                  const std::vector<uint8_t>& cs_bytes,
-                                  std::vector<uint16_t>& bayer_pix,
-                                  nijinwvdc::DngWriteOptions& dopts,
-                                  uint32_t& out_w,
-                                  uint32_t& out_h) -> bool {
-        if (clip.major_brand == "ARW") {
-            nijinwvdc::Arw6Info arw6;
-            if (!nijinwvdc::decode_arw6_bayer(cs_bytes.data(), cs_bytes.size(), threads, bayer_pix, arw6, err)) {
-                return false;
-            }
-            nijinwvdc::build_dng_options_from_clip_and_frame(clip, meta, arw6, active_crop, override_orientation, dopts);
-            out_w = arw6.width;
-            out_h = arw6.height;
-            return true;
-        }
-        nijinwvdc::TicoRawInfo jxs;
-        if (!nijinwvdc::decode_ticoraw_bayer(cs_bytes.data(), cs_bytes.size(), threads, bayer_pix, jxs, err)) {
-            return false;
-        }
-        nijinwvdc::build_dng_options_from_clip_and_frame(clip, meta, jxs, active_crop, override_orientation, dopts);
-        out_w = jxs.width;
-        out_h = jxs.height;
-        return true;
-    };
+    nijinwvdc::DecoderSession session(threads);
 
     if (bench_mode) {
-        size_t count = (clip.video_samples.size() == 1)
+        size_t count = (reader.frame_count() == 1u)
                            ? static_cast<size_t>(std::max(1, bench_frames))
-                           : static_cast<size_t>(std::min<long>(std::max(1, bench_frames), static_cast<long>(clip.video_samples.size())));
+                           : static_cast<size_t>(std::min<long>(std::max(1, bench_frames), static_cast<long>(reader.frame_count())));
         std::vector<uint8_t> cs;
         std::vector<uint16_t> bayer;
         nijinwvdc::NevFrameMeta meta;
-        nijinwvdc::DngWriteOptions dopts;
-        uint32_t bw = 0, bh = 0;
+        nijinwvdc::DecodeOptions dopts;
+        dopts.num_threads = threads;
+        nijinwvdc::DecodedFrameInfo dec_info;
 
-        // Warmup frame 0
-        if (!nijinwvdc::read_nev_frame_meta_and_codestream(clip, 0, meta, &cs, err) ||
-            !decode_clip_sample(meta, cs, bayer, dopts, bw, bh)) {
+        if (!reader.read_frame_packet(0, meta, &cs, err) ||
+            !session.decode_codestream(cs.data(), cs.size(), dopts, bayer, dec_info, err)) {
             std::fprintf(stderr, "Benchmark warmup failed: %s\n", err.c_str());
             return 1;
         }
@@ -572,13 +698,16 @@ int main(int argc, char** argv) {
         double dec_ms_total = 0.0;
         auto t_e2e_start = std::chrono::steady_clock::now();
         for (size_t i = 0; i < count; ++i) {
-            uint32_t fidx = (clip.video_samples.size() == 1) ? 0u : static_cast<uint32_t>(i);
-            if (!nijinwvdc::read_nev_frame_meta_and_codestream(clip, fidx, meta, &cs, err)) {
+            uint32_t fidx = (reader.frame_count() == 1u) ? 0u : static_cast<uint32_t>(i);
+            if (!reader.read_frame_packet(fidx, meta, &cs, err)) {
                 std::fprintf(stderr, "Read failed at iter %zu: %s\n", i, err.c_str());
                 return 1;
             }
             auto t0 = std::chrono::steady_clock::now();
-            if (!decode_clip_sample(meta, cs, bayer, dopts, bw, bh)) {
+            if (!session.decode_codestream_into(
+                    cs.data(), cs.size(), dopts,
+                    bayer.data(), static_cast<size_t>(dec_info.coded_width) * sizeof(uint16_t),
+                    dec_info.coded_height, dec_info, err)) {
                 std::fprintf(stderr, "Decode failed at iter %zu: %s\n", i, err.c_str());
                 return 1;
             }
@@ -590,7 +719,8 @@ int main(int argc, char** argv) {
         double avg_dec = dec_ms_total / static_cast<double>(count);
         double avg_e2e = e2e_ms_total / static_cast<double>(count);
         std::printf("Bench (%zu frames, threads=%d, %ux%u): decode=%.2f ms/frame (%.2f fps), read+decode=%.2f ms/frame (%.2f fps)\n",
-                    count, threads, bw, bh, avg_dec, 1000.0 / avg_dec, avg_e2e, 1000.0 / avg_e2e);
+                    count, threads, dec_info.coded_width, dec_info.coded_height,
+                    avg_dec, 1000.0 / avg_dec, avg_e2e, 1000.0 / avg_e2e);
         return 0;
     }
 
@@ -601,12 +731,12 @@ int main(int argc, char** argv) {
     }
 
     std::vector<uint32_t> frames;
-    if (!parse_frame_spec(frame_spec, clip.video_samples.size(), frames, err)) {
+    if (!parse_frame_spec(frame_spec, reader.frame_count(), frames, err)) {
         std::fprintf(stderr, "Error: %s\n", err.c_str());
         return 2;
     }
 
-    bool out_is_dir = (frames.size() > 1) || output_path.back() == '/' || path_is_dir(output_path);
+    bool out_is_dir = (frames.size() > 1) || is_path_sep(output_path.back()) || path_is_dir(output_path);
     bool use_raw = (format_override == "raw") || (!out_is_dir && ends_with_ci(output_path, ".raw"));
 
     if (out_is_dir) {
@@ -622,34 +752,39 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::vector<uint8_t> cs;
     std::vector<uint16_t> bayer;
-    std::vector<uint16_t> cropped;
+    nijinwvdc::DecodeOptions dec_opts;
+    dec_opts.num_threads = threads;
+    dec_opts.apply_active_crop = active_crop;
     for (uint32_t fidx : frames) {
-        nijinwvdc::NevFrameMeta meta;
-        if (!nijinwvdc::read_nev_frame_meta_and_codestream(clip, fidx, meta, &cs, err)) {
-            std::fprintf(stderr, "Error reading frame %u: %s\n", fidx, err.c_str());
-            return 1;
-        }
-        nijinwvdc::DngWriteOptions opts;
-        uint32_t fw = 0, fh = 0;
-        if (!decode_clip_sample(meta, cs, bayer, opts, fw, fh)) {
+        nijinwvdc::DecodedFrameInfo dec_info;
+        if (!session.decode_frame(reader, fidx, dec_opts, bayer, dec_info, err)) {
             std::fprintf(stderr, "Error decoding frame %u: %s\n", fidx, err.c_str());
             return 1;
         }
 
-        const uint16_t* out_pix = bayer.data();
-        if (active_crop && meta.has_crop && meta.crop[2] > 0 && meta.crop[3] > 0) {
-            uint8_t new_cfa[4];
-            if (!nijinwvdc::apply_bayer_crop(bayer.data(), fw, fh, meta.crop, opts.cfa_pattern, cropped, new_cfa)) {
-                std::fprintf(stderr, "Error applying active crop [%u,%u,%u,%u]\n",
-                             meta.crop[0], meta.crop[1], meta.crop[2], meta.crop[3]);
-                return 1;
-            }
-            out_pix = cropped.data();
-            opts.width = meta.crop[2];
-            opts.height = meta.crop[3];
-            std::memcpy(opts.cfa_pattern, new_cfa, 4);
+        nijinwvdc::DngWriteOptions opts;
+        if (clip.codec_family == nijinwvdc::CodecFamily::Arw6) {
+            nijinwvdc::Arw6Info arw6;
+            arw6.width = dec_info.coded_width;
+            arw6.height = dec_info.coded_height;
+            arw6.bit_depth = dec_info.bit_depth;
+            nijinwvdc::build_dng_options_from_clip_and_frame(
+                clip, dec_info.meta, arw6, active_crop, override_orientation, opts);
+        } else {
+            nijinwvdc::TicoRawInfo jxs;
+            jxs.width = static_cast<uint16_t>(dec_info.coded_width);
+            jxs.height = static_cast<uint16_t>(dec_info.coded_height);
+            jxs.cdt_depth = dec_info.bit_depth;
+            jxs.out_bitdepth = dec_info.bit_depth;
+            nijinwvdc::build_dng_options_from_clip_and_frame(
+                clip, dec_info.meta, jxs, active_crop, override_orientation, opts);
+        }
+        opts.width = dec_info.output_width;
+        opts.height = dec_info.output_height;
+        std::memcpy(opts.cfa_pattern, dec_info.cfa_pattern, 4);
+        if (active_crop && (dec_info.output_width != dec_info.coded_width ||
+                            dec_info.output_height != dec_info.coded_height)) {
             opts.has_crop = false;
         }
 
@@ -662,12 +797,12 @@ int main(int argc, char** argv) {
 
         if (use_raw) {
             size_t nbytes = static_cast<size_t>(opts.width) * static_cast<size_t>(opts.height) * sizeof(uint16_t);
-            if (!write_raw_file(target, out_pix, nbytes, err)) {
+            if (!write_raw_file(target, bayer.data(), nbytes, err)) {
                 std::fprintf(stderr, "Error: %s\n", err.c_str());
                 return 1;
             }
         } else {
-            if (!nijinwvdc::write_cfa_dng(target, out_pix, opts, err)) {
+            if (!nijinwvdc::write_cfa_dng(target, bayer.data(), opts, err)) {
                 std::fprintf(stderr, "Error: %s\n", err.c_str());
                 return 1;
             }

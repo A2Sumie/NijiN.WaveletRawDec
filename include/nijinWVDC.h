@@ -2,12 +2,48 @@
 #ifndef NIJINWVDC_H
 #define NIJINWVDC_H
 
+#include "nijinWVDC_export.h"
+
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace nijinwvdc {
+
+NIJINWVDC_API const char* version_string();
+NIJINWVDC_API uint32_t simd_capabilities();
+
+enum class ContainerFormat : uint8_t {
+    Unknown = 0,
+    Mp4Nev = 1,
+    TiffNef = 2,
+    TiffArw = 3,
+    RawCodestream = 4
+};
+
+enum class CodecFamily : uint8_t {
+    Unknown = 0,
+    TicoRaw = 1,
+    Arw6 = 2
+};
+
+struct TrackChunkSpan {
+    uint64_t offset = 0;
+    uint32_t sample_count = 0;
+};
+
+struct SttsRun {
+    uint32_t sample_count = 0;
+    uint32_t sample_delta = 0;
+};
+
+struct IoCallbacks {
+    void* user_data = nullptr;
+    uint64_t file_size = 0;
+    bool (*read_at)(void* user_data, uint64_t offset, void* dst, size_t size, size_t* bytes_read_out) = nullptr;
+};
 
 struct NevSampleLocation {
     uint64_t file_offset = 0;
@@ -23,11 +59,12 @@ struct NevTrackSummary {
     uint32_t sample_count = 0;
     uint32_t width = 0;
     uint32_t height = 0;
-    // Audio (QuickTime Sound v2 / LPCM)
+    // Audio (QuickTime Sound v0/v1/v2 / LPCM)
     double audio_sample_rate = 0.0;
     uint32_t audio_channels = 0;
     uint32_t audio_bits_per_channel = 0;
     uint32_t audio_bytes_per_packet = 0;
+    uint32_t audio_lpcm_flags = 0;
     // Timecode
     uint32_t tmcd_flags = 0;
     uint32_t tmcd_timescale = 0;
@@ -102,6 +139,46 @@ struct NevClipInfo {
 
     bool has_single_frame_meta = false;
     NevFrameMeta single_frame_meta;
+
+    ContainerFormat container_format = ContainerFormat::Unknown;
+    CodecFamily codec_family = CodecFamily::Unknown;
+    std::vector<SttsRun> video_stts;
+    int audio_track_index = -1;
+    std::vector<TrackChunkSpan> audio_chunks;
+    uint64_t total_audio_frames = 0;
+    int timecode_track_index = -1;
+    std::vector<uint32_t> timecode_samples;
+};
+
+struct VideoFrameTiming {
+    uint32_t frame_index = 0;
+    uint32_t timescale = 0;
+    uint64_t pts_ticks = 0;
+    uint32_t duration_ticks = 0;
+    double pts_seconds = 0.0;
+    double duration_seconds = 0.0;
+    bool has_timecode = false;
+    bool drop_frame = false;
+    uint8_t tc_hours = 0;
+    uint8_t tc_minutes = 0;
+    uint8_t tc_seconds = 0;
+    uint8_t tc_frames = 0;
+    char timecode_str[16] = {};
+};
+
+struct AudioFormatInfo {
+    bool available = false;
+    std::string format;
+    uint32_t timescale = 0;
+    double sample_rate = 0.0;
+    uint32_t channels = 0;
+    uint32_t bits_per_channel = 0;
+    uint32_t bytes_per_packet = 0;
+    uint32_t lpcm_flags = 0;
+    bool is_signed = true;
+    bool is_float = false;
+    bool is_big_endian = false;
+    uint64_t total_frames = 0;
 };
 
 struct TicoRawInfo {
@@ -164,6 +241,29 @@ struct Arw6Info {
     std::vector<Arw6TileInfo> tiles;
 };
 
+struct DecodeOptions {
+    int num_threads = 0;          // 0 = use session default
+    bool apply_active_crop = false;
+    bool has_roi = false;
+    uint32_t roi[4] = {0, 0, 0, 0}; // [x, y, width, height] in coded pixels
+};
+
+struct DecodedFrameInfo {
+    CodecFamily codec = CodecFamily::Unknown;
+    uint32_t coded_width = 0;
+    uint32_t coded_height = 0;
+    uint32_t output_width = 0;
+    uint32_t output_height = 0;
+    uint32_t offset_x = 0;
+    uint32_t offset_y = 0;
+    uint16_t bit_depth = 14;
+    uint8_t cfa_pattern[4] = {0, 1, 1, 2};
+    bool has_meta = false;
+    NevFrameMeta meta;
+    bool has_timing = false;
+    VideoFrameTiming timing;
+};
+
 struct DngWriteOptions {
     uint32_t width = 0;
     uint32_t height = 0;
@@ -191,14 +291,14 @@ struct DngWriteOptions {
 };
 
 // Container parsing (64-bit file I/O)
-bool parse_nev_clip(const std::string& path, NevClipInfo& clip, std::string& err);
-bool read_nev_frame_meta_and_codestream(
+NIJINWVDC_API bool parse_nev_clip(const std::string& path, NevClipInfo& clip, std::string& err);
+NIJINWVDC_API bool read_nev_frame_meta_and_codestream(
     const NevClipInfo& clip,
     uint32_t frame_index,
     NevFrameMeta& meta,
     std::vector<uint8_t>* codestream_out,
     std::string& err);
-bool extract_nev_blob(
+NIJINWVDC_API bool extract_nev_blob(
     const std::string& path,
     uint64_t offset,
     uint32_t size,
@@ -206,13 +306,13 @@ bool extract_nev_blob(
     std::string& err);
 
 // TicoRAW / JPEG XS R0 decoding
-bool probe_ticoraw_header(
+NIJINWVDC_API bool probe_ticoraw_header(
     const uint8_t* data,
     size_t len,
     TicoRawInfo& info,
     std::string& err);
 
-bool decode_ticoraw_bayer(
+NIJINWVDC_API bool decode_ticoraw_bayer(
     const uint8_t* data,
     size_t len,
     int num_threads,
@@ -221,19 +321,19 @@ bool decode_ticoraw_bayer(
     std::string& err);
 
 // Sony ARW6 (Compression=32766, SonyRawFileType=6) multi-tile & "A000" wavelet decoding
-bool probe_arw6_codestream(
+NIJINWVDC_API bool probe_arw6_codestream(
     const uint8_t* data,
     size_t len,
     Arw6Info& info,
     std::string& err);
 
-bool probe_arw6_strip(
+NIJINWVDC_API bool probe_arw6_strip(
     const uint8_t* strip_data,
     size_t strip_len,
     Arw6Info& info,
     std::string& err);
 
-bool decode_arw6_tile(
+NIJINWVDC_API bool decode_arw6_tile(
     const uint8_t* cs_data,
     size_t cs_len,
     int num_threads,
@@ -245,7 +345,7 @@ bool decode_arw6_tile(
     Arw6Info& tile_info_out,
     std::string& err);
 
-bool decode_arw6_bayer(
+NIJINWVDC_API bool decode_arw6_bayer(
     const uint8_t* strip_data,
     size_t strip_len,
     int num_threads,
@@ -254,23 +354,23 @@ bool decode_arw6_bayer(
     std::string& err);
 
 // DNG 1.4 writer & camera matrix lookup
-bool lookup_nikon_d65_colormatrix(const std::string& model, double out_cm[9]);
-bool lookup_camera_d65_colormatrix(const std::string& make, const std::string& model, double out_cm[9]);
-void build_dng_options_from_clip_and_frame(
+NIJINWVDC_API bool lookup_nikon_d65_colormatrix(const std::string& model, double out_cm[9]);
+NIJINWVDC_API bool lookup_camera_d65_colormatrix(const std::string& make, const std::string& model, double out_cm[9]);
+NIJINWVDC_API void build_dng_options_from_clip_and_frame(
     const NevClipInfo& clip,
     const NevFrameMeta& meta,
     const TicoRawInfo& jxs,
     bool apply_active_crop,
     uint16_t override_orientation,
     DngWriteOptions& opts);
-void build_dng_options_from_clip_and_frame(
+NIJINWVDC_API void build_dng_options_from_clip_and_frame(
     const NevClipInfo& clip,
     const NevFrameMeta& meta,
     const Arw6Info& arw6,
     bool apply_active_crop,
     uint16_t override_orientation,
     DngWriteOptions& opts);
-bool apply_bayer_crop(
+NIJINWVDC_API bool apply_bayer_crop(
     const uint16_t* src,
     uint32_t src_w,
     uint32_t src_h,
@@ -278,11 +378,163 @@ bool apply_bayer_crop(
     const uint8_t src_cfa[4],
     std::vector<uint16_t>& dst,
     uint8_t dst_cfa[4]);
-bool write_cfa_dng(
+NIJINWVDC_API bool write_cfa_dng(
     const std::string& path,
     const uint16_t* pixels,
     const DngWriteOptions& opts,
     std::string& err);
+
+// High-throughput strided post-processing & in-memory DNG helpers
+NIJINWVDC_API bool apply_bayer_crop_strided(
+    const uint16_t* src,
+    size_t src_row_stride_bytes,
+    uint32_t src_w,
+    uint32_t src_h,
+    const uint16_t crop_xywh[4],
+    const uint8_t src_cfa[4],
+    uint16_t* dst,
+    size_t dst_row_stride_bytes,
+    uint8_t dst_cfa[4]);
+
+NIJINWVDC_API bool split_bayer_cfa_planes(
+    const uint16_t* src,
+    size_t src_row_stride_bytes,
+    uint32_t width,
+    uint32_t height,
+    uint16_t* c00,
+    uint16_t* c01,
+    uint16_t* c10,
+    uint16_t* c11,
+    size_t plane_row_stride_bytes);
+
+NIJINWVDC_API bool normalize_bayer_to_float(
+    const uint16_t* src,
+    size_t src_row_stride_bytes,
+    uint32_t width,
+    uint32_t height,
+    const float black[4],
+    float white_level,
+    bool clamp_01,
+    float* dst,
+    size_t dst_row_stride_bytes);
+
+NIJINWVDC_API bool build_cfa_dng_header(
+    const DngWriteOptions& opts,
+    std::vector<uint8_t>& header_out,
+    std::string& err);
+
+NIJINWVDC_API bool encode_cfa_dng_memory(
+    const uint16_t* pixels,
+    const DngWriteOptions& opts,
+    std::vector<uint8_t>& dng_out,
+    std::string& err);
+
+// Stateful, thread-safe container & media reader (file / memory / callbacks)
+class MediaReader {
+public:
+    NIJINWVDC_API MediaReader();
+    NIJINWVDC_API ~MediaReader();
+    NIJINWVDC_API MediaReader(MediaReader&& other) noexcept;
+    NIJINWVDC_API MediaReader& operator=(MediaReader&& other) noexcept;
+    MediaReader(const MediaReader&) = delete;
+    MediaReader& operator=(const MediaReader&) = delete;
+
+    NIJINWVDC_API bool open_file(const std::string& path, std::string& err);
+    NIJINWVDC_API bool open_memory(const uint8_t* data, size_t size, std::string& err);
+    NIJINWVDC_API bool open_callbacks(const IoCallbacks& callbacks, std::string& err);
+    NIJINWVDC_API void close();
+
+    NIJINWVDC_API bool is_open() const;
+    NIJINWVDC_API ContainerFormat container_format() const;
+    NIJINWVDC_API CodecFamily codec_family() const;
+    NIJINWVDC_API const NevClipInfo& clip_info() const;
+    NIJINWVDC_API uint32_t frame_count() const;
+
+    NIJINWVDC_API bool read_frame_packet(
+        uint32_t frame_index,
+        NevFrameMeta& meta,
+        std::vector<uint8_t>* codestream_out,
+        std::string& err) const;
+
+    NIJINWVDC_API bool get_frame_timing(
+        uint32_t frame_index,
+        VideoFrameTiming& timing_out,
+        std::string& err) const;
+
+    NIJINWVDC_API AudioFormatInfo audio_info() const;
+    NIJINWVDC_API bool read_audio_pcm(
+        uint64_t start_frame,
+        uint64_t frame_count,
+        std::vector<uint8_t>& pcm_out,
+        std::string& err) const;
+    NIJINWVDC_API bool read_audio_pcm_into(
+        uint64_t start_frame,
+        uint64_t frame_count,
+        void* dst,
+        size_t dst_bytes,
+        uint64_t* frames_read_out,
+        std::string& err) const;
+    NIJINWVDC_API bool export_audio_wav(const std::string& wav_path, std::string& err) const;
+    NIJINWVDC_API bool extract_preview_jpeg(std::vector<uint8_t>& jpeg_out, std::string& err) const;
+
+    struct Impl;
+private:
+    std::unique_ptr<Impl> impl_;
+};
+
+// Reusable stateful decoder session owning persistent worker pool and arenas
+class DecoderSession {
+public:
+    NIJINWVDC_API explicit DecoderSession(int num_threads = 0);
+    NIJINWVDC_API ~DecoderSession();
+    NIJINWVDC_API DecoderSession(DecoderSession&& other) noexcept;
+    NIJINWVDC_API DecoderSession& operator=(DecoderSession&& other) noexcept;
+    DecoderSession(const DecoderSession&) = delete;
+    DecoderSession& operator=(const DecoderSession&) = delete;
+
+    NIJINWVDC_API void set_num_threads(int num_threads);
+    NIJINWVDC_API int num_threads() const;
+
+    NIJINWVDC_API bool decode_codestream(
+        const uint8_t* data,
+        size_t len,
+        const DecodeOptions& opts,
+        std::vector<uint16_t>& bayer_out,
+        DecodedFrameInfo& info_out,
+        std::string& err);
+
+    NIJINWVDC_API bool decode_codestream_into(
+        const uint8_t* data,
+        size_t len,
+        const DecodeOptions& opts,
+        uint16_t* dst,
+        size_t dst_row_stride_bytes,
+        size_t dst_height_capacity,
+        DecodedFrameInfo& info_out,
+        std::string& err);
+
+    NIJINWVDC_API bool decode_frame(
+        const MediaReader& reader,
+        uint32_t frame_index,
+        const DecodeOptions& opts,
+        std::vector<uint16_t>& bayer_out,
+        DecodedFrameInfo& info_out,
+        std::string& err);
+
+    NIJINWVDC_API bool decode_frame_into(
+        const MediaReader& reader,
+        uint32_t frame_index,
+        const DecodeOptions& opts,
+        uint16_t* dst,
+        size_t dst_row_stride_bytes,
+        size_t dst_height_capacity,
+        DecodedFrameInfo& info_out,
+        std::string& err);
+
+    struct Impl;
+private:
+    std::unique_ptr<Impl> impl_;
+};
 
 } // namespace nijinwvdc
 

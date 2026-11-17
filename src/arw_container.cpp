@@ -14,8 +14,7 @@ inline int16_t rd_i16_e(const uint8_t* p, bool be) {
 }
 
 void parse_arw_exif_ifd(
-    FILE* fp,
-    uint64_t file_size,
+    const RandomAccessReader& r,
     bool be,
     uint32_t exif_ifd_off,
     NevClipInfo& clip,
@@ -24,7 +23,7 @@ void parse_arw_exif_ifd(
         return;
     }
     std::vector<TiffTagValue> exif;
-    if (!read_tiff_ifd(fp, 0, file_size, be, exif_ifd_off, exif)) {
+    if (!read_tiff_ifd(r, 0, be, exif_ifd_off, exif)) {
         return;
     }
     for (const auto& tv : exif) {
@@ -62,9 +61,8 @@ void consider_jpeg_preview(uint64_t off, uint32_t sz, uint64_t file_size, NevCli
 
 } // namespace
 
-bool parse_sony_arw_tiff(
-    FILE* fp,
-    uint64_t file_size,
+bool parse_sony_arw_tiff_reader(
+    const RandomAccessReader& r,
     bool be,
     uint32_t ifd0_next_off,
     const std::vector<TiffTagValue>& ifd0,
@@ -73,6 +71,7 @@ bool parse_sony_arw_tiff(
     NevClipInfo& clip,
     NevFrameMeta& meta,
     std::string& err) {
+    const uint64_t file_size = r.size();
     // IFD0 may already hold the preview JPEG offset/size populated in clip.ncth_* by the TIFF dispatcher.
     if (clip.ncth_size > 0 && clip.ncth_offset + clip.ncth_size <= file_size) {
         uint64_t o = clip.ncth_offset;
@@ -84,7 +83,7 @@ bool parse_sony_arw_tiff(
 
     if (ifd0_next_off > 0) {
         std::vector<TiffTagValue> ifd1;
-        if (read_tiff_ifd(fp, 0, file_size, be, ifd0_next_off, ifd1)) {
+        if (read_tiff_ifd(r, 0, be, ifd0_next_off, ifd1)) {
             uint64_t joff = 0;
             uint32_t jsz = 0;
             for (const auto& tv : ifd1) {
@@ -99,7 +98,7 @@ bool parse_sony_arw_tiff(
     std::vector<std::vector<TiffTagValue>> candidate_ifds;
     for (uint32_t sub_off : subifds) {
         std::vector<TiffTagValue> sifd;
-        if (read_tiff_ifd(fp, 0, file_size, be, sub_off, sifd)) {
+        if (read_tiff_ifd(r, 0, be, sub_off, sifd)) {
             candidate_ifds.push_back(std::move(sifd));
         }
     }
@@ -183,7 +182,7 @@ bool parse_sony_arw_tiff(
         if (comp == 32766 && (phot == 32803 || phot == 0) && raw_type == 6 &&
             soff > 0 && sbc >= 0x68 && static_cast<uint64_t>(soff) + sbc <= file_size) {
             uint8_t thdr[0x68] = {};
-            if (!seek_read(fp, soff, thdr, sizeof(thdr))) {
+            if (!r.read(soff, thdr, sizeof(thdr))) {
                 err = "Failed reading ARW6 strip header";
                 return false;
             }
@@ -200,7 +199,7 @@ bool parse_sony_arw_tiff(
                 return false;
             }
             uint8_t sig[4] = {};
-            if (!seek_read(fp, static_cast<uint64_t>(soff) + rel0, sig, 4) ||
+            if (!r.read(static_cast<uint64_t>(soff) + rel0, sig, 4) ||
                 std::memcmp(sig, "A000", 4) != 0) {
                 err = "ARW SubIFD (Compression=32766) is missing A000 wavelet codestream";
                 return false;
@@ -248,7 +247,7 @@ bool parse_sony_arw_tiff(
         return false;
     }
 
-    parse_arw_exif_ifd(fp, file_size, be, exif_ifd_off, clip, meta);
+    parse_arw_exif_ifd(r, be, exif_ifd_off, clip, meta);
 
     if (meta.has_crop) {
         clip.nctg_active_w = meta.crop[2];
@@ -260,6 +259,8 @@ bool parse_sony_arw_tiff(
     meta.codestream_offset = raw_off;
     meta.codestream_size = raw_sz;
 
+    clip.container_format = ContainerFormat::TiffArw;
+    clip.codec_family = CodecFamily::Arw6;
     clip.major_brand = "ARW";
     clip.video_samples.push_back({raw_off, raw_sz});
     clip.video_track_index = 0;

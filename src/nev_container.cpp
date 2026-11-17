@@ -6,12 +6,11 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
-#include <sys/stat.h>
 
 namespace nijinwvdc {
 namespace {
 
-using detail::ScopedFile;
+using detail::RandomAccessReader;
 using detail::TiffTagValue;
 using detail::fourcc_to_str;
 using detail::rd_be16;
@@ -25,7 +24,6 @@ using detail::rd_u16_e;
 using detail::rd_u32_e;
 using detail::read_tiff_ifd;
 using detail::rstrip_ascii;
-using detail::seek_read;
 using detail::tag_as_rational;
 using detail::tag_as_u32;
 
@@ -48,12 +46,12 @@ struct BoxHeader {
     char type[5] = {0, 0, 0, 0, 0};
 };
 
-bool read_box_header(FILE* fp, uint64_t pos, uint64_t parent_end, BoxHeader& out) {
+bool read_box_header(const RandomAccessReader& r, uint64_t pos, uint64_t parent_end, BoxHeader& out) {
     if (pos + 8 > parent_end) {
         return false;
     }
     uint8_t hdr[16] = {0};
-    if (!seek_read(fp, pos, hdr, 8)) {
+    if (!r.read(pos, hdr, 8)) {
         return false;
     }
     uint32_t sz32 = rd_be32(hdr);
@@ -61,7 +59,7 @@ bool read_box_header(FILE* fp, uint64_t pos, uint64_t parent_end, BoxHeader& out
     out.type[4] = '\0';
     out.offset = pos;
     if (sz32 == 1) {
-        if (pos + 16 > parent_end || !seek_read(fp, pos + 8, hdr + 8, 8)) {
+        if (pos + 16 > parent_end || !r.read(pos + 8, hdr + 8, 8)) {
             return false;
         }
         out.size = rd_be64(hdr + 8);
@@ -140,18 +138,18 @@ bool parse_nctg_buffer(const uint8_t* data, size_t len, NevClipInfo& clip) {
     return true;
 }
 
-bool parse_ncdt(FILE* fp, uint64_t start, uint64_t end, NevClipInfo& clip) {
+bool parse_ncdt(const RandomAccessReader& r, uint64_t start, uint64_t end, NevClipInfo& clip) {
     uint64_t pos = start;
     while (pos + 8 <= end) {
         BoxHeader bh;
-        if (!read_box_header(fp, pos, end, bh)) {
+        if (!read_box_header(r, pos, end, bh)) {
             return false;
         }
         uint64_t pay_off = bh.offset + bh.header_size;
         uint64_t pay_sz = bh.size - bh.header_size;
         if (std::strcmp(bh.type, "NCTG") == 0 && pay_sz <= 4 * 1024 * 1024) {
             std::vector<uint8_t> buf(static_cast<size_t>(pay_sz));
-            if (seek_read(fp, pay_off, buf.data(), buf.size())) {
+            if (r.read(pay_off, buf.data(), buf.size())) {
                 parse_nctg_buffer(buf.data(), buf.size(), clip);
             }
         } else if (std::strcmp(bh.type, "NCTH") == 0) {
@@ -169,11 +167,11 @@ bool parse_ncdt(FILE* fp, uint64_t start, uint64_t end, NevClipInfo& clip) {
     return true;
 }
 
-bool parse_stbl(FILE* fp, uint64_t start, uint64_t end, RawTrackData& tr, std::string& err) {
+bool parse_stbl(const RandomAccessReader& r, uint64_t start, uint64_t end, RawTrackData& tr, std::string& err) {
     uint64_t pos = start;
     while (pos + 8 <= end) {
         BoxHeader bh;
-        if (!read_box_header(fp, pos, end, bh)) {
+        if (!read_box_header(r, pos, end, bh)) {
             err = "Malformed box inside stbl";
             return false;
         }
@@ -181,7 +179,7 @@ bool parse_stbl(FILE* fp, uint64_t start, uint64_t end, RawTrackData& tr, std::s
         uint64_t pay_sz = bh.size - bh.header_size;
         if (pay_sz <= 16 * 1024 * 1024) {
             std::vector<uint8_t> buf(static_cast<size_t>(pay_sz));
-            if (!seek_read(fp, pay_off, buf.data(), buf.size())) {
+            if (!r.read(pay_off, buf.data(), buf.size())) {
                 err = "Failed reading stbl box payload";
                 return false;
             }
@@ -201,11 +199,28 @@ bool parse_stbl(FILE* fp, uint64_t start, uint64_t end, RawTrackData& tr, std::s
                                 tr.summary.audio_sample_rate = rd_be_f64(ent + 40);
                                 tr.summary.audio_channels = rd_be32(ent + 48);
                                 tr.summary.audio_bits_per_channel = rd_be32(ent + 56);
+                                tr.summary.audio_lpcm_flags = rd_be32(ent + 60);
                                 tr.summary.audio_bytes_per_packet = rd_be32(ent + 64);
                             } else if (ver <= 1 && ent_sz >= 36) {
                                 tr.summary.audio_channels = rd_be16(ent + 24);
                                 tr.summary.audio_bits_per_channel = rd_be16(ent + 26);
                                 tr.summary.audio_sample_rate = static_cast<double>(rd_be32(ent + 32)) / 65536.0;
+                                if (tr.summary.format == "twos" || tr.summary.format == "in24" ||
+                                    tr.summary.format == "in32") {
+                                    tr.summary.audio_lpcm_flags = 4u | 2u | 8u;
+                                } else if (tr.summary.format == "sowt") {
+                                    tr.summary.audio_lpcm_flags = 4u | 8u;
+                                } else if (tr.summary.format == "fl32" || tr.summary.format == "fl64") {
+                                    tr.summary.audio_lpcm_flags = 1u | 2u | 8u;
+                                } else if (tr.summary.format == "raw ") {
+                                    tr.summary.audio_lpcm_flags = 8u;
+                                }
+                            }
+                            if (tr.summary.audio_bytes_per_packet == 0 &&
+                                tr.summary.audio_channels > 0 &&
+                                tr.summary.audio_bits_per_channel > 0) {
+                                tr.summary.audio_bytes_per_packet =
+                                    (tr.summary.audio_channels * tr.summary.audio_bits_per_channel) / 8u;
                             }
                         } else if (tr.summary.handler_type == "tmcd" && ent_sz >= 34) {
                             tr.summary.tmcd_flags = rd_be32(ent + 20);
@@ -259,10 +274,10 @@ bool parse_stbl(FILE* fp, uint64_t start, uint64_t end, RawTrackData& tr, std::s
     return true;
 }
 
-bool parse_trak(FILE* fp, uint64_t start, uint64_t end, RawTrackData& tr, std::string& err);
+bool parse_trak(const RandomAccessReader& r, uint64_t start, uint64_t end, RawTrackData& tr, std::string& err);
 
 bool parse_container_recurse(
-    FILE* fp,
+    const RandomAccessReader& r,
     uint64_t start,
     uint64_t end,
     RawTrackData& tr,
@@ -270,7 +285,7 @@ bool parse_container_recurse(
     uint64_t pos = start;
     while (pos + 8 <= end) {
         BoxHeader bh;
-        if (!read_box_header(fp, pos, end, bh)) {
+        if (!read_box_header(r, pos, end, bh)) {
             err = "Malformed box inside trak";
             return false;
         }
@@ -279,7 +294,7 @@ bool parse_container_recurse(
         if (std::strcmp(bh.type, "tkhd") == 0) {
             uint8_t buf[96] = {0};
             size_t to_read = static_cast<size_t>(std::min<uint64_t>(sizeof(buf), pay_end - pay_off));
-            if (seek_read(fp, pay_off, buf, to_read) && to_read >= 24) {
+            if (r.read(pay_off, buf, to_read) && to_read >= 24) {
                 uint8_t ver = buf[0];
                 if (ver == 0 && to_read >= 84) {
                     tr.summary.track_id = rd_be32(buf + 12);
@@ -290,7 +305,7 @@ bool parse_container_recurse(
         } else if (std::strcmp(bh.type, "mdhd") == 0) {
             uint8_t buf[36] = {0};
             size_t to_read = static_cast<size_t>(std::min<uint64_t>(sizeof(buf), pay_end - pay_off));
-            if (seek_read(fp, pay_off, buf, to_read) && to_read >= 24) {
+            if (r.read(pay_off, buf, to_read) && to_read >= 24) {
                 uint8_t ver = buf[0];
                 if (ver == 0) {
                     tr.summary.timescale = rd_be32(buf + 12);
@@ -303,15 +318,15 @@ bool parse_container_recurse(
         } else if (std::strcmp(bh.type, "hdlr") == 0) {
             uint8_t buf[24] = {0};
             size_t to_read = static_cast<size_t>(std::min<uint64_t>(sizeof(buf), pay_end - pay_off));
-            if (seek_read(fp, pay_off, buf, to_read) && to_read >= 12) {
+            if (r.read(pay_off, buf, to_read) && to_read >= 12) {
                 tr.summary.handler_type = fourcc_to_str(buf + 8);
             }
         } else if (std::strcmp(bh.type, "mdia") == 0 || std::strcmp(bh.type, "minf") == 0) {
-            if (!parse_container_recurse(fp, pay_off, pay_end, tr, err)) {
+            if (!parse_container_recurse(r, pay_off, pay_end, tr, err)) {
                 return false;
             }
         } else if (std::strcmp(bh.type, "stbl") == 0) {
-            if (!parse_stbl(fp, pay_off, pay_end, tr, err)) {
+            if (!parse_stbl(r, pay_off, pay_end, tr, err)) {
                 return false;
             }
         }
@@ -320,8 +335,8 @@ bool parse_container_recurse(
     return true;
 }
 
-bool parse_trak(FILE* fp, uint64_t start, uint64_t end, RawTrackData& tr, std::string& err) {
-    return parse_container_recurse(fp, start, end, tr, err);
+bool parse_trak(const RandomAccessReader& r, uint64_t start, uint64_t end, RawTrackData& tr, std::string& err) {
+    return parse_container_recurse(r, start, end, tr, err);
 }
 
 bool build_sample_table(const RawTrackData& tr, uint64_t file_size, std::vector<NevSampleLocation>& out, std::string& err) {
@@ -367,6 +382,70 @@ bool build_sample_table(const RawTrackData& tr, uint64_t file_size, std::vector<
         return false;
     }
     return true;
+}
+
+bool build_audio_chunks(
+    const RawTrackData& tr,
+    uint64_t file_size,
+    std::vector<TrackChunkSpan>& out_chunks,
+    uint64_t& out_total_frames) {
+    out_chunks.clear();
+    out_total_frames = 0;
+    const uint32_t frame_bytes = (tr.summary.audio_bytes_per_packet != 0)
+                                     ? tr.summary.audio_bytes_per_packet
+                                     : tr.constant_sample_size;
+    if (frame_bytes == 0 || tr.summary.sample_count == 0 ||
+        tr.chunk_offsets.empty() || tr.stsc.empty()) {
+        return false;
+    }
+    const uint64_t total = tr.summary.sample_count;
+    out_chunks.reserve(tr.chunk_offsets.size());
+    uint64_t sample_idx = 0;
+    size_t stsc_idx = 0;
+    for (size_t ci = 0; ci < tr.chunk_offsets.size() && sample_idx < total; ++ci) {
+        const uint32_t chunk_num = static_cast<uint32_t>(ci + 1);
+        while (stsc_idx + 1 < tr.stsc.size() && chunk_num >= tr.stsc[stsc_idx + 1].first_chunk) {
+            ++stsc_idx;
+        }
+        const uint32_t spc = tr.stsc[stsc_idx].samples_per_chunk;
+        if (spc == 0) {
+            return false;
+        }
+        const uint32_t n_in_chunk = static_cast<uint32_t>(std::min<uint64_t>(spc, total - sample_idx));
+        const uint64_t chunk_off = tr.chunk_offsets[ci];
+        const uint64_t chunk_bytes = static_cast<uint64_t>(n_in_chunk) * static_cast<uint64_t>(frame_bytes);
+        if (chunk_off > file_size || chunk_bytes > file_size - chunk_off) {
+            return false;
+        }
+        out_chunks.push_back({chunk_off, n_in_chunk});
+        sample_idx += n_in_chunk;
+    }
+    out_total_frames = sample_idx;
+    return !out_chunks.empty();
+}
+
+bool read_timecode_samples(
+    const RandomAccessReader& r,
+    const RawTrackData& tr,
+    std::vector<uint32_t>& out_samples) {
+    out_samples.clear();
+    std::vector<NevSampleLocation> locs;
+    std::string dummy_err;
+    if (!build_sample_table(tr, r.size(), locs, dummy_err)) {
+        return false;
+    }
+    out_samples.reserve(locs.size());
+    for (const auto& loc : locs) {
+        if (loc.sample_size < 4) {
+            break;
+        }
+        uint8_t buf4[4] = {};
+        if (!r.read(loc.file_offset, buf4, 4)) {
+            break;
+        }
+        out_samples.push_back(rd_be32(buf4));
+    }
+    return !out_samples.empty();
 }
 
 void apply_makernote_tag(
@@ -445,21 +524,21 @@ size_t tiff_dtype_size(uint16_t dtype) {
 }
 
 bool read_tiff_ifd(
-    FILE* fp,
+    const RandomAccessReader& r,
     uint64_t tiff_base,
-    uint64_t file_size,
     bool be,
     uint32_t ifd_rel_off,
     std::vector<TiffTagValue>& out_tags,
     uint32_t* next_ifd_off) {
     out_tags.clear();
     if (next_ifd_off) *next_ifd_off = 0;
+    const uint64_t file_size = r.size();
     uint64_t ifd_abs = tiff_base + ifd_rel_off;
     if (ifd_abs + 2 > file_size) {
         return false;
     }
     uint8_t cnt_buf[2];
-    if (!seek_read(fp, ifd_abs, cnt_buf, 2)) {
+    if (!r.read(ifd_abs, cnt_buf, 2)) {
         return false;
     }
     uint16_t cnt = rd_u16_e(cnt_buf, be);
@@ -471,7 +550,7 @@ bool read_tiff_ifd(
         return false;
     }
     std::vector<uint8_t> raw(static_cast<size_t>(entries_bytes + 4));
-    if (!seek_read(fp, ifd_abs + 2, raw.data(), raw.size())) {
+    if (!r.read(ifd_abs + 2, raw.data(), raw.size())) {
         return false;
     }
     if (next_ifd_off) {
@@ -496,7 +575,7 @@ bool read_tiff_ifd(
             tv.file_offset = abs_vo;
             if (blen64 <= 4 * 1024 * 1024 && abs_vo + blen64 <= file_size) {
                 tv.data.resize(static_cast<size_t>(blen64));
-                if (!seek_read(fp, abs_vo, tv.data.data(), tv.data.size())) {
+                if (!r.read(abs_vo, tv.data.data(), tv.data.size())) {
                     tv.data.clear();
                 }
             }
@@ -533,20 +612,20 @@ bool tag_as_rational(const TiffTagValue& tv, bool be, double& out) {
 namespace {
 
 bool parse_tiff_raw_clip(
-    FILE* fp,
-    uint64_t file_size,
+    const RandomAccessReader& r,
     bool be,
     NevClipInfo& clip,
     std::string& err) {
+    const uint64_t file_size = r.size();
     uint8_t hdr[8] = {0};
-    if (!seek_read(fp, 0, hdr, 8)) {
+    if (!r.read(0, hdr, 8)) {
         err = "Failed reading TIFF header";
         return false;
     }
     uint32_t ifd0_off = rd_u32_e(hdr + 4, be);
     uint32_t ifd0_next_off = 0;
     std::vector<TiffTagValue> ifd0;
-    if (!read_tiff_ifd(fp, 0, file_size, be, ifd0_off, ifd0, &ifd0_next_off)) {
+    if (!read_tiff_ifd(r, 0, be, ifd0_off, ifd0, &ifd0_next_off)) {
         err = "Malformed TIFF IFD0";
         return false;
     }
@@ -582,8 +661,8 @@ bool parse_tiff_raw_clip(
     }
 
     if (starts_with_ci(clip.make, "sony")) {
-        return detail::parse_sony_arw_tiff(
-            fp, file_size, be, ifd0_next_off, ifd0, subifds, exif_ifd_off, clip, meta, err);
+        return detail::parse_sony_arw_tiff_reader(
+            r, be, ifd0_next_off, ifd0, subifds, exif_ifd_off, clip, meta, err);
     }
 
     bool found_he_raw = false;
@@ -594,7 +673,7 @@ bool parse_tiff_raw_clip(
 
     for (uint32_t sub_off : subifds) {
         std::vector<TiffTagValue> sifd;
-        if (!read_tiff_ifd(fp, 0, file_size, be, sub_off, sifd)) {
+        if (!read_tiff_ifd(r, 0, be, sub_off, sifd)) {
             continue;
         }
         uint32_t w = 0, h = 0, bps = 0, comp = 0, phot = 0;
@@ -625,7 +704,7 @@ bool parse_tiff_raw_clip(
         if (comp == 34713 && phot == 32803 && soff > 0 && sbc >= 16 && soff + sbc <= file_size) {
             saw_34713 = true;
             uint8_t sig[2] = {0, 0};
-            if (seek_read(fp, soff, sig, 2) && sig[0] == 0xFF && sig[1] == 0x10) {
+            if (r.read(soff, sig, 2) && sig[0] == 0xFF && sig[1] == 0x10) {
                 found_he_raw = true;
                 raw_off = soff;
                 raw_sz = sbc;
@@ -639,8 +718,8 @@ bool parse_tiff_raw_clip(
     }
 
     if (!found_he_raw && saw_sony_tag) {
-        return detail::parse_sony_arw_tiff(
-            fp, file_size, be, ifd0_next_off, ifd0, subifds, exif_ifd_off, clip, meta, err);
+        return detail::parse_sony_arw_tiff_reader(
+            r, be, ifd0_next_off, ifd0, subifds, exif_ifd_off, clip, meta, err);
     }
 
     if (!found_he_raw) {
@@ -651,7 +730,7 @@ bool parse_tiff_raw_clip(
 
     if (exif_ifd_off > 0) {
         std::vector<TiffTagValue> exif;
-        if (read_tiff_ifd(fp, 0, file_size, be, exif_ifd_off, exif)) {
+        if (read_tiff_ifd(r, 0, be, exif_ifd_off, exif)) {
             for (const auto& tv : exif) {
                 double rval = 0.0;
                 if (tv.tag == 33434 && tag_as_rational(tv, be, rval)) {
@@ -673,7 +752,7 @@ bool parse_tiff_raw_clip(
                         uint32_t mn_ifd = rd_u32_e(tv.data.data() + 14, mn_be);
                         if (mn_magic == 42) {
                             std::vector<TiffTagValue> mn_tags;
-                            if (read_tiff_ifd(fp, tv.file_offset + 10, file_size, mn_be, mn_ifd, mn_tags)) {
+                            if (read_tiff_ifd(r, tv.file_offset + 10, mn_be, mn_ifd, mn_tags)) {
                                 for (const auto& mt : mn_tags) {
                                     apply_makernote_tag(
                                         mt.tag, mt.dtype, mt.count, mt.data.data(), mt.data.size(), mn_be, meta);
@@ -699,6 +778,8 @@ bool parse_tiff_raw_clip(
     meta.codestream_offset = raw_off;
     meta.codestream_size = raw_sz;
 
+    clip.container_format = ContainerFormat::TiffNef;
+    clip.codec_family = CodecFamily::TicoRaw;
     clip.major_brand = "NEF";
     clip.video_samples.push_back({raw_off, raw_sz});
     clip.video_track_index = 0;
@@ -756,29 +837,105 @@ void parse_nrfh(const uint8_t* buf, size_t len, NevFrameMeta& meta) {
 
 } // namespace
 
-bool parse_nev_clip(const std::string& path, NevClipInfo& clip, std::string& err) {
+namespace detail {
+
+bool parse_nev_clip_reader(
+    const RandomAccessReader& r,
+    const std::string& display_path,
+    NevClipInfo& clip,
+    std::string& err) {
     clip = NevClipInfo();
-    clip.file_path = path;
-
-    struct stat st{};
-    if (stat(path.c_str(), &st) != 0 || st.st_size <= 0) {
-        err = "Cannot stat input file: " + path;
+    clip.file_path = display_path;
+    if (!r.is_open() || r.size() == 0) {
+        err = "Input reader is empty or not open";
         return false;
     }
-    clip.file_size = static_cast<uint64_t>(st.st_size);
-
-    ScopedFile sf(path);
-    if (!sf.fp) {
-        err = "Cannot open input file: " + path;
-        return false;
-    }
+    clip.file_size = r.size();
 
     uint8_t magic4[4] = {0, 0, 0, 0};
-    if (clip.file_size >= 8 && seek_read(sf.fp, 0, magic4, 4)) {
-        bool is_le_tiff = (magic4[0] == 'I' && magic4[1] == 'I' && magic4[2] == 42 && magic4[3] == 0);
-        bool is_be_tiff = (magic4[0] == 'M' && magic4[1] == 'M' && magic4[2] == 0 && magic4[3] == 42);
+    if (clip.file_size >= 4 && r.read(0, magic4, 4)) {
+        bool is_le_tiff = (clip.file_size >= 8 && magic4[0] == 'I' && magic4[1] == 'I' && magic4[2] == 42 && magic4[3] == 0);
+        bool is_be_tiff = (clip.file_size >= 8 && magic4[0] == 'M' && magic4[1] == 'M' && magic4[2] == 0 && magic4[3] == 42);
         if (is_le_tiff || is_be_tiff) {
-            return parse_tiff_raw_clip(sf.fp, clip.file_size, is_be_tiff, clip, err);
+            return parse_tiff_raw_clip(r, is_be_tiff, clip, err);
+        }
+        if (clip.file_size <= 0xFFFFFFFFULL && magic4[0] == 0xFF && magic4[1] == 0x10) {
+            const size_t probe_len = static_cast<size_t>(std::min<uint64_t>(clip.file_size, 8192ULL));
+            std::vector<uint8_t> hdr(probe_len);
+            TicoRawInfo jxs;
+            std::string probe_err;
+            if (r.read(0, hdr.data(), hdr.size()) &&
+                probe_ticoraw_header(hdr.data(), hdr.size(), jxs, probe_err)) {
+                clip.container_format = ContainerFormat::RawCodestream;
+                clip.codec_family = CodecFamily::TicoRaw;
+                clip.major_brand = "JXS";
+                const uint32_t sz32 = static_cast<uint32_t>(clip.file_size);
+                clip.video_samples.push_back({0, sz32});
+                clip.video_track_index = 0;
+
+                NevTrackSummary tr;
+                tr.track_id = 1;
+                tr.handler_type = "vide";
+                tr.format = "JXS";
+                tr.sample_count = 1;
+                tr.width = jxs.width;
+                tr.height = jxs.height;
+                clip.tracks.push_back(tr);
+
+                NevFrameMeta meta;
+                meta.frame_index = 0;
+                meta.sample_offset = 0;
+                meta.sample_size = sz32;
+                meta.codestream_offset = 0;
+                meta.codestream_size = sz32;
+                meta.width = jxs.width;
+                meta.height = jxs.height;
+                meta.bit_depth = (jxs.out_bitdepth > 0) ? static_cast<uint16_t>(jxs.out_bitdepth) : 14;
+                clip.has_single_frame_meta = true;
+                clip.single_frame_meta = meta;
+                return true;
+            }
+        }
+        if (clip.file_size >= 16 && clip.file_size <= 0xFFFFFFFFULL &&
+            std::memcmp(magic4, "A000", 4) == 0) {
+            const size_t probe_len = static_cast<size_t>(std::min<uint64_t>(clip.file_size, 256ULL));
+            std::vector<uint8_t> hdr(probe_len);
+            Arw6Info arw6;
+            std::string probe_err;
+            if (r.read(0, hdr.data(), hdr.size()) &&
+                probe_arw6_codestream(hdr.data(), hdr.size(), arw6, probe_err)) {
+                clip.container_format = ContainerFormat::RawCodestream;
+                clip.codec_family = CodecFamily::Arw6;
+                clip.major_brand = "A000";
+                const uint32_t sz32 = static_cast<uint32_t>(clip.file_size);
+                clip.video_samples.push_back({0, sz32});
+                clip.video_track_index = 0;
+
+                NevTrackSummary tr;
+                tr.track_id = 1;
+                tr.handler_type = "vide";
+                tr.format = "ARW6";
+                tr.sample_count = 1;
+                tr.width = arw6.width;
+                tr.height = arw6.height;
+                clip.tracks.push_back(tr);
+
+                NevFrameMeta meta;
+                meta.frame_index = 0;
+                meta.sample_offset = 0;
+                meta.sample_size = sz32;
+                meta.codestream_offset = 0;
+                meta.codestream_size = sz32;
+                meta.width = arw6.width;
+                meta.height = arw6.height;
+                meta.bit_depth = arw6.bit_depth;
+                meta.sony_raw_file_type = 6;
+                meta.black[0] = meta.black[1] = meta.black[2] = meta.black[3] = 512;
+                meta.has_black = true;
+                clip.has_single_frame_meta = true;
+                clip.single_frame_meta = meta;
+                return true;
+            }
         }
     }
 
@@ -787,7 +944,7 @@ bool parse_nev_clip(const std::string& path, NevClipInfo& clip, std::string& err
     uint64_t pos = 0;
     while (pos + 8 <= clip.file_size) {
         BoxHeader bh;
-        if (!read_box_header(sf.fp, pos, clip.file_size, bh)) {
+        if (!read_box_header(r, pos, clip.file_size, bh)) {
             err = "Invalid top-level MOV box at offset " + std::to_string(pos);
             return false;
         }
@@ -797,8 +954,8 @@ bool parse_nev_clip(const std::string& path, NevClipInfo& clip, std::string& err
         if (std::strcmp(bh.type, "ftyp") == 0) {
             seen_ftyp = true;
             uint8_t buf[16] = {0};
-            size_t r = static_cast<size_t>(std::min<uint64_t>(sizeof(buf), pay_end - pay_off));
-            if (seek_read(sf.fp, pay_off, buf, r) && r >= 8) {
+            size_t n = static_cast<size_t>(std::min<uint64_t>(sizeof(buf), pay_end - pay_off));
+            if (r.read(pay_off, buf, n) && n >= 8) {
                 clip.major_brand = fourcc_to_str(buf);
                 clip.minor_version = rd_be32(buf + 4);
             }
@@ -807,7 +964,7 @@ bool parse_nev_clip(const std::string& path, NevClipInfo& clip, std::string& err
             uint64_t mpos = pay_off;
             while (mpos + 8 <= pay_end) {
                 BoxHeader mb;
-                if (!read_box_header(sf.fp, mpos, pay_end, mb)) {
+                if (!read_box_header(r, mpos, pay_end, mb)) {
                     err = "Invalid box inside moov";
                     return false;
                 }
@@ -815,20 +972,20 @@ bool parse_nev_clip(const std::string& path, NevClipInfo& clip, std::string& err
                 uint64_t m_end = mb.offset + mb.size;
                 if (std::strcmp(mb.type, "mvhd") == 0) {
                     uint8_t buf[36] = {0};
-                    size_t r = static_cast<size_t>(std::min<uint64_t>(sizeof(buf), m_end - m_off));
-                    if (seek_read(sf.fp, m_off, buf, r) && r >= 24) {
+                    size_t n = static_cast<size_t>(std::min<uint64_t>(sizeof(buf), m_end - m_off));
+                    if (r.read(m_off, buf, n) && n >= 24) {
                         uint8_t ver = buf[0];
                         if (ver == 0) {
                             clip.movie_timescale = rd_be32(buf + 12);
                             clip.movie_duration = rd_be32(buf + 16);
-                        } else if (ver == 1 && r >= 32) {
+                        } else if (ver == 1 && n >= 32) {
                             clip.movie_timescale = rd_be32(buf + 20);
                             clip.movie_duration = rd_be64(buf + 24);
                         }
                     }
                 } else if (std::strcmp(mb.type, "trak") == 0) {
                     RawTrackData tr;
-                    if (!parse_trak(sf.fp, m_off, m_end, tr, err)) {
+                    if (!parse_trak(r, m_off, m_end, tr, err)) {
                         return false;
                     }
                     int t_idx = static_cast<int>(clip.tracks.size());
@@ -838,20 +995,38 @@ bool parse_nev_clip(const std::string& path, NevClipInfo& clip, std::string& err
                         if (!build_sample_table(tr, clip.file_size, clip.video_samples, err)) {
                             return false;
                         }
+                        clip.video_stts.reserve(tr.stts.size());
+                        for (const auto& s : tr.stts) {
+                            clip.video_stts.push_back({s.first, s.second});
+                        }
                         if (clip.fps <= 0.0 && !tr.stts.empty() && tr.stts[0].second > 0 && tr.summary.timescale > 0) {
                             clip.fps = static_cast<double>(tr.summary.timescale) /
                                        static_cast<double>(tr.stts[0].second);
+                        }
+                    } else if (tr.summary.handler_type == "soun" && clip.audio_track_index < 0) {
+                        std::vector<TrackChunkSpan> chunks;
+                        uint64_t total_audio = 0;
+                        if (build_audio_chunks(tr, clip.file_size, chunks, total_audio)) {
+                            clip.audio_track_index = t_idx;
+                            clip.audio_chunks = std::move(chunks);
+                            clip.total_audio_frames = total_audio;
+                        }
+                    } else if (tr.summary.handler_type == "tmcd" && clip.timecode_track_index < 0) {
+                        std::vector<uint32_t> tc;
+                        if (read_timecode_samples(r, tr, tc)) {
+                            clip.timecode_track_index = t_idx;
+                            clip.timecode_samples = std::move(tc);
                         }
                     }
                 } else if (std::strcmp(mb.type, "udta") == 0) {
                     uint64_t upos = m_off;
                     while (upos + 8 <= m_end) {
                         BoxHeader ub;
-                        if (!read_box_header(sf.fp, upos, m_end, ub)) {
+                        if (!read_box_header(r, upos, m_end, ub)) {
                             break;
                         }
                         if (std::strcmp(ub.type, "NCDT") == 0) {
-                            parse_ncdt(sf.fp, ub.offset + ub.header_size, ub.offset + ub.size, clip);
+                            parse_ncdt(r, ub.offset + ub.header_size, ub.offset + ub.size, clip);
                         }
                         upos += ub.size;
                     }
@@ -866,10 +1041,13 @@ bool parse_nev_clip(const std::string& path, NevClipInfo& clip, std::string& err
         err = "Not a valid Nikon NRAW (.NEV) clip";
         return false;
     }
+    clip.container_format = ContainerFormat::Mp4Nev;
+    clip.codec_family = CodecFamily::TicoRaw;
     return true;
 }
 
-bool read_nev_frame_meta_and_codestream(
+bool read_nev_frame_meta_and_codestream_reader(
+    const RandomAccessReader& r,
     const NevClipInfo& clip,
     uint32_t frame_index,
     NevFrameMeta& meta,
@@ -880,18 +1058,17 @@ bool read_nev_frame_meta_and_codestream(
               std::to_string(clip.video_samples.size()) + ")";
         return false;
     }
+    if (!r.is_open()) {
+        err = "Input reader is not open";
+        return false;
+    }
 
     if (clip.has_single_frame_meta) {
         meta = clip.single_frame_meta;
         meta.frame_index = frame_index;
         if (codestream_out) {
-            ScopedFile sf(clip.file_path);
-            if (!sf.fp) {
-                err = "Cannot reopen input file: " + clip.file_path;
-                return false;
-            }
             codestream_out->resize(meta.codestream_size);
-            if (!seek_read(sf.fp, meta.codestream_offset, codestream_out->data(), meta.codestream_size)) {
+            if (!r.read(meta.codestream_offset, codestream_out->data(), meta.codestream_size)) {
                 err = "Failed reading raw codestream bytes";
                 return false;
             }
@@ -905,20 +1082,15 @@ bool read_nev_frame_meta_and_codestream(
         return false;
     }
 
-    ScopedFile sf(clip.file_path);
-    if (!sf.fp) {
-        err = "Cannot reopen NEV file: " + clip.file_path;
-        return false;
-    }
-
-    std::vector<uint8_t> head_buf(std::min<uint32_t>(loc.sample_size, 4096u));
-    if (!seek_read(sf.fp, loc.file_offset, head_buf.data(), head_buf.size())) {
+    uint8_t head_buf[4096];
+    const size_t head_len = std::min<uint32_t>(loc.sample_size, 4096u);
+    if (!r.read(loc.file_offset, head_buf, head_len)) {
         err = "Failed reading NRAW sample header";
         return false;
     }
 
-    uint32_t outer_sz = rd_be32(head_buf.data());
-    if (std::memcmp(head_buf.data() + 4, "NRAW", 4) != 0 || outer_sz != loc.sample_size) {
+    uint32_t outer_sz = rd_be32(head_buf);
+    if (std::memcmp(head_buf + 4, "NRAW", 4) != 0 || outer_sz != loc.sample_size) {
         err = "Missing outer NRAW sample box at frame " + std::to_string(frame_index);
         return false;
     }
@@ -933,24 +1105,24 @@ bool read_nev_frame_meta_and_codestream(
     uint32_t jxs_rel_off = 0;
     uint32_t jxs_len = 0;
     size_t pos = 8;
-    while (pos + 8 <= head_buf.size()) {
-        uint32_t sz = rd_be32(head_buf.data() + pos);
-        const uint8_t* fcc = head_buf.data() + pos + 4;
+    while (pos + 8 <= head_len) {
+        uint32_t sz = rd_be32(head_buf + pos);
+        const uint8_t* fcc = head_buf + pos + 4;
         if (sz >= 8 && pos + sz <= loc.sample_size &&
             (std::memcmp(fcc, "NRFM", 4) == 0 ||
              std::memcmp(fcc, "NRFH", 4) == 0 ||
              std::memcmp(fcc, "NRTH", 4) == 0)) {
-            if (std::memcmp(fcc, "NRFH", 4) == 0 && pos + sz <= head_buf.size()) {
-                parse_nrfh(head_buf.data() + pos + 8, sz - 8, meta);
-            } else if (std::memcmp(fcc, "NRTH", 4) == 0 && pos + sz <= head_buf.size()) {
+            if (std::memcmp(fcc, "NRFH", 4) == 0 && pos + sz <= head_len) {
+                parse_nrfh(head_buf + pos + 8, sz - 8, meta);
+            } else if (std::memcmp(fcc, "NRTH", 4) == 0 && pos + sz <= head_len) {
                 // NRTH wraps NRTI (16B) + NRTA
                 size_t p2 = pos + 8;
                 size_t e2 = pos + sz;
                 while (p2 + 8 <= e2) {
-                    uint32_t s2 = rd_be32(head_buf.data() + p2);
+                    uint32_t s2 = rd_be32(head_buf + p2);
                     if (s2 < 8 || p2 + s2 > e2) break;
-                    if (std::memcmp(head_buf.data() + p2 + 4, "NRTI", 4) == 0 && s2 >= 16) {
-                        jxs_len = rd_be32(head_buf.data() + p2 + 12);
+                    if (std::memcmp(head_buf + p2 + 4, "NRTI", 4) == 0 && s2 >= 16) {
+                        jxs_len = rd_be32(head_buf + p2 + 12);
                     }
                     p2 += s2;
                 }
@@ -975,7 +1147,7 @@ bool read_nev_frame_meta_and_codestream(
 
     if (codestream_out) {
         codestream_out->resize(jxs_len);
-        if (!seek_read(sf.fp, meta.codestream_offset, codestream_out->data(), jxs_len)) {
+        if (!r.read(meta.codestream_offset, codestream_out->data(), jxs_len)) {
             err = "Failed reading TicoRAW codestream bytes";
             return false;
         }
@@ -983,8 +1155,8 @@ bool read_nev_frame_meta_and_codestream(
     return true;
 }
 
-bool extract_nev_blob(
-    const std::string& path,
+bool extract_blob_reader(
+    const RandomAccessReader& r,
     uint64_t offset,
     uint32_t size,
     std::vector<uint8_t>& out,
@@ -993,17 +1165,55 @@ bool extract_nev_blob(
         err = "Requested blob does not exist in clip";
         return false;
     }
-    ScopedFile sf(path);
-    if (!sf.fp) {
-        err = "Cannot open NEV file: " + path;
+    if (!r.is_open()) {
+        err = "Input reader is not open";
         return false;
     }
     out.resize(size);
-    if (!seek_read(sf.fp, offset, out.data(), size)) {
+    if (!r.read(offset, out.data(), size)) {
         err = "Failed reading embedded blob";
         return false;
     }
     return true;
+}
+
+} // namespace detail
+
+bool parse_nev_clip(const std::string& path, NevClipInfo& clip, std::string& err) {
+    clip = NevClipInfo();
+    clip.file_path = path;
+    RandomAccessReader r;
+    if (!r.open_file(path, err)) {
+        return false;
+    }
+    return detail::parse_nev_clip_reader(r, path, clip, err);
+}
+
+bool read_nev_frame_meta_and_codestream(
+    const NevClipInfo& clip,
+    uint32_t frame_index,
+    NevFrameMeta& meta,
+    std::vector<uint8_t>* codestream_out,
+    std::string& err) {
+    RandomAccessReader r;
+    if (!r.open_file(clip.file_path, err)) {
+        return false;
+    }
+    return detail::read_nev_frame_meta_and_codestream_reader(
+        r, clip, frame_index, meta, codestream_out, err);
+}
+
+bool extract_nev_blob(
+    const std::string& path,
+    uint64_t offset,
+    uint32_t size,
+    std::vector<uint8_t>& out,
+    std::string& err) {
+    RandomAccessReader r;
+    if (!r.open_file(path, err)) {
+        return false;
+    }
+    return detail::extract_blob_reader(r, offset, size, out, err);
 }
 
 } // namespace nijinwvdc

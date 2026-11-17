@@ -2,11 +2,13 @@
 #include "../include/nijinWVDC.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <sys/stat.h>
+#include <thread>
 #include <vector>
 
 #define CHECK(expr)                                                                         \
@@ -21,8 +23,16 @@ namespace {
 
 std::string temp_file_path(const char* name) {
     const char* td = std::getenv("TMPDIR");
+#ifdef _WIN32
+    if (!td || !*td) td = std::getenv("TEMP");
+    if (!td || !*td) td = std::getenv("TMP");
+    std::string base = (td && *td) ? td : ".";
+#else
     std::string base = (td && *td) ? td : "/tmp";
-    if (!base.empty() && base.back() == '/') base.pop_back();
+#endif
+    while (base.size() > 1 && (base.back() == '/' || base.back() == '\\')) {
+        base.pop_back();
+    }
     return base + "/" + name;
 }
 
@@ -79,7 +89,7 @@ std::vector<uint8_t> read_bytes(const std::string& path) {
 void test_negative_containers_and_codestreams() {
     std::string err;
     nijinwvdc::NevClipInfo clip;
-    CHECK(!nijinwvdc::parse_nev_clip("/tmp/does_not_exist_nijin_123456.nev", clip, err));
+    CHECK(!nijinwvdc::parse_nev_clip(temp_file_path("does_not_exist_nijin_123456.nev"), clip, err));
 
     nijinwvdc::TicoRawInfo jxs;
     std::vector<uint16_t> out;
@@ -265,7 +275,11 @@ struct BitWriter {
     }
 };
 
-std::vector<uint8_t> build_synth_arw6_res_stream(int n_bands, int chunk_count, int32_t dc_val) {
+std::vector<uint8_t> build_synth_arw6_res_stream(
+    int n_bands,
+    int chunk_count,
+    int32_t dc_val,
+    size_t zero_chunk_bytes = 8) {
     std::vector<std::vector<uint8_t>> chunks(static_cast<size_t>(chunk_count));
     std::vector<uint8_t> payload;
     for (int ci = 0; ci < chunk_count; ++ci) {
@@ -280,9 +294,9 @@ std::vector<uint8_t> build_synth_arw6_res_stream(int n_bands, int chunk_count, i
             bw.push_bits(0, 12);
             bw.push_bits(0, 12);
             bw.push_bit(dc_val < 0 ? 1u : 0u);
-            chunks[ci] = bw.finish_padded(8);
+            chunks[ci] = bw.finish_padded(std::max<size_t>(8u, zero_chunk_bytes));
         } else {
-            chunks[ci].assign(8, 0);
+            chunks[ci].assign(zero_chunk_bytes, 0);
         }
         payload.insert(payload.end(), chunks[ci].begin(), chunks[ci].end());
     }
@@ -324,7 +338,12 @@ std::vector<uint8_t> build_synth_arw6_res_stream(int n_bands, int chunk_count, i
     return stream;
 }
 
-std::vector<uint8_t> build_synth_arw6_16x16(int32_t gl_dc, int32_t r_dc, int32_t b_dc) {
+std::vector<uint8_t> build_synth_arw6_wx16(
+    uint16_t width_px,
+    int32_t gl_dc,
+    int32_t r_dc,
+    int32_t b_dc,
+    size_t zero_chunk_bytes = 8) {
     std::vector<uint8_t> streams[5][3];
     const int32_t dcs[3] = {gl_dc, r_dc, b_dc};
     uint32_t grp_bytes[4] = {0, 0, 0, 0};
@@ -333,11 +352,12 @@ std::vector<uint8_t> build_synth_arw6_16x16(int32_t gl_dc, int32_t r_dc, int32_t
         int nb = (r == 0) ? 1 : 3;
         int nchunks = (r == 0) ? 1 : 2;
         for (int c = 0; c < 3; ++c) {
-            streams[r][c] = build_synth_arw6_res_stream(nb, nchunks, (r == 0) ? dcs[c] : 0);
+            streams[r][c] = build_synth_arw6_res_stream(
+                nb, nchunks, (r == 0) ? dcs[c] : 0, zero_chunk_bytes);
             grp_bytes[r] += static_cast<uint32_t>(streams[r][c].size());
         }
     }
-    streams[4][0] = build_synth_arw6_res_stream(1, 2, 0);
+    streams[4][0] = build_synth_arw6_res_stream(1, 2, 0, zero_chunk_bytes);
 
     std::vector<uint8_t> cs(128, 0);
     std::memcpy(cs.data(), "A000", 4);
@@ -351,8 +371,8 @@ std::vector<uint8_t> build_synth_arw6_16x16(int32_t gl_dc, int32_t r_dc, int32_t
         cs[off + 2] = static_cast<uint8_t>(v & 0xFFu);
     };
 
-    put_be16(8, 16);   // w
-    put_be16(10, 8);   // h / 2
+    put_be16(8, width_px); // w
+    put_be16(10, 8);       // h / 2
     put_be16(12, 14 << 4);
     cs[14] = (3u << 5) | (3u << 2) | 0x02u;
     cs[15] = 0x00u;
@@ -377,6 +397,10 @@ std::vector<uint8_t> build_synth_arw6_16x16(int32_t gl_dc, int32_t r_dc, int32_t
     }
     cs.insert(cs.end(), streams[4][0].begin(), streams[4][0].end());
     return cs;
+}
+
+std::vector<uint8_t> build_synth_arw6_16x16(int32_t gl_dc, int32_t r_dc, int32_t b_dc) {
+    return build_synth_arw6_wx16(16, gl_dc, r_dc, b_dc, 8);
 }
 
 void test_arw6_synthetic_1tile_and_4tile() {
@@ -405,6 +429,21 @@ void test_arw6_synthetic_1tile_and_4tile() {
             CHECK(b1[(r * 2) * 16 + c * 2 + 1] == 674);
             CHECK(b1[(r * 2 + 1) * 16 + c * 2] == 674);
             CHECK(b1[(r * 2 + 1) * 16 + c * 2 + 1] == 654);
+        }
+    }
+
+    // Wide 64x16 (w_comp=32) negative-DC tile: exercises AVX2 16-quad main loop with negative sums
+    auto cs_wide = build_synth_arw6_wx16(64, -700, 20, -20, 64);
+    std::vector<uint16_t> wide1, wide4;
+    CHECK(nijinwvdc::decode_arw6_tile(cs_wide.data(), cs_wide.size(), 1, 0, 0, 64, 16, wide1, info1, err));
+    CHECK(nijinwvdc::decode_arw6_tile(cs_wide.data(), cs_wide.size(), 4, 0, 0, 64, 16, wide4, info4, err));
+    CHECK(wide1.size() == 64u * 16u && wide1 == wide4);
+    for (uint32_t r = 0; r < 8; ++r) {
+        for (uint32_t c = 0; c < 32; ++c) {
+            CHECK(wide1[(r * 2) * 64 + c * 2] == 694);
+            CHECK(wide1[(r * 2) * 64 + c * 2 + 1] == 674);
+            CHECK(wide1[(r * 2 + 1) * 64 + c * 2] == 674);
+            CHECK(wide1[(r * 2 + 1) * 64 + c * 2 + 1] == 654);
         }
     }
 
@@ -596,6 +635,442 @@ void test_dng_roundtrip_synthetic() {
     verify_dng_case("nijin_selftest_split.dng", split_blk, false);
 }
 
+void write_be32_u8(std::vector<uint8_t>& buf, uint32_t v) {
+    buf.push_back(static_cast<uint8_t>((v >> 24) & 0xFFu));
+    buf.push_back(static_cast<uint8_t>((v >> 16) & 0xFFu));
+    buf.push_back(static_cast<uint8_t>((v >> 8) & 0xFFu));
+    buf.push_back(static_cast<uint8_t>(v & 0xFFu));
+}
+
+std::vector<uint8_t> make_box(const char type[4], const std::vector<uint8_t>& payload) {
+    std::vector<uint8_t> out;
+    out.reserve(8u + payload.size());
+    write_be32_u8(out, static_cast<uint32_t>(8u + payload.size()));
+    out.insert(out.end(), type, type + 4);
+    out.insert(out.end(), payload.begin(), payload.end());
+    return out;
+}
+
+std::vector<uint8_t> build_synth_arw_4tile_tiff() {
+    auto cs0 = build_synth_arw6_16x16(-700, 20, -20);
+    auto cs1 = build_synth_arw6_16x16(-750, 10, -10);
+    auto cs2 = build_synth_arw6_16x16(-650, 15, -15);
+    auto cs3 = build_synth_arw6_16x16(-620, 20, -20);
+    const std::vector<uint8_t>* qcs[4] = {&cs0, &cs1, &cs2, &cs3};
+    const uint32_t qxy[4][2] = {{0, 0}, {16, 0}, {0, 16}, {16, 16}};
+    std::vector<uint8_t> strip4(0x68, 0);
+    put_le32(strip4, 0, 4);
+    uint32_t cur = 0x68;
+    for (int i = 0; i < 4; ++i) {
+        size_t rec = 8 + static_cast<size_t>(i) * 24;
+        put_le32(strip4, rec + 0, cur);
+        put_le32(strip4, rec + 8, qxy[i][0]);
+        put_le32(strip4, rec + 12, qxy[i][1]);
+        put_le32(strip4, rec + 16, 16);
+        put_le32(strip4, rec + 20, 16);
+        cur += static_cast<uint32_t>(qcs[i]->size());
+    }
+    for (int i = 0; i < 4; ++i) {
+        strip4.insert(strip4.end(), qcs[i]->begin(), qcs[i]->end());
+    }
+
+    const char make_str[] = "SONY";
+    const char model_str[] = "ILCE-7M5";
+    std::vector<uint8_t> arw(512 + strip4.size(), 0);
+    arw[0] = 'I'; arw[1] = 'I'; put_le16(arw, 2, 42); put_le32(arw, 4, 8);
+    put_le16(arw, 8, 3);
+    auto put_ifd0 = [&](size_t idx, uint16_t tag, uint16_t dt, uint32_t cnt, uint32_t val) {
+        size_t o = 10 + idx * 12;
+        put_le16(arw, o + 0, tag); put_le16(arw, o + 2, dt);
+        put_le32(arw, o + 4, cnt); put_le32(arw, o + 8, val);
+    };
+    put_ifd0(0, 271, 2, 5, 48);
+    put_ifd0(1, 272, 2, 9, 54);
+    put_ifd0(2, 330, 4, 1, 64);
+    std::memcpy(&arw[48], make_str, 5);
+    std::memcpy(&arw[54], model_str, 9);
+
+    const size_t strip_off = 512;
+    const size_t data_pool = 240;
+    put_le16(arw, 64, 12);
+    auto put_sub = [&](size_t idx, uint16_t tag, uint16_t dt, uint32_t cnt, uint32_t val) {
+        size_t o = 66 + idx * 12;
+        put_le16(arw, o + 0, tag); put_le16(arw, o + 2, dt);
+        put_le32(arw, o + 4, cnt); put_le32(arw, o + 8, val);
+    };
+    put_sub(0, 256, 4, 1, 32);
+    put_sub(1, 257, 4, 1, 32);
+    put_sub(2, 258, 3, 1, 14);
+    put_sub(3, 259, 3, 1, 32766);
+    put_sub(4, 262, 3, 1, 32803);
+    put_sub(5, 273, 4, 1, static_cast<uint32_t>(strip_off));
+    put_sub(6, 279, 4, 1, static_cast<uint32_t>(strip4.size()));
+    put_sub(7, 33422, 1, 4, 0x02010100u);
+    put_sub(8, 0x7000, 3, 1, 6);
+    put_sub(9, 0x7310, 3, 4, static_cast<uint32_t>(data_pool));
+    put_sub(10, 50719, 4, 2, static_cast<uint32_t>(data_pool + 8));
+    put_sub(11, 50720, 4, 2, static_cast<uint32_t>(data_pool + 16));
+    for (size_t i = 0; i < 4; ++i) put_le16(arw, data_pool + i * 2, 512);
+    put_le32(arw, data_pool + 8, 2);  put_le32(arw, data_pool + 12, 2);
+    put_le32(arw, data_pool + 16, 28); put_le32(arw, data_pool + 20, 28);
+    std::memcpy(&arw[strip_off], strip4.data(), strip4.size());
+    return arw;
+}
+
+void test_session_reader_postproc_and_threading() {
+    std::string err;
+    CHECK(std::strcmp(nijinwvdc::version_string(), NIJINWVDC_VERSION_STRING) == 0);
+    const uint32_t caps = nijinwvdc::simd_capabilities();
+#if defined(__aarch64__) || defined(_M_ARM64)
+    CHECK((caps & NIJIN_SIMD_ARM_NEON) != 0u);
+#elif defined(__x86_64__) || defined(_M_X64)
+    CHECK((caps & NIJIN_SIMD_X86_SSE2) != 0u);
+#else
+    (void)caps;
+#endif
+
+    // 1) MediaReader open_memory + IoCallbacks (small bounded reads) + bare A000 + DecoderSession reuse/strided/ROI
+    auto cs_tile = build_synth_arw6_16x16(-700, 20, -20);
+    auto cs_tile_hi = build_synth_arw6_16x16(400, 100, -100);
+    auto arw_tiff = build_synth_arw_4tile_tiff();
+
+    nijinwvdc::MediaReader r_mem;
+    CHECK(r_mem.open_memory(arw_tiff.data(), arw_tiff.size(), err));
+    CHECK(r_mem.container_format() == nijinwvdc::ContainerFormat::TiffArw);
+    CHECK(r_mem.codec_family() == nijinwvdc::CodecFamily::Arw6);
+    CHECK(r_mem.frame_count() == 1u);
+
+    struct ChunkedMem {
+        const std::vector<uint8_t>* buf;
+    } cctx{&arw_tiff};
+    nijinwvdc::IoCallbacks cb;
+    cb.user_data = &cctx;
+    cb.file_size = arw_tiff.size();
+    cb.read_at = [](void* ud, uint64_t off, void* dst, size_t sz, size_t* got) -> bool {
+        const auto* ctx = static_cast<const ChunkedMem*>(ud);
+        if (off > ctx->buf->size() || sz > ctx->buf->size() - off) return false;
+        size_t pos = 0;
+        while (pos < sz) {
+            size_t step = std::min<size_t>(37u, sz - pos);
+            std::memcpy(static_cast<uint8_t*>(dst) + pos, ctx->buf->data() + off + pos, step);
+            pos += step;
+        }
+        *got = sz;
+        return true;
+    };
+    nijinwvdc::MediaReader r_cb;
+    CHECK(r_cb.open_callbacks(cb, err));
+
+    nijinwvdc::MediaReader r_a000;
+    CHECK(r_a000.open_memory(cs_tile.data(), cs_tile.size(), err));
+    CHECK(r_a000.container_format() == nijinwvdc::ContainerFormat::RawCodestream);
+    CHECK(r_a000.codec_family() == nijinwvdc::CodecFamily::Arw6);
+
+    nijinwvdc::DecoderSession sess(2);
+    std::vector<uint16_t> b_mem, b_cb, b_tile, b_hi;
+    nijinwvdc::DecodedFrameInfo di_mem, di_cb, di_tile, di_hi;
+    nijinwvdc::DecodeOptions dopts;
+    CHECK(sess.decode_frame(r_mem, 0, dopts, b_mem, di_mem, err));
+    CHECK(sess.decode_frame(r_cb, 0, dopts, b_cb, di_cb, err));
+    CHECK(b_mem == b_cb);
+    CHECK(sess.decode_frame(r_a000, 0, dopts, b_tile, di_tile, err));
+    CHECK(di_tile.coded_width == 16u && di_tile.coded_height == 16u && b_tile[0] == 694u);
+    CHECK(sess.decode_codestream(cs_tile_hi.data(), cs_tile_hi.size(), dopts, b_hi, di_hi, err));
+    CHECK(b_hi[0] > b_hi[1]);
+
+    // Padded strided decode with canary guard words
+    const size_t pad_u16_stride = 40u; // 80 bytes (> 32 * 2)
+    std::vector<uint16_t> strided_buf(16u + 32u * pad_u16_stride + 16u, 0xBEEFu);
+    nijinwvdc::DecodedFrameInfo di_strided;
+    CHECK(sess.decode_frame_into(
+        r_mem, 0, dopts, strided_buf.data() + 16u, pad_u16_stride * sizeof(uint16_t), 32u, di_strided, err));
+    for (size_t i = 0; i < 16u; ++i) {
+        CHECK(strided_buf[i] == 0xBEEFu);
+        CHECK(strided_buf[16u + 32u * pad_u16_stride + i] == 0xBEEFu);
+    }
+    for (uint32_t y = 0; y < 32u; ++y) {
+        for (uint32_t x = 0; x < 32u; ++x) {
+            CHECK(strided_buf[16u + y * pad_u16_stride + x] == b_mem[y * 32u + x]);
+        }
+        for (uint32_t x = 32u; x < pad_u16_stride; ++x) {
+            CHECK(strided_buf[16u + y * pad_u16_stride + x] == 0xBEEFu);
+        }
+    }
+
+    // Active crop + arbitrary odd ROI parity
+    nijinwvdc::DecodeOptions dopts_crop;
+    dopts_crop.apply_active_crop = true;
+    std::vector<uint16_t> b_crop, b_crop_ref;
+    nijinwvdc::DecodedFrameInfo di_crop;
+    CHECK(sess.decode_frame(r_mem, 0, dopts_crop, b_crop, di_crop, err));
+    uint8_t ref_cfa[4] = {0};
+    CHECK(nijinwvdc::apply_bayer_crop(
+        b_mem.data(), 32u, 32u, di_mem.meta.crop, di_mem.meta.cfa_pattern, b_crop_ref, ref_cfa));
+    CHECK(di_crop.output_width == 28u && di_crop.output_height == 28u && b_crop == b_crop_ref);
+
+    nijinwvdc::DecodeOptions dopts_roi;
+    dopts_roi.has_roi = true;
+    dopts_roi.roi[0] = 3; dopts_roi.roi[1] = 3; dopts_roi.roi[2] = 22; dopts_roi.roi[3] = 20;
+    std::vector<uint16_t> b_roi, b_roi_ref;
+    nijinwvdc::DecodedFrameInfo di_roi;
+    CHECK(sess.decode_frame(r_mem, 0, dopts_roi, b_roi, di_roi, err));
+    const uint16_t roi16[4] = {3, 3, 22, 20};
+    CHECK(nijinwvdc::apply_bayer_crop(b_mem.data(), 32u, 32u, roi16, di_mem.meta.cfa_pattern, b_roi_ref, ref_cfa));
+    CHECK(di_roi.output_width == 22u && di_roi.output_height == 20u);
+    CHECK(std::memcmp(di_roi.cfa_pattern, ref_cfa, 4) == 0);
+    CHECK(b_roi == b_roi_ref);
+
+    // Concurrent multi-thread decode sharing one MediaReader
+    std::vector<std::thread> workers;
+    for (int t = 0; t < 4; ++t) {
+        workers.emplace_back([&r_mem, &b_mem]() {
+            nijinwvdc::DecoderSession tsess(2);
+            nijinwvdc::DecodeOptions topts;
+            std::vector<uint16_t> tb;
+            nijinwvdc::DecodedFrameInfo tinfo;
+            std::string terr;
+            for (int iter = 0; iter < 8; ++iter) {
+                CHECK(tsess.decode_frame(r_mem, 0, topts, tb, tinfo, terr));
+                CHECK(tb == b_mem);
+            }
+        });
+    }
+    for (auto& w : workers) w.join();
+
+    // 2) SIMD split_bayer_cfa_planes + normalize_bayer_to_float
+    const uint32_t sw = 100, sh = 6, s_stride_u16 = 108;
+    std::vector<uint16_t> s_pix(sh * s_stride_u16, 0x5555u);
+    for (uint32_t y = 0; y < sh; ++y) {
+        for (uint32_t x = 0; x < sw; ++x) {
+            uint16_t v = static_cast<uint16_t>((y * 1021u + x * 673u) & 0xFFFFu);
+            if (x == 0 && y == 0) v = 0xFFFFu;
+            if (x == 1 && y == 0) v = 0x8000u;
+            if (x == 2 && y == 0) v = 0x7FFFu;
+            if (x == 3 && y == 0) v = 0x0000u;
+            s_pix[y * s_stride_u16 + x] = v;
+        }
+    }
+    const size_t half_w = sw / 2, half_h = sh / 2, p_stride_u16 = 56;
+    std::vector<uint16_t> p00(half_h * p_stride_u16, 0), p01(half_h * p_stride_u16, 0),
+                          p10(half_h * p_stride_u16, 0), p11(half_h * p_stride_u16, 0);
+    CHECK(nijinwvdc::split_bayer_cfa_planes(
+        s_pix.data(), s_stride_u16 * 2u, sw, sh,
+        p00.data(), p01.data(), p10.data(), p11.data(), p_stride_u16 * 2u));
+    for (uint32_t py = 0; py < half_h; ++py) {
+        for (uint32_t px = 0; px < half_w; ++px) {
+            CHECK(p00[py * p_stride_u16 + px] == s_pix[(2u * py) * s_stride_u16 + 2u * px]);
+            CHECK(p01[py * p_stride_u16 + px] == s_pix[(2u * py) * s_stride_u16 + 2u * px + 1u]);
+            CHECK(p10[py * p_stride_u16 + px] == s_pix[(2u * py + 1u) * s_stride_u16 + 2u * px]);
+            CHECK(p11[py * p_stride_u16 + px] == s_pix[(2u * py + 1u) * s_stride_u16 + 2u * px + 1u]);
+        }
+    }
+
+    const uint32_t nw = 38, nh = 3;
+    std::vector<uint16_t> nsrc(nw * nh);
+    for (size_t i = 0; i < nsrc.size(); ++i) nsrc[i] = static_cast<uint16_t>((i * 457u) % 16384u);
+    const float fblk[4] = {100.0f, 200.0f, 300.0f, 400.0f};
+    const float fwhite = 10000.0f;
+    std::vector<float> fclamp(nw * nh, -1.0f), funclamp(nw * nh, -1.0f);
+    CHECK(nijinwvdc::normalize_bayer_to_float(nsrc.data(), 0, nw, nh, fblk, fwhite, true, fclamp.data(), 0));
+    CHECK(nijinwvdc::normalize_bayer_to_float(nsrc.data(), 0, nw, nh, fblk, fwhite, false, funclamp.data(), 0));
+    for (uint32_t y = 0; y < nh; ++y) {
+        for (uint32_t x = 0; x < nw; ++x) {
+            const uint32_t ph = ((y & 1u) * 2u) | (x & 1u);
+            const float ref = (static_cast<float>(nsrc[y * nw + x]) - fblk[ph]) / (fwhite - fblk[ph]);
+            const float ref_c = (ref < 0.0f) ? 0.0f : ((ref > 1.0f) ? 1.0f : ref);
+            CHECK(std::fabs(funclamp[y * nw + x] - ref) < 1e-5f);
+            CHECK(std::fabs(fclamp[y * nw + x] - ref_c) < 1e-5f);
+        }
+    }
+
+    // 3) Synthetic MOV (vide + BE soun lpcm split across chunks + drop-frame tmcd) -> timing + audio + WAV
+    std::vector<uint8_t> pcm_data;
+    const uint32_t total_aframes = 512;
+    for (uint32_t i = 0; i < total_aframes; ++i) {
+        int16_t l = static_cast<int16_t>(1000 + i);
+        int16_t r = static_cast<int16_t>(-2000 - i);
+        pcm_data.push_back(static_cast<uint8_t>((static_cast<uint16_t>(l) >> 8) & 0xFFu));
+        pcm_data.push_back(static_cast<uint8_t>(static_cast<uint16_t>(l) & 0xFFu));
+        pcm_data.push_back(static_cast<uint8_t>((static_cast<uint16_t>(r) >> 8) & 0xFFu));
+        pcm_data.push_back(static_cast<uint8_t>(static_cast<uint16_t>(r) & 0xFFu));
+    }
+    const uint32_t tmcd_vals[3] = {1799u, 1800u, 17982u};
+    std::vector<uint8_t> tmcd_raw;
+    for (uint32_t tv : tmcd_vals) write_be32_u8(tmcd_raw, tv);
+
+    auto make_stco_single = [](uint32_t off) {
+        std::vector<uint8_t> p(12, 0);
+        put_le32(p, 0, 0);
+        p[7] = 1;
+        p[8] = static_cast<uint8_t>((off >> 24) & 0xFFu);
+        p[9] = static_cast<uint8_t>((off >> 16) & 0xFFu);
+        p[10] = static_cast<uint8_t>((off >> 8) & 0xFFu);
+        p[11] = static_cast<uint8_t>(off & 0xFFu);
+        return make_box("stco", p);
+    };
+
+    // Reserve known mdat offset >= 4096 inside a synthetic MOV
+    std::vector<uint8_t> ftyp_pay = {'n', 'i', 'k', 'o', 0, 0, 0, 1};
+    auto box_ftyp = make_box("ftyp", ftyp_pay);
+    std::vector<uint8_t> mdat_pay(32 + pcm_data.size() + tmcd_raw.size(), 0);
+    const size_t pcm_rel0 = 32;
+    const size_t pcm_rel1 = 32 + 300 * 4;
+    const size_t tc_rel = 32 + pcm_data.size();
+    std::memcpy(&mdat_pay[pcm_rel0], pcm_data.data(), pcm_data.size());
+    std::memcpy(&mdat_pay[tc_rel], tmcd_raw.data(), tmcd_raw.size());
+
+    auto build_mov = [&](uint32_t mdat_abs_off) {
+        std::vector<uint8_t> mvhd_p(24, 0);
+        mvhd_p[14] = 0x75; mvhd_p[15] = 0x30; // timescale = 30000
+
+        // vide trak
+        std::vector<uint8_t> v_mdhd(24, 0); v_mdhd[14] = 0x75; v_mdhd[15] = 0x30;
+        std::vector<uint8_t> v_hdlr(12, 0); std::memcpy(&v_hdlr[8], "vide", 4);
+        std::vector<uint8_t> v_stsd(94, 0); v_stsd[7] = 1; v_stsd[11] = 86;
+        std::memcpy(&v_stsd[12], "NRAW", 4);
+        v_stsd[40] = 0; v_stsd[41] = 16; v_stsd[42] = 0; v_stsd[43] = 16;
+        std::vector<uint8_t> v_stts(24, 0);
+        v_stts[7] = 2;
+        v_stts[11] = 2; v_stts[14] = 0x03; v_stts[15] = 0xE9; // 2 * 1001
+        v_stts[19] = 1; v_stts[22] = 0x07; v_stts[23] = 0xD2; // 1 * 2002
+        std::vector<uint8_t> v_stsc(20, 0); v_stsc[7] = 1; v_stsc[11] = 1; v_stsc[15] = 3;
+        std::vector<uint8_t> v_stsz(12, 0); v_stsz[7] = 8; v_stsz[11] = 3;
+        auto v_stbl = make_box("stbl", [&]() {
+            std::vector<uint8_t> all;
+            for (auto& b : {make_box("stsd", v_stsd), make_box("stts", v_stts),
+                            make_box("stsc", v_stsc), make_box("stsz", v_stsz),
+                            make_stco_single(mdat_abs_off)}) {
+                all.insert(all.end(), b.begin(), b.end());
+            }
+            return all;
+        }());
+        std::vector<uint8_t> v_trak_body;
+        for (auto& b : {make_box("mdhd", v_mdhd), make_box("hdlr", v_hdlr), make_box("minf", v_stbl)}) {
+            v_trak_body.insert(v_trak_body.end(), b.begin(), b.end());
+        }
+
+        // soun trak (lpcm v2 big-endian 16-bit 2ch 48kHz across 2 chunks: 300, 212 frames)
+        std::vector<uint8_t> s_mdhd(24, 0); s_mdhd[14] = 0xBB; s_mdhd[15] = 0x80; // 48000
+        std::vector<uint8_t> s_hdlr(12, 0); std::memcpy(&s_hdlr[8], "soun", 4);
+        std::vector<uint8_t> s_stsd(80, 0); s_stsd[7] = 1; s_stsd[11] = 72;
+        std::memcpy(&s_stsd[12], "lpcm", 4);
+        s_stsd[25] = 2; // ver=2 @ +16 (+8 header = 24)
+        const double sr = 48000.0;
+        uint64_t sr_u = 0; std::memcpy(&sr_u, &sr, 8);
+        for (int b = 0; b < 8; ++b) s_stsd[48 + b] = static_cast<uint8_t>((sr_u >> ((7 - b) * 8)) & 0xFFu);
+        s_stsd[59] = 2;  // ch
+        s_stsd[67] = 16; // bits
+        s_stsd[71] = 0x0Eu; // flags: big-endian(2) | signed(4) | packed(8)
+        s_stsd[75] = 4;  // bytesPerPacket
+        std::vector<uint8_t> s_stsc(32, 0); s_stsc[7] = 2;
+        s_stsc[11] = 1; s_stsc[14] = 0x01; s_stsc[15] = 0x2C; // chunk 1: 300
+        s_stsc[23] = 2; s_stsc[27] = 212;                      // chunk 2: 212
+        std::vector<uint8_t> s_stsz(12, 0); s_stsz[7] = 4; s_stsz[10] = 0x02; s_stsz[11] = 0x00; // 512
+        std::vector<uint8_t> s_stco(16, 0); s_stco[7] = 2;
+        uint32_t co0 = mdat_abs_off + static_cast<uint32_t>(pcm_rel0);
+        uint32_t co1 = mdat_abs_off + static_cast<uint32_t>(pcm_rel1);
+        for (int b = 0; b < 4; ++b) {
+            s_stco[8 + b] = static_cast<uint8_t>((co0 >> ((3 - b) * 8)) & 0xFFu);
+            s_stco[12 + b] = static_cast<uint8_t>((co1 >> ((3 - b) * 8)) & 0xFFu);
+        }
+        auto s_stbl = make_box("stbl", [&]() {
+            std::vector<uint8_t> all;
+            for (auto& b : {make_box("stsd", s_stsd), make_box("stsc", s_stsc),
+                            make_box("stsz", s_stsz), make_box("stco", s_stco)}) {
+                all.insert(all.end(), b.begin(), b.end());
+            }
+            return all;
+        }());
+        std::vector<uint8_t> s_trak_body;
+        for (auto& b : {make_box("mdhd", s_mdhd), make_box("hdlr", s_hdlr), make_box("minf", s_stbl)}) {
+            s_trak_body.insert(s_trak_body.end(), b.begin(), b.end());
+        }
+
+        // tmcd trak (drop-frame 29.97, 30 nf)
+        std::vector<uint8_t> t_hdlr(12, 0); std::memcpy(&t_hdlr[8], "tmcd", 4);
+        std::vector<uint8_t> t_stsd(44, 0); t_stsd[7] = 1; t_stsd[11] = 36;
+        std::memcpy(&t_stsd[12], "tmcd", 4);
+        t_stsd[31] = 1; // flags=1 (drop-frame) @ +20 (+8=28..31)
+        t_stsd[40] = 30; // nf @ +32 (+8=40)
+        std::vector<uint8_t> t_stsc(20, 0); t_stsc[7] = 1; t_stsc[11] = 1; t_stsc[15] = 3;
+        std::vector<uint8_t> t_stsz(12, 0); t_stsz[7] = 4; t_stsz[11] = 3;
+        auto t_stbl = make_box("stbl", [&]() {
+            std::vector<uint8_t> all;
+            for (auto& b : {make_box("stsd", t_stsd), make_box("stsc", t_stsc),
+                            make_box("stsz", t_stsz),
+                            make_stco_single(mdat_abs_off + static_cast<uint32_t>(tc_rel))}) {
+                all.insert(all.end(), b.begin(), b.end());
+            }
+            return all;
+        }());
+        std::vector<uint8_t> t_trak_body;
+        for (auto& b : {make_box("hdlr", t_hdlr), make_box("minf", t_stbl)}) {
+            t_trak_body.insert(t_trak_body.end(), b.begin(), b.end());
+        }
+
+        std::vector<uint8_t> moov_body;
+        for (auto& b : {make_box("mvhd", mvhd_p), make_box("trak", v_trak_body),
+                        make_box("trak", s_trak_body), make_box("trak", t_trak_body)}) {
+            moov_body.insert(moov_body.end(), b.begin(), b.end());
+        }
+        auto box_moov = make_box("moov", moov_body);
+        auto box_mdat = make_box("mdat", mdat_pay);
+        std::vector<uint8_t> mov;
+        mov.insert(mov.end(), box_ftyp.begin(), box_ftyp.end());
+        mov.insert(mov.end(), box_moov.begin(), box_moov.end());
+        mov.insert(mov.end(), box_mdat.begin(), box_mdat.end());
+        return mov;
+    };
+
+    auto mov_probe = build_mov(0);
+    const uint32_t mdat_pay_off = static_cast<uint32_t>(mov_probe.size() - mdat_pay.size());
+    auto mov = build_mov(mdat_pay_off);
+
+    nijinwvdc::MediaReader r_mov;
+    CHECK(r_mov.open_memory(mov.data(), mov.size(), err));
+    CHECK(r_mov.container_format() == nijinwvdc::ContainerFormat::Mp4Nev);
+    CHECK(r_mov.frame_count() == 3u);
+
+    nijinwvdc::VideoFrameTiming ft0, ft1, ft2;
+    CHECK(r_mov.get_frame_timing(0, ft0, err));
+    CHECK(r_mov.get_frame_timing(1, ft1, err));
+    CHECK(r_mov.get_frame_timing(2, ft2, err));
+    CHECK(ft0.pts_ticks == 0 && ft0.duration_ticks == 1001 && ft0.has_timecode && ft0.drop_frame);
+    CHECK(std::strcmp(ft0.timecode_str, "00:00:59;29") == 0);
+    CHECK(ft1.pts_ticks == 1001 && std::strcmp(ft1.timecode_str, "00:01:00;02") == 0);
+    CHECK(ft2.pts_ticks == 2002 && ft2.duration_ticks == 2002 && std::strcmp(ft2.timecode_str, "00:10:00;00") == 0);
+
+    const auto ainfo = r_mov.audio_info();
+    CHECK(ainfo.available && ainfo.channels == 2u && ainfo.bits_per_channel == 16u);
+    CHECK(ainfo.is_big_endian && ainfo.is_signed && !ainfo.is_float && ainfo.total_frames == total_aframes);
+
+    std::vector<uint8_t> pcm_slice;
+    CHECK(r_mov.read_audio_pcm(250, 128, pcm_slice, err));
+    CHECK(pcm_slice.size() == 128u * 4u);
+    CHECK(std::memcmp(pcm_slice.data(), &pcm_data[250u * 4u], pcm_slice.size()) == 0);
+
+    std::string wav_path = temp_file_path("nijin_synth_audio.wav");
+    CHECK(r_mov.export_audio_wav(wav_path, err));
+    auto wav = read_bytes(wav_path);
+    std::remove(wav_path.c_str());
+    CHECK(wav.size() == 44u + pcm_data.size());
+    CHECK(std::memcmp(wav.data(), "RIFF", 4) == 0 && std::memcmp(&wav[8], "WAVE", 4) == 0);
+    CHECK(rd_le16(&wav[20]) == 1u && rd_le16(&wav[22]) == 2u && rd_le32(&wav[24]) == 48000u);
+    CHECK(rd_le32(&wav[40]) == pcm_data.size());
+    CHECK(static_cast<int16_t>(rd_le16(&wav[44])) == 1000 && static_cast<int16_t>(rd_le16(&wav[46])) == -2000);
+
+    // 4) encode_cfa_dng_memory exact parity with write_cfa_dng
+    nijinwvdc::DngWriteOptions mopts;
+    mopts.width = 32; mopts.height = 32;
+    std::vector<uint8_t> mem_dng;
+    CHECK(nijinwvdc::encode_cfa_dng_memory(b_mem.data(), mopts, mem_dng, err));
+    std::string file_dng = temp_file_path("nijin_mem_cmp.dng");
+    CHECK(nijinwvdc::write_cfa_dng(file_dng, b_mem.data(), mopts, err));
+    auto file_dng_bytes = read_bytes(file_dng);
+    std::remove(file_dng.c_str());
+    CHECK(mem_dng == file_dng_bytes);
+}
+
 void test_optional_real_corpus() {
     std::string err;
     const char* env_nev = std::getenv("NIJINWVDC_TEST_NEV");
@@ -639,6 +1114,22 @@ void test_optional_real_corpus() {
         nijinwvdc::build_dng_options_from_clip_and_frame(clip, m0, info4, false, 0, dopts);
         CHECK(nijinwvdc::write_cfa_dng(tmp_dng, b4.data(), dopts, err));
         std::remove(tmp_dng.c_str());
+
+        nijinwvdc::MediaReader mr;
+        CHECK(mr.open_file(env_nev, err));
+        nijinwvdc::DecoderSession ds;
+        nijinwvdc::DecodeOptions dopts_s;
+        std::vector<uint16_t> bs;
+        nijinwvdc::DecodedFrameInfo ds_info;
+        CHECK(ds.decode_frame(mr, 0, dopts_s, bs, ds_info, err));
+        CHECK(bs == b1);
+        const auto ainfo = mr.audio_info();
+        if (ainfo.available) {
+            std::string wav_p = temp_file_path("nijin_corpus_nev.wav");
+            CHECK(mr.export_audio_wav(wav_p, err));
+            CHECK(file_exists(wav_p));
+            std::remove(wav_p.c_str());
+        }
     }
 
     const char* env_nef = std::getenv("NIJINWVDC_TEST_NEF");
@@ -719,6 +1210,15 @@ void test_optional_real_corpus() {
             CHECK(nijinwvdc::write_cfa_dng(tmp_dng, b8.data(), dopts, err));
         }
         std::remove(tmp_dng.c_str());
+
+        nijinwvdc::MediaReader mr;
+        CHECK(mr.open_file(env_arw, err));
+        nijinwvdc::DecoderSession ds;
+        nijinwvdc::DecodeOptions dopts_s;
+        std::vector<uint16_t> bs;
+        nijinwvdc::DecodedFrameInfo ds_info;
+        CHECK(ds.decode_frame(mr, 0, dopts_s, bs, ds_info, err));
+        CHECK(bs == b1);
     }
 }
 
@@ -729,6 +1229,7 @@ int main() {
     test_cfa_crop_and_colormatrix();
     test_arw6_synthetic_1tile_and_4tile();
     test_dng_roundtrip_synthetic();
+    test_session_reader_postproc_and_threading();
     test_optional_real_corpus();
     std::printf("test_nijinWVDC: ALL PASSED\n");
     return 0;
