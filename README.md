@@ -104,8 +104,8 @@ Prebuilt SDK + CLI archives are published on [**GitHub Releases**](https://githu
 | `nijinWVDC-v0.3.0-macos-arm64.tar.gz` | Apple Silicon `arm64` static (`.a`), shared (`.dylib`), CLI, headers, CMake/pkg-config |
 | `nijinWVDC-v0.3.0-macos-x86_64.tar.gz` | Intel macOS `x86_64` static (`.a`), shared (`.dylib`), CLI, headers, CMake/pkg-config |
 | `nijinWVDC-v0.3.0-macos-universal2.tar.gz` | Universal fat binary (`arm64` + `x86_64`) static, shared, CLI, headers, CMake/pkg-config |
-| `nijinWVDC-v0.3.0-linux-x86_64.tar.gz` | Linux `x86_64` (`ubuntu-24.04`, SSE2 + runtime AVX2 dispatch) `.a`, `.so`, CLI, headers, CMake/pkg-config |
-| `nijinWVDC-v0.3.0-windows-x86_64.zip` | Windows `x64` (`nijinWVDC.dll` + import `.lib` + `nijinWVDC_static.lib`), `nijinWVDC.exe`, headers, CMake |
+| `nijinWVDC-v0.3.0-linux-x86_64.tar.gz` | Linux `x86_64` (GCC 15.2, glibc 2.25+, SSE2 + runtime AVX2 dispatch) `.a`, `.so`, CLI, headers, CMake/pkg-config |
+| `nijinWVDC-v0.3.0-windows-x86_64.zip` | Windows `x64` (MinGW-w64 GCC 16.2, `nijinWVDC.dll`, `.dll.a` / `.lib` import libs, `.a`), `nijinWVDC.exe`, headers, CMake/pkg-config |
 
 ---
 
@@ -192,7 +192,7 @@ See [**`docs/CLI.md`**](docs/CLI.md) for all flags, JSON schema, C++20 `MediaRea
 | [`src/dng_writer.cpp`](src/dng_writer.cpp) | In-memory & file DNG 1.4 writer, `constexpr` D65 `ColorMatrix1` lookup, and strided modulo CFA cropper |
 | [`src/main.cpp`](src/main.cpp) | Cross-platform CLI driver (`--version` / `--info` / `--json` / batch decode / `--extract-audio` / `--bench`) |
 | [`tests/test_nijinWVDC.cpp`](tests/test_nijinWVDC.cpp) · [`tests/test_c_api.c`](tests/test_c_api.c) | C++20 & C11 shared-library unit, `std::span`, concurrency, strided/ROI, audio/timecode WAV, and corpus suites |
-| [`CMakeLists.txt`](CMakeLists.txt) · [`cmake/`](cmake) · [`Makefile`](Makefile) | Static + shared library targets, CMake package config, pkg-config, and [`release.yml`](.github/workflows/release.yml) CI |
+| [`CMakeLists.txt`](CMakeLists.txt) · [`cmake/`](cmake) · [`Makefile`](Makefile) | Static + shared library targets, CMake package config, pkg-config, and [`scripts/package_release.py`](scripts/package_release.py) release packager |
 
 ---
 

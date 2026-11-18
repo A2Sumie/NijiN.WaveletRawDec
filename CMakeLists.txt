@@ -41,6 +41,9 @@ function(nijinwvdc_apply_target_options tgt)
         target_compile_options(${tgt} PRIVATE -Wall -Wextra -Werror)
         if(MINGW)
             target_compile_definitions(${tgt} PRIVATE __USE_MINGW_ANSI_STDIO=1)
+            if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+                target_compile_options(${tgt} PRIVATE -Wa,-muse-unaligned-vector-move)
+            endif()
         endif()
     endif()
 endfunction()
@@ -78,6 +81,9 @@ if(NIJINWVDC_BUILD_SHARED)
         C_VISIBILITY_PRESET hidden
         VISIBILITY_INLINES_HIDDEN ON
     )
+    if(MINGW)
+        set_target_properties(nijinWVDC_shared PROPERTIES PREFIX "")
+    endif()
     if(APPLE)
         set_target_properties(nijinWVDC_shared PROPERTIES
             MACOSX_RPATH ON

@@ -1,6 +1,8 @@
 # Compiled binaries & build artifacts
 /build/
 /cmake-build*/
+/dist/
+/release_dist/
 /*.o
 /*.a
 /*.exe

@@ -33,7 +33,7 @@ ASAN_CLI     := $(BUILD)/nijinWVDC_asan
 ASAN_TEST    := $(BUILD)/test_nijinWVDC_asan
 ASAN_C_TEST  := $(BUILD)/test_c_api_asan
 
-.PHONY: all shared clean asan test
+.PHONY: all shared clean asan test release-dist
 
 all: $(TARGET) $(STATIC_LIB) $(SHARED_LIB)
 
@@ -85,3 +85,6 @@ test: $(TEST_TARGET) $(TEST_C) asan
 
 clean:
 	rm -rf $(BUILD)
+
+release-dist:
+	python3 scripts/package_release.py
