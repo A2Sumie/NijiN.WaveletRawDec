@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <mutex>
@@ -18,10 +19,11 @@ namespace nijinwvdc {
 namespace {
 
 using detail::rd_be64_fast;
-using detail::clz64_nz;
 
 inline uint16_t rd_be16(const uint8_t* p) {
-    return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
+    uint16_t v = 0;
+    std::memcpy(&v, p, sizeof(v));
+    return detail::bswap16(v);
 }
 
 inline uint32_t rd_be24(const uint8_t* p) {
@@ -31,19 +33,25 @@ inline uint32_t rd_be24(const uint8_t* p) {
 }
 
 inline uint32_t rd_le32(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
+    uint32_t v = 0;
+    std::memcpy(&v, p, sizeof(v));
+    if constexpr (std::endian::native == std::endian::big) {
+        return detail::bswap32(v);
+    }
+    return v;
 }
 
 inline uint64_t rd_le64(const uint8_t* p) {
-    return static_cast<uint64_t>(rd_le32(p)) |
-           (static_cast<uint64_t>(rd_le32(p + 4)) << 32);
+    uint64_t v = 0;
+    std::memcpy(&v, p, sizeof(v));
+    if constexpr (std::endian::native == std::endian::big) {
+        return detail::bswap64(v);
+    }
+    return v;
 }
 
 // 12-bit to 15-bit inverse non-linear tone mapping table (linear below 1428, smooth highlight expansion to 39002)
-static const uint16_t kArw6NltLut[4096] = {
+static constexpr uint16_t kArw6NltLut[4096] = {
         0,     1,     2,     3,     4,     5,     6,     7,     8,     9,    10,    11,
        12,    13,    14,    15,    16,    17,    18,    19,    20,    21,    22,    23,
        24,    25,    26,    27,    28,    29,    30,    31,    32,    33,    34,    35,
@@ -388,17 +396,29 @@ static const uint16_t kArw6NltLut[4096] = {
     38829, 38886, 38944, 39002
 };
 
-// Pre-shifted 14-bit clamped inverse NLT LUT for inner-loop lookups without shift/clamp per pixel.
-const uint16_t* get_arw6_nlt_lut14() {
-    static const std::array<uint16_t, 4096> lut14 = []() {
-        std::array<uint16_t, 4096> t;
-        for (size_t i = 0; i < 4096u; ++i) {
-            uint16_t v = static_cast<uint16_t>(kArw6NltLut[i] >> 1);
-            t[i] = (v > 0x4000u) ? static_cast<uint16_t>(0x4000u) : v;
-        }
-        return t;
-    }();
-    return lut14.data();
+// Pre-shifted 14-bit clamped inverse NLT LUT and default NLT slope LUT baked at compile time.
+consteval std::array<uint16_t, 4096> make_arw6_nlt_lut14() noexcept {
+    std::array<uint16_t, 4096> t{};
+    for (size_t i = 0; i < 4096u; ++i) {
+        const uint16_t v = static_cast<uint16_t>(kArw6NltLut[i] >> 1);
+        t[i] = (v > 0x4000u) ? static_cast<uint16_t>(0x4000u) : v;
+    }
+    return t;
+}
+
+inline constexpr std::array<uint16_t, 4096> kArw6NltLut14 = make_arw6_nlt_lut14();
+
+consteval std::array<float, WaveletQuantProfile::kNltSlopeLutSize> make_arw6_default_dadu_du_raw() noexcept {
+    std::array<float, WaveletQuantProfile::kNltSlopeLutSize> out{};
+    detail::compute_dadu_du_raw_from_lut(kArw6NltLut14.data(), 4096, 4, 16383u, out.data());
+    return out;
+}
+
+inline constexpr std::array<float, WaveletQuantProfile::kNltSlopeLutSize> kArw6DefaultDaduDuRaw =
+    make_arw6_default_dadu_du_raw();
+
+inline const uint16_t* get_arw6_nlt_lut14() noexcept {
+    return kArw6NltLut14.data();
 }
 
 // MSB-first 64-bit word bitreader mirroring the even-word (16-byte) stream framing with zero allocation.
@@ -416,7 +436,7 @@ struct WordBitReader {
         word = 0ULL;
         bits_left = 0;
         err = 0;
-        if (len == 0 || !data) {
+        if (len == 0 || !data) [[unlikely]] {
             fast_ptr = nullptr;
             fast_end = nullptr;
             tail_idx = 0;
@@ -444,7 +464,7 @@ struct WordBitReader {
     }
 
     inline bool refill_word() {
-        if (fast_ptr < fast_end) {
+        if (fast_ptr < fast_end) [[likely]] {
             word = rd_be64_fast(fast_ptr);
             fast_ptr += 8;
             return true;
@@ -458,20 +478,20 @@ struct WordBitReader {
     }
 
     inline uint32_t read_bits(int n) {
-        if (n <= 0 || err != 0) return 0;
-        if (n > 32) {
+        if (n <= 0 || err != 0) [[unlikely]] return 0;
+        if (n > 32) [[unlikely]] {
             err = 2;
             bits_left = 0;
             return 0;
         }
         const int32_t rem = bits_left - n;
-        if (rem >= 0) {
+        if (rem >= 0) [[likely]] {
             bits_left = rem;
             const uint64_t mask = (1ULL << n) - 1ULL;
             return static_cast<uint32_t>((word >> rem) & mask);
         }
         const uint64_t prev = word;
-        if (!refill_word()) {
+        if (!refill_word()) [[unlikely]] {
             bits_left = 0;
             return 0;
         }
@@ -486,13 +506,13 @@ struct WordBitReader {
     }
 
     inline uint32_t read_bit() {
-        if (err != 0) return 0;
+        if (err != 0) [[unlikely]] return 0;
         const int32_t rem = bits_left - 1;
-        if (rem >= 0) {
+        if (rem >= 0) [[likely]] {
             bits_left = rem;
             return static_cast<uint32_t>((word >> rem) & 1ULL);
         }
-        if (!refill_word()) {
+        if (!refill_word()) [[unlikely]] {
             bits_left = 0;
             return 0;
         }
@@ -507,14 +527,14 @@ struct WordBitReader {
                             : ((bits_left >= 64) ? word : (word & ((1ULL << bits_left) - 1ULL)));
         while (rem_bits == 0ULL) {
             zeros += bits_left;
-            if (!refill_word()) {
+            if (!refill_word()) [[unlikely]] {
                 bits_left = 0;
                 return zeros;
             }
             bits_left = 64;
             rem_bits = word;
         }
-        const int32_t pos = 63 - clz64_nz(rem_bits);
+        const int32_t pos = 63 - static_cast<int32_t>(std::countl_zero(rem_bits));
         zeros += bits_left - pos - 1;
         bits_left = pos;
         return zeros;
@@ -523,9 +543,9 @@ struct WordBitReader {
 
 // Predictive Golomb-Rice parameter tracking across 4-coefficient quads.
 inline void update_k(WordBitReader& br, int32_t& k) {
-    if (br.err == 0 && br.bits_left >= 2) {
+    if (br.err == 0 && br.bits_left >= 2) [[likely]] {
         const uint32_t top2 = static_cast<uint32_t>(br.word >> (br.bits_left - 2)) & 3u;
-        if ((top2 & 2u) == 0u) {
+        if ((top2 & 2u) == 0u) [[likely]] {
             --br.bits_left;
             return;
         }
@@ -540,9 +560,9 @@ inline void update_k(WordBitReader& br, int32_t& k) {
             return;
         }
         const int32_t max_z = k - 1;
-        if (br.bits_left >= max_z) {
+        if (br.bits_left >= max_z) [[likely]] {
             const uint64_t top_aligned = (br.bits_left == 64) ? br.word : (br.word << (64 - br.bits_left));
-            const int32_t lz = (top_aligned != 0ULL) ? clz64_nz(top_aligned) : 64;
+            const int32_t lz = static_cast<int32_t>(std::countl_zero(top_aligned));
             if (lz >= max_z) {
                 br.bits_left -= max_z;
                 k = 0;
@@ -554,7 +574,7 @@ inline void update_k(WordBitReader& br, int32_t& k) {
         }
         for (int32_t z = 0; z < max_z; ++z) {
             const uint32_t b = br.read_bit();
-            if (br.err != 0) {
+            if (br.err != 0) [[unlikely]] {
                 k = 0;
                 return;
             }
@@ -572,7 +592,7 @@ inline void update_k(WordBitReader& br, int32_t& k) {
         return;
     }
     const uint32_t second = br.read_bit();
-    if (br.err != 0) {
+    if (br.err != 0) [[unlikely]] {
         return;
     }
     if (second == 0u) {
@@ -586,7 +606,7 @@ inline void update_k(WordBitReader& br, int32_t& k) {
     }
     for (int32_t z = 0; z < k - 1; ++z) {
         const uint32_t b = br.read_bit();
-        if (br.err != 0) {
+        if (br.err != 0) [[unlikely]] {
             k = 0;
             return;
         }
@@ -633,30 +653,45 @@ void decode_subband_row(
     for (int32_t q = 0; q < num_quads; ++q) {
         if (k == 0) {
             const int32_t rem = num_quads - q;
-            if (rem < 2) {
+            if (rem < 2) [[unlikely]] {
                 std::memset(out_coeffs + static_cast<size_t>(q) * 4u, 0,
                             static_cast<size_t>(rem) * 4u * sizeof(OutT));
                 return;
             }
             int32_t z = 0;
             int32_t base = 1;
-            for (;;) {
-                const uint32_t b = br.read_bit();
-                if (b != 0u) {
-                    break;
+            const int32_t max_z = static_cast<int32_t>(std::bit_width(static_cast<uint32_t>(rem - 1)));
+            if (br.err == 0 && br.bits_left >= max_z) [[likely]] {
+                const uint64_t top_aligned = (br.bits_left == 64) ? br.word : (br.word << (64 - br.bits_left));
+                const int32_t lz = static_cast<int32_t>(std::countl_zero(top_aligned));
+                if (lz >= max_z) {
+                    br.bits_left -= max_z;
+                    std::memset(out_coeffs + static_cast<size_t>(q) * 4u, 0,
+                                static_cast<size_t>(rem) * 4u * sizeof(OutT));
+                    return;
                 }
-                ++z;
-                base = 1 << z;
+                br.bits_left -= (lz + 1);
+                z = lz;
+                base = 1 << lz;
+            } else {
+                for (;;) {
+                    const uint32_t b = br.read_bit();
+                    if (b != 0u) {
+                        break;
+                    }
+                    ++z;
+                    base = 1 << z;
+                    if (base >= rem) {
+                        std::memset(out_coeffs + static_cast<size_t>(q) * 4u, 0,
+                                    static_cast<size_t>(rem) * 4u * sizeof(OutT));
+                        return;
+                    }
+                }
                 if (base >= rem) {
                     std::memset(out_coeffs + static_cast<size_t>(q) * 4u, 0,
                                 static_cast<size_t>(rem) * 4u * sizeof(OutT));
                     return;
                 }
-            }
-            if (base >= rem) {
-                std::memset(out_coeffs + static_cast<size_t>(q) * 4u, 0,
-                            static_cast<size_t>(rem) * 4u * sizeof(OutT));
-                return;
             }
             const uint32_t suffix = br.read_bits(z);
             const int32_t run = base + static_cast<int32_t>(suffix);
@@ -671,7 +706,7 @@ void decode_subband_row(
 
             const int32_t zk = br.read_unary_zeros();
             k = zk + 1;
-            if (br.err != 0 || k > 19) {
+            if (br.err != 0 || k > 19) [[unlikely]] {
                 const int32_t left = num_quads - q;
                 std::memset(out_coeffs + static_cast<size_t>(q) * 4u, 0,
                             static_cast<size_t>(left) * 4u * sizeof(OutT));
@@ -681,7 +716,7 @@ void decode_subband_row(
 
         uint32_t m0, m1, m2, m3;
         const int32_t k4 = k * 4;
-        if (br.err == 0 && br.bits_left >= k4) {
+        if (br.err == 0 && br.bits_left >= k4) [[likely]] {
             int32_t bl = br.bits_left - k;
             const uint64_t mask = (1ULL << k) - 1ULL;
             const uint64_t w = br.word;
@@ -702,42 +737,46 @@ void decode_subband_row(
 
         uint32_t mag0 = m0, mag1 = m1, mag2 = m2, mag3 = m3;
         if (has_shift) {
-            if (m0 != 0u) mag0 = (((m0 << 1) | 1u) << shift_m1) - (m0 & 1u);
-            if (m1 != 0u) mag1 = (((m1 << 1) | 1u) << shift_m1) - (m1 & 1u);
-            if (m2 != 0u) mag2 = (((m2 << 1) | 1u) << shift_m1) - (m2 & 1u);
-            if (m3 != 0u) mag3 = (((m3 << 1) | 1u) << shift_m1) - (m3 & 1u);
+            const uint32_t nz0 = (m0 != 0u) ? 1u : 0u;
+            const uint32_t nz1 = (m1 != 0u) ? 1u : 0u;
+            const uint32_t nz2 = (m2 != 0u) ? 1u : 0u;
+            const uint32_t nz3 = (m3 != 0u) ? 1u : 0u;
+            mag0 = ((((m0 << 1) | 1u) << shift_m1) - (m0 & 1u)) & (0u - nz0);
+            mag1 = ((((m1 << 1) | 1u) << shift_m1) - (m1 & 1u)) & (0u - nz1);
+            mag2 = ((((m2 << 1) | 1u) << shift_m1) - (m2 & 1u)) & (0u - nz2);
+            mag3 = ((((m3 << 1) | 1u) << shift_m1) - (m3 & 1u)) & (0u - nz3);
         }
 
         // Update predictor state before reading sign bits of the current quad.
-        if (q < num_quads - 1) {
+        if (q < num_quads - 1) [[likely]] {
             update_k(br, k);
-            if (k < 0 || k > 19) {
+            if (k < 0 || k > 19) [[unlikely]] {
                 br.err = 2;
             }
         }
 
         OutT* const dst = out_coeffs + static_cast<size_t>(q) * 4u;
-        const uint32_t mags[4] = {mag0, mag1, mag2, mag3};
-        if ((mag0 | mag1 | mag2 | mag3) == 0u) {
+        const uint32_t nzmask =
+            (mag0 != 0u ? 1u : 0u) |
+            (mag1 != 0u ? 2u : 0u) |
+            (mag2 != 0u ? 4u : 0u) |
+            (mag3 != 0u ? 8u : 0u);
+        if (nzmask == 0u) {
             dst[0] = 0;
             dst[1] = 0;
             dst[2] = 0;
             dst[3] = 0;
-        } else if (br.err == 0 && br.bits_left >= 4) {
-            int32_t bl = br.bits_left;
-            const uint64_t w = br.word;
-            for (int i = 0; i < 4; ++i) {
-                const uint32_t mg = mags[i];
-                if (mg > 0u) {
-                    --bl;
-                    const uint32_t sgn = static_cast<uint32_t>((w >> bl) & 1ULL);
-                    store_coeff_val(dst[i], sgn ? (0u - mg) : mg);
-                } else {
-                    dst[i] = 0;
-                }
-            }
-            br.bits_left = bl;
+        } else if (br.err == 0 && br.bits_left >= 4) [[likely]] {
+            const int32_t nz_cnt = std::popcount(nzmask);
+            const uint32_t s_nib = static_cast<uint32_t>((br.word >> (br.bits_left - 4)) & 15ULL);
+            br.bits_left -= nz_cnt;
+            const uint8_t neg = detail::kSignExpandTable.mask[nzmask][s_nib];
+            store_coeff_val(dst[0], (neg & 1u) ? (0u - mag0) : mag0);
+            store_coeff_val(dst[1], (neg & 2u) ? (0u - mag1) : mag1);
+            store_coeff_val(dst[2], (neg & 4u) ? (0u - mag2) : mag2);
+            store_coeff_val(dst[3], (neg & 8u) ? (0u - mag3) : mag3);
         } else {
+            const uint32_t mags[4] = {mag0, mag1, mag2, mag3};
             for (int i = 0; i < 4; ++i) {
                 const uint32_t mg = mags[i];
                 if (mg > 0u) {
@@ -748,7 +787,7 @@ void decode_subband_row(
                 }
             }
         }
-        if (br.err != 0) {
+        if (br.err != 0) [[unlikely]] {
             const int32_t left = num_quads - q - 1;
             if (left > 0) {
                 std::memset(dst + 4, 0, static_cast<size_t>(left) * 4u * sizeof(OutT));
@@ -1489,7 +1528,7 @@ void idwt_2d_level_fallback(
     }
 }
 
-struct Arw6WorkerWork {
+struct alignas(128) Arw6WorkerWork {
     std::vector<int32_t> dpcm_row;
     std::vector<int16_t> ev0;
     std::vector<int16_t> ev1;
@@ -1497,6 +1536,8 @@ struct Arw6WorkerWork {
     std::vector<int16_t> horiz_even;
     std::vector<int16_t> g0_a;
     std::vector<int16_t> g0_b;
+    std::vector<uint16_t> crop_ev;
+    std::vector<uint16_t> crop_od;
     WordBitReader br;
 
     void ensure_idwt_row_cap(int32_t w) {
@@ -1512,6 +1553,25 @@ struct Arw6WorkerWork {
         if (g0_a.size() < need) g0_a.resize(need);
         if (g0_b.size() < need) g0_b.resize(need);
     }
+
+    void ensure_crop_cap(uint32_t w_tile) {
+        const size_t need = static_cast<size_t>(w_tile);
+        if (crop_ev.size() < need) crop_ev.resize(need);
+        if (crop_od.size() < need) crop_od.resize(need);
+    }
+};
+
+struct DecodeTask {
+    uint8_t comp_idx = 0;
+    uint8_t res_idx = 0;
+    uint16_t chunk_idx = 0;
+    const ParsedResStream* stream = nullptr;
+};
+
+struct IdwtStripTask {
+    int comp_idx = 0;
+    int32_t y_beg = 0;
+    int32_t y_end = 0;
 };
 
 struct Arw6ArenaImpl {
@@ -1520,6 +1580,8 @@ struct Arw6ArenaImpl {
     std::array<std::vector<int16_t>, 3> idwt_pong;
     std::vector<int16_t> fallback_vert;
     std::array<std::array<ParsedResStream, 4>, 4> parsed_streams;
+    std::vector<DecodeTask> tasks;
+    std::vector<IdwtStripTask> idwt_tasks;
     std::vector<Arw6WorkerWork> workers;
 
     void ensure_workers(int n) {
@@ -1703,13 +1765,13 @@ NIJIN_NOINLINE NIJIN_TARGET_AVX2 void reconstruct_bayer_row_avx2(
         const __m256i ur = _mm256_min_epi16(_mm256_max_epi16(_mm256_adds_epi16(g_avg, _mm256_adds_epi16(rc_v, rc_v)), zero_v), max_v);
         const __m256i ub = _mm256_min_epi16(_mm256_max_epi16(_mm256_adds_epi16(g_avg, _mm256_adds_epi16(bc_v, bc_v)), zero_v), max_v);
 
-        int16_t idx_r[16], idx_g0[16], idx_g1[16], idx_b[16];
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(idx_r), ur);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(idx_g0), ug0);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(idx_g1), ug1);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(idx_b), ub);
+        alignas(32) int16_t idx_r[16], idx_g0[16], idx_g1[16], idx_b[16];
+        _mm256_store_si256(reinterpret_cast<__m256i*>(idx_r), ur);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(idx_g0), ug0);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(idx_g1), ug1);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(idx_b), ub);
 
-        uint16_t vr[16], vg0[16], vg1[16], vb[16];
+        alignas(32) uint16_t vr[16], vg0[16], vg1[16], vb[16];
         for (int i = 0; i < 16; ++i) {
             vr[i]  = lut14[idx_r[i]];
             vg0[i] = lut14[idx_g0[i]];
@@ -1717,10 +1779,10 @@ NIJIN_NOINLINE NIJIN_TARGET_AVX2 void reconstruct_bayer_row_avx2(
             vb[i]  = lut14[idx_b[i]];
         }
 
-        const __m256i r_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(vr));
-        const __m256i g0_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(vg0));
-        const __m256i g1_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(vg1));
-        const __m256i b_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(vb));
+        const __m256i r_v = _mm256_load_si256(reinterpret_cast<const __m256i*>(vr));
+        const __m256i g0_v = _mm256_load_si256(reinterpret_cast<const __m256i*>(vg0));
+        const __m256i g1_v = _mm256_load_si256(reinterpret_cast<const __m256i*>(vg1));
+        const __m256i b_v = _mm256_load_si256(reinterpret_cast<const __m256i*>(vb));
 
         const __m256i ev_lo = _mm256_unpacklo_epi16(r_v, g0_v);
         const __m256i ev_hi = _mm256_unpackhi_epi16(r_v, g0_v);
@@ -1989,23 +2051,23 @@ inline void reconstruct_bayer_row(
             const __m128i ur = _mm_min_epi16(_mm_max_epi16(_mm_adds_epi16(g_avg, _mm_adds_epi16(rc_v, rc_v)), zero_v), max_v);
             const __m128i ub = _mm_min_epi16(_mm_max_epi16(_mm_adds_epi16(g_avg, _mm_adds_epi16(bc_v, bc_v)), zero_v), max_v);
 
-            int16_t idx_r[8], idx_g0[8], idx_g1[8], idx_b[8];
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(idx_r), ur);
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(idx_g0), ug0);
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(idx_g1), ug1);
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(idx_b), ub);
+            alignas(16) int16_t idx_r[8], idx_g0[8], idx_g1[8], idx_b[8];
+            _mm_store_si128(reinterpret_cast<__m128i*>(idx_r), ur);
+            _mm_store_si128(reinterpret_cast<__m128i*>(idx_g0), ug0);
+            _mm_store_si128(reinterpret_cast<__m128i*>(idx_g1), ug1);
+            _mm_store_si128(reinterpret_cast<__m128i*>(idx_b), ub);
 
-            uint16_t vr[8], vg0[8], vg1[8], vb[8];
+            alignas(16) uint16_t vr[8], vg0[8], vg1[8], vb[8];
             for (int i = 0; i < 8; ++i) {
                 vr[i]  = lut14[idx_r[i]];
                 vg0[i] = lut14[idx_g0[i]];
                 vg1[i] = lut14[idx_g1[i]];
                 vb[i]  = lut14[idx_b[i]];
             }
-            const __m128i r_v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(vr));
-            const __m128i g0_v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(vg0));
-            const __m128i g1_v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(vg1));
-            const __m128i b_v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(vb));
+            const __m128i r_v = _mm_load_si128(reinterpret_cast<const __m128i*>(vr));
+            const __m128i g0_v = _mm_load_si128(reinterpret_cast<const __m128i*>(vg0));
+            const __m128i g1_v = _mm_load_si128(reinterpret_cast<const __m128i*>(vg1));
+            const __m128i b_v = _mm_load_si128(reinterpret_cast<const __m128i*>(vb));
 
             _mm_storeu_si128(reinterpret_cast<__m128i*>(dst0 + 2u * c), _mm_unpacklo_epi16(r_v, g0_v));
             _mm_storeu_si128(reinterpret_cast<__m128i*>(dst0 + 2u * c + 8u), _mm_unpackhi_epi16(r_v, g0_v));
@@ -2183,7 +2245,11 @@ struct Arw6QuantAccum {
         }
 
         const uint16_t* const lut14 = get_arw6_nlt_lut14();
-        detail::compute_dadu_du_raw_from_lut(lut14, 4096, 4, raw_white, out.nlt_dadu_du_raw);
+        if (raw_white == 16383u) {
+            std::memcpy(out.nlt_dadu_du_raw, kArw6DefaultDaduDuRaw.data(), sizeof(out.nlt_dadu_du_raw));
+        } else {
+            detail::compute_dadu_du_raw_from_lut(lut14, 4096, 4, raw_white, out.nlt_dadu_du_raw);
+        }
         detail::finalize_quant_profile_stats(out);
         detail::normalize_spectra(luma_scale, chroma_scale, luma_w16, chroma_w16, out);
         recalibrate_quant_profile_range(out, 0.0f, static_cast<float>(raw_white));
@@ -2204,8 +2270,9 @@ bool decode_arw6_codestream_internal(
     std::string& err,
     detail::WorkerPool* external_pool,
     Arw6ArenaImpl* external_arena,
-    Arw6QuantAccum* quant_accum = nullptr) {
-    if (!probe_arw6_codestream(cs, cs_len, info, err)) {
+    Arw6QuantAccum* quant_accum = nullptr,
+    const detail::CropRect* crop = nullptr) {
+    if (!probe_arw6_codestream(cs, cs_len, info, err)) [[unlikely]] {
         return false;
     }
     const uint32_t w = info.width;
@@ -2213,13 +2280,23 @@ bool decode_arw6_codestream_internal(
     const uint32_t w_comp = w >> 1;
     const uint32_t h_half = h >> 1;
 
-    if (tile_x + w > full_w || tile_y + h > full_h) {
+    if (tile_x + w > full_w || tile_y + h > full_h) [[unlikely]] {
         err = "ARW6 tile rectangle exceeds target image dimensions";
         return false;
     }
 
+    const bool has_crop = (crop != nullptr && crop->enabled);
+    const uint32_t ov_x0 = has_crop ? std::max(tile_x, crop->x) : tile_x;
+    const uint32_t ov_x1 = has_crop ? std::min(tile_x + w, crop->x + crop->w) : (tile_x + w);
+    const uint32_t ov_y0 = has_crop ? std::max(tile_y, crop->y) : tile_y;
+    const uint32_t ov_y1 = has_crop ? std::min(tile_y + h, crop->y + crop->h) : (tile_y + h);
+    const bool has_overlap = (ov_x0 < ov_x1) && (ov_y0 < ov_y1);
+    if (has_crop && !has_overlap && quant_accum == nullptr) {
+        return true;
+    }
+
     std::array<StreamSlice, 4> comp_res_slices[4];
-    if (!parse_subband_offset_table(cs, cs_len, comp_res_slices, err)) {
+    if (!parse_subband_offset_table(cs, cs_len, comp_res_slices, err)) [[unlikely]] {
         return false;
     }
 
@@ -2233,26 +2310,22 @@ bool decode_arw6_codestream_internal(
     build_component_geometry(w_comp, h_half, info.decomp_levels, info.decomp_levels, comps[2]);
     build_component_geometry(w_comp, h_half, info.decomp_levels, 0, comps[3]);
 
-    struct DecodeTask {
-        uint8_t comp_idx = 0;
-        uint8_t res_idx = 0;
-        uint16_t chunk_idx = 0;
-        const ParsedResStream* stream = nullptr;
-    };
-
     std::array<std::array<ParsedResStream, 4>, 4>& parsed_streams = arena.parsed_streams;
-    std::vector<DecodeTask> tasks;
-    tasks.reserve(3500u);
+    std::vector<DecodeTask>& tasks = arena.tasks;
+    tasks.clear();
+    if (tasks.capacity() < 3500u) {
+        tasks.reserve(3500u);
+    }
     for (int c = 0; c < 4; ++c) {
         const int max_r = (c == 3) ? 0 : 3;
         for (int r = 0; r <= max_r; ++r) {
             const StreamSlice& sl = comp_res_slices[c][r];
-            if (static_cast<uint64_t>(sl.offset) + sl.size > cs_len) {
+            if (static_cast<uint64_t>(sl.offset) + sl.size > cs_len) [[unlikely]] {
                 err = "ARW6 resolution stream exceeds codestream bounds";
                 return false;
             }
             const int32_t expected_nb = (r == 0) ? 1 : 3;
-            if (!parse_chunk_directory(cs + sl.offset, sl.size, expected_nb, parsed_streams[c][r], err)) {
+            if (!parse_chunk_directory(cs + sl.offset, sl.size, expected_nb, parsed_streams[c][r], err)) [[unlikely]] {
                 return false;
             }
             const ParsedResStream& prs = parsed_streams[c][r];
@@ -2292,6 +2365,9 @@ bool decode_arw6_codestream_internal(
 
     if (quant_accum != nullptr) {
         quant_accum->accumulate_tile(tile_x, tile_y, w, h, info, comps, parsed_streams);
+    }
+    if (!has_overlap) {
+        return true;
     }
 
     int workers = detail::resolve_worker_count(num_threads);
@@ -2334,13 +2410,9 @@ bool decode_arw6_codestream_internal(
     };
 
     const int32_t max_res = info.decomp_levels;
+    std::vector<IdwtStripTask>& idwt_tasks = arena.idwt_tasks;
     for (int32_t r = 1; r <= max_res; ++r) {
-        struct IdwtStripTask {
-            int comp_idx = 0;
-            int32_t y_beg = 0;
-            int32_t y_end = 0;
-        };
-        std::vector<IdwtStripTask> idwt_tasks;
+        idwt_tasks.clear();
         for (int c = 0; c < 3; ++c) {
             const ResolutionBox& rb = comps[c].res[r];
             const size_t plane_elems = static_cast<size_t>(rb.w) * static_cast<size_t>(rb.h);
@@ -2396,7 +2468,7 @@ bool decode_arw6_codestream_internal(
     if (arena.idwt_ping[0].size() != expected_comp_sz ||
         arena.idwt_ping[1].size() != expected_comp_sz ||
         arena.idwt_ping[2].size() != expected_comp_sz ||
-        gh_sb.data.size() != expected_comp_sz) {
+        gh_sb.data.size() != expected_comp_sz) [[unlikely]] {
         err = "Internal ARW6 decoded component dimension mismatch";
         return false;
     }
@@ -2406,15 +2478,28 @@ bool decode_arw6_codestream_internal(
     const int16_t* const bp_ptr = arena.idwt_ping[2].data();
     const int16_t* const gh_ptr = gh_sb.data.data();
 
-    // Stage 3: Fused strip-ring Quincunx diamond green synthesis + pre-shifted NLT LUT + NEON RGGB output.
+    // Stage 3: Fused strip-ring Quincunx diamond green synthesis + pre-shifted NLT LUT + SIMD RGGB output.
     const int32_t nlt_bits = info.internal_depth; // 12
     const uint16_t* const lut14 = get_arw6_nlt_lut14();
 
-    auto run_quincunx_strip = [&](size_t r0_s, size_t r1_s, int worker_idx) {
-        const uint32_t r0 = static_cast<uint32_t>(r0_s);
-        const uint32_t r1 = static_cast<uint32_t>(r1_s);
+    const uint32_t q_beg = has_crop ? ((ov_y0 - tile_y) >> 1) : 0u;
+    const uint32_t q_end = has_crop
+        ? std::min<uint32_t>(h_half, (ov_y1 - tile_y + 1u) >> 1)
+        : h_half;
+    const uint32_t dst_x0 = has_crop ? crop->x : 0u;
+    const uint32_t dst_y0 = has_crop ? crop->y : 0u;
+    const bool full_tile_x = (!has_crop) || (ov_x0 == tile_x && ov_x1 == tile_x + w);
+    const size_t copy_x_off = static_cast<size_t>(ov_x0 - tile_x);
+    const size_t copy_bytes = static_cast<size_t>(ov_x1 - ov_x0) * sizeof(uint16_t);
+
+    auto run_quincunx_strip = [&](size_t r0_rel, size_t r1_rel, int worker_idx) {
+        const uint32_t r0 = q_beg + static_cast<uint32_t>(r0_rel);
+        const uint32_t r1 = q_beg + static_cast<uint32_t>(r1_rel);
         Arw6WorkerWork& ww = arena.workers[static_cast<size_t>(worker_idx)];
         ww.ensure_g0_cap(w_comp);
+        if (has_crop) {
+            ww.ensure_crop_cap(w);
+        }
         int16_t* e_curr = ww.g0_a.data();
         int16_t* e_next = ww.g0_b.data();
 
@@ -2435,11 +2520,31 @@ bool decode_arw6_codestream_internal(
             }
 
             const size_t row_off = static_cast<size_t>(r) * w_comp;
-            uint16_t* const dst0 = dst_base + static_cast<size_t>(tile_y + r * 2u) * dst_stride_u16 + tile_x;
-            uint16_t* const dst1 = dst_base + static_cast<size_t>(tile_y + r * 2u + 1u) * dst_stride_u16 + tile_x;
+            const uint32_t by_ev = tile_y + r * 2u;
+            const uint32_t by_od = by_ev + 1u;
+            const bool direct_row = (!has_crop) ||
+                (full_tile_x && by_ev >= ov_y0 && by_od < ov_y1);
+            uint16_t* const dst0 = direct_row
+                ? (dst_base + static_cast<size_t>(by_ev - dst_y0) * dst_stride_u16 + (tile_x - dst_x0))
+                : ww.crop_ev.data();
+            uint16_t* const dst1 = direct_row
+                ? (dst0 + dst_stride_u16)
+                : ww.crop_od.data();
             reconstruct_bayer_row(
                 e_curr, e_next_ptr, gh_ptr + row_off, rp_ptr + row_off, bp_ptr + row_off,
                 dst0, dst1, w_comp, nlt_bits, lut14);
+            if (!direct_row) {
+                if (by_ev >= ov_y0 && by_ev < ov_y1) {
+                    std::memcpy(
+                        dst_base + static_cast<size_t>(by_ev - dst_y0) * dst_stride_u16 + (ov_x0 - dst_x0),
+                        dst0 + copy_x_off, copy_bytes);
+                }
+                if (by_od >= ov_y0 && by_od < ov_y1) {
+                    std::memcpy(
+                        dst_base + static_cast<size_t>(by_od - dst_y0) * dst_stride_u16 + (ov_x0 - dst_x0),
+                        dst1 + copy_x_off, copy_bytes);
+                }
+            }
 
             if (r + 1u < h_half) {
                 std::swap(e_curr, e_next);
@@ -2447,7 +2552,9 @@ bool decode_arw6_codestream_internal(
         }
     };
 
-    pool.parallel_strips(h_half, 32u, workers, run_quincunx_strip);
+    if (q_beg < q_end) {
+        pool.parallel_strips(q_end - q_beg, 32u, workers, run_quincunx_strip);
+    }
     return true;
 }
 
@@ -2513,8 +2620,7 @@ bool probe_arw6_strip(
     }
     uint64_t min_rel = 8ULL + tile_cnt * 24ULL;
     std::vector<Arw6TileInfo> tiles(static_cast<size_t>(tile_cnt));
-    std::vector<uint64_t> sorted_offs;
-    sorted_offs.reserve(static_cast<size_t>(tile_cnt));
+    uint64_t sorted_offs[4] = {};
 
     uint32_t full_w = 0;
     uint32_t full_h = 0;
@@ -2527,22 +2633,23 @@ bool probe_arw6_strip(
         ti.width = rd_le32(td + 16);
         ti.height = rd_le32(td + 20);
         if (ti.rel_offset < min_rel || ti.rel_offset + 16 > strip_len ||
-            ti.width < 2 || ti.height < 2 || (ti.width & 1u) != 0 || (ti.height & 1u) != 0) {
+            ti.width < 2 || ti.height < 2 || (ti.width & 1u) != 0 || (ti.height & 1u) != 0) [[unlikely]] {
             err = "Invalid ARW6 tile descriptor at index " + std::to_string(i);
             return false;
         }
-        if ((ti.x & 1u) != 0 || (ti.y & 1u) != 0) {
+        if ((ti.x & 1u) != 0 || (ti.y & 1u) != 0) [[unlikely]] {
             err = "ARW6 tile origin must align to 2x2 CFA grid";
             return false;
         }
-        sorted_offs.push_back(ti.rel_offset);
+        sorted_offs[i] = ti.rel_offset;
         full_w = std::max(full_w, ti.x + ti.width);
         full_h = std::max(full_h, ti.y + ti.height);
     }
 
-    std::sort(sorted_offs.begin(), sorted_offs.end());
-    for (size_t i = 1; i < sorted_offs.size(); ++i) {
-        if (sorted_offs[i] <= sorted_offs[i - 1]) {
+    const size_t n_tiles = static_cast<size_t>(tile_cnt);
+    std::sort(sorted_offs, sorted_offs + n_tiles);
+    for (size_t i = 1; i < n_tiles; ++i) {
+        if (sorted_offs[i] <= sorted_offs[i - 1]) [[unlikely]] {
             err = "Duplicate ARW6 tile offsets";
             return false;
         }
@@ -2550,8 +2657,8 @@ bool probe_arw6_strip(
 
     for (size_t i = 0; i < tiles.size(); ++i) {
         uint64_t end_off = strip_len;
-        auto it = std::upper_bound(sorted_offs.begin(), sorted_offs.end(), tiles[i].rel_offset);
-        if (it != sorted_offs.end()) {
+        const uint64_t* it = std::upper_bound(sorted_offs, sorted_offs + n_tiles, tiles[i].rel_offset);
+        if (it != sorted_offs + n_tiles) {
             end_off = *it;
         }
         tiles[i].data_size = static_cast<uint32_t>(end_off - tiles[i].rel_offset);
@@ -2600,18 +2707,30 @@ bool decode_arw6_tile_strided(
     std::string& err,
     WorkerPool* external_pool,
     Arw6Arena* external_arena,
-    WaveletQuantProfile* quant_out) {
-    if (!cs_data || cs_len < 16) {
+    WaveletQuantProfile* quant_out,
+    const CropRect* crop) {
+    if (!cs_data || cs_len < 16) [[unlikely]] {
         err = "Empty ARW6 tile codestream";
         return false;
     }
     Arw6Info probed;
-    if (!probe_arw6_codestream(cs_data, cs_len, probed, err)) {
+    if (!probe_arw6_codestream(cs_data, cs_len, probed, err)) [[unlikely]] {
         return false;
     }
     const uint32_t tw = (full_w == 0) ? probed.width : full_w;
     const uint32_t th = (full_h == 0) ? probed.height : full_h;
-    if (!dst || dst_stride_u16 < tw || dst_height_capacity < th) {
+    const bool has_crop = (crop != nullptr && crop->enabled);
+    if (has_crop) {
+        if (crop->w == 0u || crop->h == 0u ||
+            crop->x > tw || crop->w > tw - crop->x ||
+            crop->y > th || crop->h > th - crop->y) [[unlikely]] {
+            err = "Crop region out of bounds for ARW6 tile";
+            return false;
+        }
+    }
+    const size_t req_w = has_crop ? static_cast<size_t>(crop->w) : static_cast<size_t>(tw);
+    const size_t req_h = has_crop ? static_cast<size_t>(crop->h) : static_cast<size_t>(th);
+    if (!dst || dst_stride_u16 < req_w || dst_height_capacity < req_h) [[unlikely]] {
         err = "Destination Bayer buffer too small for ARW6 tile";
         return false;
     }
@@ -2623,7 +2742,7 @@ bool decode_arw6_tile_strided(
             cs_data, cs_len, num_threads, tile_x, tile_y, tw, th,
             dst, dst_stride_u16, tile_info_out, err,
             external_pool, reinterpret_cast<Arw6ArenaImpl*>(external_arena),
-            quant_out ? &qacc : nullptr)) {
+            quant_out ? &qacc : nullptr, crop)) {
         return false;
     }
     if (quant_out != nullptr) {
@@ -2643,11 +2762,23 @@ bool decode_arw6_bayer_strided(
     std::string& err,
     WorkerPool* external_pool,
     Arw6Arena* external_arena,
-    WaveletQuantProfile* quant_out) {
-    if (!probe_arw6_strip(strip_data, strip_len, info_out, err)) {
+    WaveletQuantProfile* quant_out,
+    const CropRect* crop) {
+    if (!probe_arw6_strip(strip_data, strip_len, info_out, err)) [[unlikely]] {
         return false;
     }
-    if (!dst || dst_stride_u16 < info_out.width || dst_height_capacity < info_out.height) {
+    const bool has_crop = (crop != nullptr && crop->enabled);
+    if (has_crop) {
+        if (crop->w == 0u || crop->h == 0u ||
+            crop->x > info_out.width || crop->w > info_out.width - crop->x ||
+            crop->y > info_out.height || crop->h > info_out.height - crop->y) [[unlikely]] {
+            err = "Crop region out of bounds for ARW6 frame";
+            return false;
+        }
+    }
+    const uint32_t req_w = has_crop ? crop->w : info_out.width;
+    const uint32_t req_h = has_crop ? crop->h : info_out.height;
+    if (!dst || dst_stride_u16 < req_w || dst_height_capacity < req_h) [[unlikely]] {
         err = "Destination Bayer buffer too small for ARW6 frame";
         return false;
     }
@@ -2676,9 +2807,9 @@ bool decode_arw6_bayer_strided(
         clean_partition = clean_partition && (area_sum == total_px);
     }
     if (!clean_partition) {
-        for (uint32_t r = 0; r < info_out.height; ++r) {
+        for (uint32_t r = 0; r < req_h; ++r) {
             std::memset(dst + static_cast<size_t>(r) * dst_stride_u16, 0,
-                        static_cast<size_t>(info_out.width) * sizeof(uint16_t));
+                        static_cast<size_t>(req_w) * sizeof(uint16_t));
         }
     }
     Arw6QuantAccum qacc;
@@ -2693,7 +2824,7 @@ bool decode_arw6_bayer_strided(
                 strip_data + ti.rel_offset, ti.data_size, num_threads,
                 ti.x, ti.y, info_out.width, info_out.height,
                 dst, dst_stride_u16, tinfo, err, external_pool, arena_ptr,
-                quant_out ? &qacc : nullptr)) {
+                quant_out ? &qacc : nullptr, crop)) {
             return false;
         }
     }

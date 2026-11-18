@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Clean-room C++17 TicoRAW / JPEG XS R0 Bayer decoder for nijinWVDC.
+// Clean-room C++20 TicoRAW / JPEG XS R0 Bayer decoder for nijinWVDC.
 // Implements ISO/IEC 21122-1 / R0 Bayer extensions (CAP, PIH, CDT, WGT, SLH,
 // bounded GCLI prediction, uniform dequantization, 5/3 IDWT, Star-Tetrix RCT,
 // and piecewise Fliproot NLT inverse LUT) with zero external dependencies.
@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -41,7 +42,9 @@ constexpr uint32_t kUniformDqMul[15] = {
 };
 
 inline uint16_t rd_be16(const uint8_t* p) {
-    return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
+    uint16_t v = 0;
+    std::memcpy(&v, p, sizeof(v));
+    return detail::bswap16(v);
 }
 
 inline uint32_t rd_be24(const uint8_t* p) {
@@ -51,10 +54,9 @@ inline uint32_t rd_be24(const uint8_t* p) {
 }
 
 inline uint32_t rd_be32(const uint8_t* p) {
-    return (static_cast<uint32_t>(p[0]) << 24) |
-           (static_cast<uint32_t>(p[1]) << 16) |
-           (static_cast<uint32_t>(p[2]) << 8) |
-           static_cast<uint32_t>(p[3]);
+    uint32_t v = 0;
+    std::memcpy(&v, p, sizeof(v));
+    return detail::bswap32(v);
 }
 
 inline int32_t clamp_i32(int32_t x, int32_t lo, int32_t hi) {
@@ -62,55 +64,11 @@ inline int32_t clamp_i32(int32_t x, int32_t lo, int32_t hi) {
 }
 
 inline int32_t asr_s32(int32_t x, unsigned shift) {
-#if defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER)
     return x >> shift;
-#else
-    if (shift == 0u) {
-        return x;
-    }
-    if (x < 0) {
-        return ~((~x) >> shift);
-    }
-    return x >> shift;
-#endif
 }
 
 inline int count_leading_ones_64(uint64_t w) {
-    const uint64_t inv = ~w;
-    return (inv == 0ULL) ? 64 : clz64_nz(inv);
-}
-
-inline int popcount4(uint32_t mask) {
-    static const uint8_t kPop4[16] = {0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4};
-    return kPop4[mask & 15u];
-}
-
-// Lookup mapping [nzmask (0..15)][s_nib (0..15)] -> 4-bit negative lane mask.
-struct SignExpandTable {
-    uint8_t mask[16][16];
-};
-
-const SignExpandTable& get_sign_expand_table() {
-    static const SignExpandTable tbl = []() {
-        SignExpandTable t{};
-        for (int nz = 0; nz < 16; ++nz) {
-            for (int sn = 0; sn < 16; ++sn) {
-                int sbit = 3;
-                uint8_t out = 0;
-                for (int lane = 0; lane < 4; ++lane) {
-                    if ((nz >> lane) & 1) {
-                        if ((sn >> sbit) & 1) {
-                            out = static_cast<uint8_t>(out | (1u << lane));
-                        }
-                        --sbit;
-                    }
-                }
-                t.mask[nz][sn] = out;
-            }
-        }
-        return t;
-    }();
-    return tbl;
+    return std::countl_one(w);
 }
 
 // Bounds-safe 64-bit MSB-first window peek starting at bit `bit_pos` inside `buf[0..byte_len)`.
@@ -118,13 +76,13 @@ const SignExpandTable& get_sign_expand_table() {
 inline uint64_t peek64z(const uint8_t* buf, size_t byte_len, size_t bit_pos) {
     const size_t byte_idx = bit_pos >> 3;
     const unsigned shift = static_cast<unsigned>(bit_pos & 7u);
-    if (shift == 0u && byte_idx + 8u <= byte_len) {
-        return rd_be64_fast(buf + byte_idx);
-    }
-    if (byte_idx + 9u <= byte_len) {
+    if (byte_idx + 9u <= byte_len) [[likely]] {
         const uint64_t hi = rd_be64_fast(buf + byte_idx);
         const uint64_t lo = buf[byte_idx + 8u];
         return (hi << shift) | (lo >> (8u - shift));
+    }
+    if (shift == 0u && byte_idx + 8u <= byte_len) {
+        return rd_be64_fast(buf + byte_idx);
     }
     uint64_t hi = 0ULL;
     uint64_t lo = 0ULL;
@@ -224,6 +182,73 @@ struct SegmentDesc {
     int pv_ofs_grp = 0;
 };
 
+struct TicoStaticTopology {
+    struct FixedSeg {
+        uint8_t seg_id = 0;
+        uint8_t pkt_idx = 0;
+        uint8_t sb_id = 0;
+        uint8_t pv_seg = 0;
+        uint8_t comp = 0;
+        uint8_t v_lvl = 0;
+        uint8_t h_lvl = 0;
+    };
+    FixedSeg segs[kNumSegments] = {};
+    int pkt_seg_ids[kNumPackets][8] = {};
+    int pkt_seg_count[kNumPackets] = {};
+    int comp_v0_seg[3][6] = {};
+    int comp_v1_seg[3][2] = {};
+    int sp_sb_order[kNumSubbands] = {};
+};
+
+consteval TicoStaticTopology make_tico_topology() noexcept {
+    TicoStaticTopology top{};
+    int nb_seg = 0;
+    int nb_pkt = 0;
+    int num_sb = 0;
+    for (int vl = 0; vl < 2; ++vl) {
+        for (int c = 0; c < 4; ++c) {
+            const int h_max = (c == 2) ? 1 : ((vl == 0) ? 6 : 2);
+            for (int hl = 0; hl < h_max; ++hl) {
+                const int sb = (c == 2) ? (hl + 18 * c) : (hl + 6 * (vl + 3 * c));
+                int pv = nb_seg;
+                if (c == 2) {
+                    pv = (vl == 1) ? (nb_seg - 11) : (nb_seg + 11);
+                }
+                TicoStaticTopology::FixedSeg& fs = top.segs[nb_seg];
+                fs.seg_id = static_cast<uint8_t>(nb_seg);
+                fs.pkt_idx = static_cast<uint8_t>(nb_pkt);
+                fs.sb_id = static_cast<uint8_t>(sb);
+                fs.pv_seg = static_cast<uint8_t>(pv);
+                fs.comp = static_cast<uint8_t>(c);
+                fs.v_lvl = static_cast<uint8_t>(vl);
+                fs.h_lvl = static_cast<uint8_t>(hl);
+                top.pkt_seg_ids[nb_pkt][top.pkt_seg_count[nb_pkt]++] = nb_seg;
+                if (c != 2 || vl == 0) {
+                    top.sp_sb_order[num_sb++] = sb;
+                }
+                ++nb_seg;
+            }
+            ++nb_pkt;
+        }
+    }
+    constexpr int c_map[3] = {0, 1, 3};
+    for (int ci = 0; ci < 3; ++ci) {
+        for (int si = 0; si < kNumSegments; ++si) {
+            const TicoStaticTopology::FixedSeg& fs = top.segs[si];
+            if (fs.comp == c_map[ci]) {
+                if (fs.v_lvl == 0) {
+                    top.comp_v0_seg[ci][fs.h_lvl] = si;
+                } else {
+                    top.comp_v1_seg[ci][fs.h_lvl] = si;
+                }
+            }
+        }
+    }
+    return top;
+}
+
+inline constexpr TicoStaticTopology kTicoTopology = make_tico_topology();
+
 struct CodecGeometry {
     int full_w = 0;
     int full_h = 0;
@@ -267,67 +292,38 @@ struct CodecGeometry {
         v1_subband_len[1] = w_pix >> 1;
         v1_subband_len[0] = (w_pix + 1) >> 1;
 
-        for (int p = 0; p < kNumPackets; ++p) {
-            pkt_seg_count[p] = 0;
-        }
+        std::memcpy(pkt_seg_ids, kTicoTopology.pkt_seg_ids, sizeof(pkt_seg_ids));
+        std::memcpy(pkt_seg_count, kTicoTopology.pkt_seg_count, sizeof(pkt_seg_count));
+        std::memcpy(comp_v0_seg, kTicoTopology.comp_v0_seg, sizeof(comp_v0_seg));
+        std::memcpy(comp_v1_seg, kTicoTopology.comp_v1_seg, sizeof(comp_v1_seg));
+        std::memcpy(sp_sb_order, kTicoTopology.sp_sb_order, sizeof(sp_sb_order));
 
-        int nb_seg = 0;
-        int nb_pkt = 0;
-        int num_sb = 0;
         int ofs_grp = 0;
-
-        for (int vl = 0; vl < 2; ++vl) {
-            for (int c = 0; c < 4; ++c) {
-                const int h_max = (c == 2) ? 1 : ((vl == 0) ? 6 : 2);
-                for (int hl = 0; hl < h_max; ++hl) {
-                    const int sb = (c == 2) ? (hl + 18 * c) : (hl + 6 * (vl + 3 * c));
-                    const int wcoef = (c == 2) ? w_pix : ((vl == 0) ? v0_subband_len[hl] : v1_subband_len[hl]);
-                    const int wgrp = (wcoef + 3) >> 2;
-                    const int sgs = (wgrp + 7) >> 3;
-                    int pv = nb_seg;
-                    if (c == 2) {
-                        pv = (vl == 1) ? (nb_seg - 11) : (nb_seg + 11);
-                    }
-                    SegmentDesc& sd = segs[nb_seg];
-                    sd.seg_id = nb_seg;
-                    sd.pkt_idx = nb_pkt;
-                    sd.sb_id = sb;
-                    sd.pv_seg = pv;
-                    sd.comp = c;
-                    sd.v_lvl = vl;
-                    sd.h_lvl = hl;
-                    sd.len_coef = wcoef;
-                    sd.len_grp = wgrp;
-                    sd.sig_groups = sgs;
-                    sd.ofs_grp = ofs_grp;
-                    ofs_grp += 8 * sgs;
-
-                    pkt_seg_ids[nb_pkt][pkt_seg_count[nb_pkt]++] = nb_seg;
-                    if (c != 2 || vl == 0) {
-                        sp_sb_order[num_sb++] = sb;
-                    }
-                    ++nb_seg;
-                }
-                ++nb_pkt;
-            }
+        for (int si = 0; si < kNumSegments; ++si) {
+            const TicoStaticTopology::FixedSeg& fs = kTicoTopology.segs[si];
+            const int wcoef = (fs.comp == 2)
+                                  ? w_pix
+                                  : ((fs.v_lvl == 0) ? v0_subband_len[fs.h_lvl] : v1_subband_len[fs.h_lvl]);
+            const int wgrp = (wcoef + 3) >> 2;
+            const int sgs = (wgrp + 7) >> 3;
+            SegmentDesc& sd = segs[si];
+            sd.seg_id = fs.seg_id;
+            sd.pkt_idx = fs.pkt_idx;
+            sd.sb_id = fs.sb_id;
+            sd.pv_seg = fs.pv_seg;
+            sd.comp = fs.comp;
+            sd.v_lvl = fs.v_lvl;
+            sd.h_lvl = fs.h_lvl;
+            sd.len_coef = wcoef;
+            sd.len_grp = wgrp;
+            sd.sig_groups = sgs;
+            sd.ofs_grp = ofs_grp;
+            ofs_grp += 8 * sgs;
         }
         total_ofs_grp = ofs_grp;
 
         for (int i = 0; i < kNumSegments; ++i) {
             segs[i].pv_ofs_grp = segs[segs[i].pv_seg].ofs_grp;
-        }
-        const int c_map[3] = {0, 1, 3};
-        for (int ci = 0; ci < 3; ++ci) {
-            for (int si = 0; si < kNumSegments; ++si) {
-                const SegmentDesc& sd = segs[si];
-                if (sd.comp == c_map[ci]) {
-                    if (sd.v_lvl == 0) {
-                        comp_v0_seg[ci][sd.h_lvl] = si;
-                    } else {
-                        comp_v1_seg[ci][sd.h_lvl] = si;
-                    }
-                }
-            }
         }
 
         std::memset(sb_gains, 0, sizeof(sb_gains));
@@ -819,16 +815,23 @@ struct BakedNltCache {
     }
 };
 
-struct SliceWorkBuf {
+struct alignas(128) SliceWorkBuf {
     std::vector<uint8_t> gcli_buf;
     std::vector<int32_t> seg_bufs[kNumSegments];
     std::vector<int32_t> idwt_a;
     std::vector<int32_t> idwt_b;
-    std::vector<int32_t> v_ev_next;
+    std::vector<int32_t> comp_ring[3][4];
+    int32_t comp_row_tag[3][4] = {
+        {-1, -1, -1, -1},
+        {-1, -1, -1, -1},
+        {-1, -1, -1, -1},
+    };
     std::vector<int32_t> y0_a;
     std::vector<int32_t> y0_b;
     std::vector<int32_t> g0_slots[3];
     std::vector<int32_t> g1_slots[3];
+    std::vector<uint16_t> crop_ev;
+    std::vector<uint16_t> crop_od;
 
     void ensure_stage1(const CodecGeometry& geom) {
         if (gcli_buf.size() < static_cast<size_t>(geom.total_ofs_grp)) {
@@ -848,19 +851,33 @@ struct SliceWorkBuf {
         }
     }
 
-    void ensure_v_even_cap(int w_pix) {
-        if (v_ev_next.size() < static_cast<size_t>(w_pix)) {
-            v_ev_next.resize(static_cast<size_t>(w_pix), 0);
-        }
-    }
-
-    void ensure_ring_cap(int w_pix) {
+    void ensure_strip_cap(int w_pix, int full_w, bool need_crop_rows) {
         const size_t need = static_cast<size_t>(w_pix);
+        for (int ci = 0; ci < 3; ++ci) {
+            for (int sl = 0; sl < 4; ++sl) {
+                if (comp_ring[ci][sl].size() < need) {
+                    comp_ring[ci][sl].resize(need);
+                }
+            }
+        }
         if (y0_a.size() < need) y0_a.resize(need);
         if (y0_b.size() < need) y0_b.resize(need);
         for (int i = 0; i < 3; ++i) {
             if (g0_slots[i].size() < need) g0_slots[i].resize(need);
             if (g1_slots[i].size() < need) g1_slots[i].resize(need);
+        }
+        if (need_crop_rows) {
+            const size_t fw = static_cast<size_t>(full_w);
+            if (crop_ev.size() < fw) crop_ev.resize(fw);
+            if (crop_od.size() < fw) crop_od.resize(fw);
+        }
+    }
+
+    void reset_ring_tags() noexcept {
+        for (int ci = 0; ci < 3; ++ci) {
+            for (int sl = 0; sl < 4; ++sl) {
+                comp_row_tag[ci][sl] = -1;
+            }
         }
     }
 };
@@ -918,7 +935,6 @@ bool decode_single_slice_entropy_and_hdwt(
     SliceWorkBuf& ww,
     int32_t* v_lh_planes[3],
     int32_t* plane_yh) {
-    const SignExpandTable& sign_tbl = get_sign_expand_table();
     const int w_pix = geom.w_pix;
     const int n_prec = geom.n_prec;
     const int precs_per_slice = geom.precs_per_slice;
@@ -1067,11 +1083,13 @@ bool decode_single_slice_entropy_and_hdwt(
                                 if (u == 0) {
                                     g = t;
                                 } else if (u <= 2 * dl) {
-                                    g = (u & 1) ? (t - ((u + 1) >> 1)) : (t + (u >> 1));
+                                    const int half = (u + 1) >> 1;
+                                    const int odd_m = -(u & 1);
+                                    g = t + ((half ^ odd_m) - odd_m);
                                 } else {
                                     g = k + u;
                                 }
-                                if (g > bw) {
+                                if (g > bw) [[unlikely]] {
                                     return false;
                                 }
                                 g_out[cg0 + i] = static_cast<uint8_t>(g);
@@ -1089,7 +1107,7 @@ bool decode_single_slice_entropy_and_hdwt(
                         d4[0] = d4[1] = d4[2] = d4[3] = 0;
                         continue;
                     }
-                    if (n_bits > 15 || d_bp + static_cast<size_t>(n_bits) * 4u > data_bits_max) {
+                    if (n_bits > 15 || d_bp + static_cast<size_t>(n_bits) * 4u > data_bits_max) [[unlikely]] {
                         return false;
                     }
                     const uint64_t dw = peek64z(data_sub, data_B, d_bp);
@@ -1112,23 +1130,23 @@ bool decode_single_slice_entropy_and_hdwt(
                         d4[0] = d4[1] = d4[2] = d4[3] = 0;
                         continue;
                     }
-                    const int nz_cnt = popcount4(nzmask);
-                    if (sgn_bp + static_cast<size_t>(nz_cnt) > sign_bits_max) {
+                    const int nz_cnt = std::popcount(nzmask);
+                    if (sgn_bp + static_cast<size_t>(nz_cnt) > sign_bits_max) [[unlikely]] {
                         return false;
                     }
                     const uint32_t s_nib = static_cast<uint32_t>(
                         peek64z(sign_sub, sign_B, sgn_bp) >> 60);
                     sgn_bp += static_cast<size_t>(nz_cnt);
 
-                    const uint8_t neg_mask = sign_tbl.mask[nzmask][s_nib & 15u];
-                    const int32_t s0 = static_cast<int32_t>(m0);
-                    const int32_t s1 = static_cast<int32_t>(m1);
-                    const int32_t s2 = static_cast<int32_t>(m2);
-                    const int32_t s3 = static_cast<int32_t>(m3);
-                    d4[0] = (neg_mask & 1u) ? -s0 : s0;
-                    d4[1] = (neg_mask & 2u) ? -s1 : s1;
-                    d4[2] = (neg_mask & 4u) ? -s2 : s2;
-                    d4[3] = (neg_mask & 8u) ? -s3 : s3;
+                    const uint8_t neg_mask = detail::kSignExpandTable.mask[nzmask][s_nib & 15u];
+                    const int32_t n0 = -static_cast<int32_t>(neg_mask & 1u);
+                    const int32_t n1 = -static_cast<int32_t>((neg_mask >> 1) & 1u);
+                    const int32_t n2 = -static_cast<int32_t>((neg_mask >> 2) & 1u);
+                    const int32_t n3 = -static_cast<int32_t>((neg_mask >> 3) & 1u);
+                    d4[0] = (static_cast<int32_t>(m0) ^ n0) - n0;
+                    d4[1] = (static_cast<int32_t>(m1) ^ n1) - n1;
+                    d4[2] = (static_cast<int32_t>(m2) ^ n2) - n2;
+                    d4[3] = (static_cast<int32_t>(m3) ^ n3) - n3;
                 }
             }
 
@@ -1237,40 +1255,56 @@ NIJIN_TARGET_AVX2 inline void vert_idwt_odd_last_avx2(const int32_t* Hc, const i
     }
 }
 
-NIJIN_NOINLINE NIJIN_TARGET_AVX2 void run_vidwt_task_avx2(
-    const int32_t* lo_base,
-    const int32_t* hi_base,
-    int32_t* dst_base,
-    int32_t* ev_next_buf,
-    int k0,
-    int k1,
+NIJIN_TARGET_AVX2 inline const int32_t* get_spatial_row_avx2(
+    SliceWorkBuf& ww,
+    int ci,
+    int r,
+    int32_t* const v_lh_planes[3],
     int n_prec,
     int w_pix) {
-    int32_t* ev_cur = dst_base + static_cast<size_t>(2 * k0) * static_cast<size_t>(w_pix);
-    if (k0 == 0) {
-        vert_idwt_even_k0_avx2(lo_base, hi_base, ev_cur, w_pix);
-    } else {
-        const int32_t* const L0 = lo_base + static_cast<size_t>(k0) * static_cast<size_t>(w_pix);
-        const int32_t* const Hp0 = hi_base + static_cast<size_t>(k0 - 1) * static_cast<size_t>(w_pix);
-        const int32_t* const Hc0 = hi_base + static_cast<size_t>(k0) * static_cast<size_t>(w_pix);
-        vert_idwt_even_avx2(L0, Hp0, Hc0, ev_cur, w_pix);
+    const int slot = r & 3;
+    if (ww.comp_row_tag[ci][slot] == r) [[likely]] {
+        return ww.comp_ring[ci][slot].data();
     }
-    for (int k = k0; k < k1; ++k) {
-        const int32_t* const Hc = hi_base + static_cast<size_t>(k) * static_cast<size_t>(w_pix);
-        int32_t* const dst_odd = dst_base + static_cast<size_t>(2 * k + 1) * static_cast<size_t>(w_pix);
-        if (k + 1 < n_prec) {
-            int32_t* const ev_nxt = (k + 1 < k1)
-                                        ? (dst_base + static_cast<size_t>(2 * (k + 1)) * static_cast<size_t>(w_pix))
-                                        : ev_next_buf;
-            const int32_t* const Ln = lo_base + static_cast<size_t>(k + 1) * static_cast<size_t>(w_pix);
-            const int32_t* const Hn = hi_base + static_cast<size_t>(k + 1) * static_cast<size_t>(w_pix);
-            vert_idwt_even_avx2(Ln, Hc, Hn, ev_nxt, w_pix);
-            vert_idwt_odd_avx2(Hc, ev_cur, ev_nxt, dst_odd, w_pix);
-            ev_cur = ev_nxt;
+    const size_t stride = static_cast<size_t>(w_pix);
+    const int32_t* const lo_base = v_lh_planes[ci];
+    const int32_t* const hi_base = lo_base + static_cast<size_t>(n_prec) * stride;
+    const int k = r >> 1;
+    const int ev0_r = 2 * k;
+    const int ev0_slot = ev0_r & 3;
+    int32_t* const ev0_ptr = ww.comp_ring[ci][ev0_slot].data();
+    if (ww.comp_row_tag[ci][ev0_slot] != ev0_r) {
+        const int32_t* const L0 = lo_base + static_cast<size_t>(k) * stride;
+        const int32_t* const Hc = hi_base + static_cast<size_t>(k) * stride;
+        if (k == 0) {
+            vert_idwt_even_k0_avx2(L0, Hc, ev0_ptr, w_pix);
         } else {
-            vert_idwt_odd_last_avx2(Hc, ev_cur, dst_odd, w_pix);
+            const int32_t* const Hp = hi_base + static_cast<size_t>(k - 1) * stride;
+            vert_idwt_even_avx2(L0, Hp, Hc, ev0_ptr, w_pix);
         }
+        ww.comp_row_tag[ci][ev0_slot] = ev0_r;
     }
+    if ((r & 1) == 0) {
+        return ev0_ptr;
+    }
+    const int32_t* const Hc = hi_base + static_cast<size_t>(k) * stride;
+    int32_t* const odd_ptr = ww.comp_ring[ci][slot].data();
+    if (k + 1 < n_prec) {
+        const int ev1_r = 2 * (k + 1);
+        const int ev1_slot = ev1_r & 3;
+        int32_t* const ev1_ptr = ww.comp_ring[ci][ev1_slot].data();
+        if (ww.comp_row_tag[ci][ev1_slot] != ev1_r) {
+            const int32_t* const Ln = lo_base + static_cast<size_t>(k + 1) * stride;
+            const int32_t* const Hn = hi_base + static_cast<size_t>(k + 1) * stride;
+            vert_idwt_even_avx2(Ln, Hc, Hn, ev1_ptr, w_pix);
+            ww.comp_row_tag[ci][ev1_slot] = ev1_r;
+        }
+        vert_idwt_odd_avx2(Hc, ev0_ptr, ev1_ptr, odd_ptr, w_pix);
+    } else {
+        vert_idwt_odd_last_avx2(Hc, ev0_ptr, odd_ptr, w_pix);
+    }
+    ww.comp_row_tag[ci][slot] = r;
+    return odd_ptr;
 }
 #endif
 
@@ -1361,6 +1395,77 @@ inline void vert_idwt_odd_last(const int32_t* Hc, const int32_t* ev0, int32_t* d
 #endif
     for (; col < w_pix; ++col) {
         dst[col] = Hc[col] + ev0[col];
+    }
+}
+
+inline const int32_t* get_spatial_row_scalar(
+    SliceWorkBuf& ww,
+    int ci,
+    int r,
+    int32_t* const v_lh_planes[3],
+    int n_prec,
+    int w_pix) {
+    const int slot = r & 3;
+    if (ww.comp_row_tag[ci][slot] == r) [[likely]] {
+        return ww.comp_ring[ci][slot].data();
+    }
+    const size_t stride = static_cast<size_t>(w_pix);
+    const int32_t* const lo_base = v_lh_planes[ci];
+    const int32_t* const hi_base = lo_base + static_cast<size_t>(n_prec) * stride;
+    const int k = r >> 1;
+    const int ev0_r = 2 * k;
+    const int ev0_slot = ev0_r & 3;
+    int32_t* const ev0_ptr = ww.comp_ring[ci][ev0_slot].data();
+    if (ww.comp_row_tag[ci][ev0_slot] != ev0_r) {
+        const int32_t* const L0 = lo_base + static_cast<size_t>(k) * stride;
+        const int32_t* const Hc = hi_base + static_cast<size_t>(k) * stride;
+        if (k == 0) {
+            vert_idwt_even_k0(L0, Hc, ev0_ptr, w_pix);
+        } else {
+            const int32_t* const Hp = hi_base + static_cast<size_t>(k - 1) * stride;
+            vert_idwt_even(L0, Hp, Hc, ev0_ptr, w_pix);
+        }
+        ww.comp_row_tag[ci][ev0_slot] = ev0_r;
+    }
+    if ((r & 1) == 0) {
+        return ev0_ptr;
+    }
+    const int32_t* const Hc = hi_base + static_cast<size_t>(k) * stride;
+    int32_t* const odd_ptr = ww.comp_ring[ci][slot].data();
+    if (k + 1 < n_prec) {
+        const int ev1_r = 2 * (k + 1);
+        const int ev1_slot = ev1_r & 3;
+        int32_t* const ev1_ptr = ww.comp_ring[ci][ev1_slot].data();
+        if (ww.comp_row_tag[ci][ev1_slot] != ev1_r) {
+            const int32_t* const Ln = lo_base + static_cast<size_t>(k + 1) * stride;
+            const int32_t* const Hn = hi_base + static_cast<size_t>(k + 1) * stride;
+            vert_idwt_even(Ln, Hc, Hn, ev1_ptr, w_pix);
+            ww.comp_row_tag[ci][ev1_slot] = ev1_r;
+        }
+        vert_idwt_odd(Hc, ev0_ptr, ev1_ptr, odd_ptr, w_pix);
+    } else {
+        vert_idwt_odd_last(Hc, ev0_ptr, odd_ptr, w_pix);
+    }
+    ww.comp_row_tag[ci][slot] = r;
+    return odd_ptr;
+}
+
+inline void flush_crop_row_pair(
+    int r,
+    const uint16_t* ev_row,
+    const uint16_t* od_row,
+    uint16_t* dst,
+    size_t dst_stride_u16,
+    const detail::CropRect& crop) {
+    const uint32_t by_ev = static_cast<uint32_t>(2 * r);
+    const uint32_t by_od = by_ev + 1u;
+    const size_t x_off = static_cast<size_t>(crop.x);
+    const size_t nbytes = static_cast<size_t>(crop.w) * sizeof(uint16_t);
+    if (by_ev >= crop.y && by_ev < crop.y + crop.h) {
+        std::memcpy(dst + static_cast<size_t>(by_ev - crop.y) * dst_stride_u16, ev_row + x_off, nbytes);
+    }
+    if (by_od >= crop.y && by_od < crop.y + crop.h) {
+        std::memcpy(dst + static_cast<size_t>(by_od - crop.y) * dst_stride_u16, od_row + x_off, nbytes);
     }
 }
 
@@ -1665,11 +1770,11 @@ inline void emit_bayer_row_pair(
             const __m128i ig1 = sse2_clamp_epi32(_mm_add_epi32(g1, off_v), zero_v, max_idx_v);
             const __m128i ib = sse2_clamp_epi32(_mm_add_epi32(blue, off_v), zero_v, max_idx_v);
 
-            int32_t xr[4], xg0[4], xg1[4], xb[4];
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(xr), ir);
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(xg0), ig0);
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(xg1), ig1);
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(xb), ib);
+            alignas(16) int32_t xr[4], xg0[4], xg1[4], xb[4];
+            _mm_store_si128(reinterpret_cast<__m128i*>(xr), ir);
+            _mm_store_si128(reinterpret_cast<__m128i*>(xg0), ig0);
+            _mm_store_si128(reinterpret_cast<__m128i*>(xg1), ig1);
+            _mm_store_si128(reinterpret_cast<__m128i*>(xb), ib);
 
             for (int lane = 0; lane < 4; ++lane) {
                 out_even[2 * (c + lane)]     = baked_lut[xr[lane]];
@@ -1866,23 +1971,23 @@ NIJIN_TARGET_AVX2 inline void emit_bayer_row_pair_avx2(
             const __m256i ig1 = _mm256_min_epi32(_mm256_max_epi32(_mm256_add_epi32(g1, off_v), zero_v), max_idx_v);
             const __m256i ib = _mm256_min_epi32(_mm256_max_epi32(_mm256_add_epi32(blue, off_v), zero_v), max_idx_v);
 
-            int32_t xr[8], xg0[8], xg1[8], xb[8];
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(xr), ir);
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(xg0), ig0);
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(xg1), ig1);
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(xb), ib);
+            alignas(32) int32_t xr[8], xg0[8], xg1[8], xb[8];
+            _mm256_store_si256(reinterpret_cast<__m256i*>(xr), ir);
+            _mm256_store_si256(reinterpret_cast<__m256i*>(xg0), ig0);
+            _mm256_store_si256(reinterpret_cast<__m256i*>(xg1), ig1);
+            _mm256_store_si256(reinterpret_cast<__m256i*>(xb), ib);
 
-            uint16_t lr[8], lg0[8], lg1[8], lb[8];
+            alignas(16) uint16_t lr[8], lg0[8], lg1[8], lb[8];
             for (int lane = 0; lane < 8; ++lane) {
                 lr[lane]  = baked_lut[xr[lane]];
                 lg0[lane] = baked_lut[xg0[lane]];
                 lg1[lane] = baked_lut[xg1[lane]];
                 lb[lane]  = baked_lut[xb[lane]];
             }
-            const __m128i vr = _mm_loadu_si128(reinterpret_cast<const __m128i*>(lr));
-            const __m128i vg0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(lg0));
-            const __m128i vg1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(lg1));
-            const __m128i vb = _mm_loadu_si128(reinterpret_cast<const __m128i*>(lb));
+            const __m128i vr = _mm_load_si128(reinterpret_cast<const __m128i*>(lr));
+            const __m128i vg0 = _mm_load_si128(reinterpret_cast<const __m128i*>(lg0));
+            const __m128i vg1 = _mm_load_si128(reinterpret_cast<const __m128i*>(lg1));
+            const __m128i vb = _mm_load_si128(reinterpret_cast<const __m128i*>(lb));
 
             _mm_storeu_si128(reinterpret_cast<__m128i*>(out_even + 2 * c), _mm_unpacklo_epi16(vr, vg0));
             _mm_storeu_si128(reinterpret_cast<__m128i*>(out_even + 2 * c + 8), _mm_unpackhi_epi16(vr, vg0));
@@ -1947,37 +2052,46 @@ NIJIN_NOINLINE NIJIN_TARGET_AVX2 void run_rct_nlt_strip_avx2(
     int r0,
     int r1,
     SliceWorkBuf& ww,
-    const int32_t* plane_yl,
+    int32_t* const v_lh_planes[3],
     const int32_t* plane_yh,
-    const int32_t* plane_cr,
-    const int32_t* plane_cb,
     uint16_t* dst,
     size_t dst_stride_u16,
+    int full_w,
     int w_pix,
     int h_pix,
+    int n_prec,
     int post_offset,
     int scale,
     int scale_off,
     int32_t max_value,
     const uint16_t* baked_lut,
-    int lut_max_idx) {
+    int lut_max_idx,
+    const detail::CropRect* crop) {
+    ww.reset_ring_tags();
+    const bool has_crop = (crop != nullptr && crop->enabled);
+    const uint32_t dst_y0 = has_crop ? crop->y : 0u;
+    const bool full_width_crop = has_crop && (crop->x == 0u) && (crop->w == static_cast<uint32_t>(full_w));
+
     auto compute_y0_at = [&](int r, int32_t* out_y0) {
         const int r_up = (r > 0) ? (r - 1) : 0;
         const size_t row = static_cast<size_t>(r) * static_cast<size_t>(w_pix);
         const size_t row_up = static_cast<size_t>(r_up) * static_cast<size_t>(w_pix);
-        compute_y0_row_avx2(plane_yl + row, plane_yh + row_up, plane_yh + row, out_y0, w_pix);
+        const int32_t* const yl_r = get_spatial_row_avx2(ww, 0, r, v_lh_planes, n_prec, w_pix);
+        compute_y0_row_avx2(yl_r, plane_yh + row_up, plane_yh + row, out_y0, w_pix);
     };
 
     auto compute_g01_at = [&](int r, const int32_t* y0_r, const int32_t* y0_dn_r, int32_t* g0_r, int32_t* g1_r) {
         const int r_up = (r > 0) ? (r - 1) : 0;
         const int r_dn = (r + 1 < h_pix) ? (r + 1) : (h_pix - 1);
         const size_t row = static_cast<size_t>(r) * static_cast<size_t>(w_pix);
-        const size_t row_up = static_cast<size_t>(r_up) * static_cast<size_t>(w_pix);
-        const size_t row_dn = static_cast<size_t>(r_dn) * static_cast<size_t>(w_pix);
+        const int32_t* const cr_r = get_spatial_row_avx2(ww, 1, r, v_lh_planes, n_prec, w_pix);
+        const int32_t* const cr_rdn = (r_dn == r) ? cr_r : get_spatial_row_avx2(ww, 1, r_dn, v_lh_planes, n_prec, w_pix);
+        const int32_t* const cb_r = get_spatial_row_avx2(ww, 2, r, v_lh_planes, n_prec, w_pix);
+        const int32_t* const cb_rup = (r_up == r) ? cb_r : get_spatial_row_avx2(ww, 2, r_up, v_lh_planes, n_prec, w_pix);
         compute_g0_g1_row_avx2(
             y0_r, y0_dn_r, plane_yh + row,
-            plane_cr + row, plane_cr + row_dn,
-            plane_cb + row_up, plane_cb + row,
+            cr_r, cr_rdn,
+            cb_rup, cb_r,
             g0_r, g1_r, w_pix);
     };
 
@@ -2030,14 +2144,25 @@ NIJIN_NOINLINE NIJIN_TARGET_AVX2 void run_rct_nlt_strip_avx2(
             g0_dn_ptr = g0_cur;
         }
 
-        const size_t row = static_cast<size_t>(r) * static_cast<size_t>(w_pix);
-        uint16_t* const out_even = dst + static_cast<size_t>(2 * r) * dst_stride_u16;
-        uint16_t* const out_odd = out_even + dst_stride_u16;
+        const int32_t* const cr_cur = get_spatial_row_avx2(ww, 1, r, v_lh_planes, n_prec, w_pix);
+        const int32_t* const cb_cur = get_spatial_row_avx2(ww, 2, r, v_lh_planes, n_prec, w_pix);
+        const uint32_t by_ev = static_cast<uint32_t>(2 * r);
+        const bool direct_row = (!has_crop) ||
+            (full_width_crop && by_ev >= dst_y0 && by_ev + 1u < dst_y0 + crop->h);
+        uint16_t* const out_even = direct_row
+            ? (dst + static_cast<size_t>(by_ev - dst_y0) * dst_stride_u16)
+            : ww.crop_ev.data();
+        uint16_t* const out_odd = direct_row
+            ? (out_even + dst_stride_u16)
+            : ww.crop_od.data();
         emit_bayer_row_pair_avx2(
             g1_up_ptr, g0_cur, g1_cur, g0_dn_ptr,
-            plane_cr + row, plane_cb + row,
+            cr_cur, cb_cur,
             out_even, out_odd, w_pix,
             post_offset, scale, scale_off, max_value, baked_lut, lut_max_idx);
+        if (!direct_row) {
+            flush_crop_row_pair(r, out_even, out_odd, dst, dst_stride_u16, *crop);
+        }
 
         if (r + 1 < r1) {
             int32_t* const tmp0 = g0_up;
@@ -2091,16 +2216,30 @@ bool decode_ticoraw_bayer_strided(
     std::string& err,
     WorkerPool* external_pool,
     TicoArena* external_arena,
-    WaveletQuantProfile* quant_out) {
+    WaveletQuantProfile* quant_out,
+    const CropRect* crop) {
     ParsedR0Header hdr;
-    if (!parse_r0_header(data, len, hdr, err)) {
+    if (!parse_r0_header(data, len, hdr, err)) [[unlikely]] {
         return false;
     }
     CodecGeometry geom;
     geom.init(hdr);
 
-    if (!dst || dst_stride_u16 < static_cast<size_t>(geom.full_w) ||
-        dst_height_capacity < static_cast<size_t>(geom.full_h)) {
+    const bool has_crop = (crop != nullptr && crop->enabled);
+    if (has_crop) {
+        if (crop->w == 0u || crop->h == 0u ||
+            crop->x > static_cast<uint32_t>(geom.full_w) ||
+            crop->w > static_cast<uint32_t>(geom.full_w) - crop->x ||
+            crop->y > static_cast<uint32_t>(geom.full_h) ||
+            crop->h > static_cast<uint32_t>(geom.full_h) - crop->y) [[unlikely]] {
+            err = "Crop region out of bounds for TicoRAW frame";
+            return false;
+        }
+    }
+
+    const size_t req_w = has_crop ? static_cast<size_t>(crop->w) : static_cast<size_t>(geom.full_w);
+    const size_t req_h = has_crop ? static_cast<size_t>(crop->h) : static_cast<size_t>(geom.full_h);
+    if (!dst || dst_stride_u16 < req_w || dst_height_capacity < req_h) [[unlikely]] {
         err = "Destination Bayer buffer too small for TicoRAW frame";
         return false;
     }
@@ -2118,7 +2257,7 @@ bool decode_ticoraw_bayer_strided(
         if (pos + 6u > len ||
             rd_be16(data + pos) != 0xFF20u ||
             rd_be16(data + pos + 2) != 4u ||
-            rd_be16(data + pos + 4) != static_cast<uint16_t>(s)) {
+            rd_be16(data + pos + 4) != static_cast<uint16_t>(s)) [[unlikely]] {
             err = "Malformed or truncated SLH slice header";
             return false;
         }
@@ -2126,13 +2265,13 @@ bool decode_ticoraw_bayer_strided(
         const int p0 = s * geom.precs_per_slice;
         const int p1 = std::min(geom.n_prec, p0 + geom.precs_per_slice);
         for (int p = p0; p < p1; ++p) {
-            if (pos + 12u > len) {
+            if (pos + 12u > len) [[unlikely]] {
                 err = "Truncated precinct header";
                 return false;
             }
             const size_t body_len = rd_be24(data + pos);
             const size_t total = 12u + body_len;
-            if (body_len == 0 || pos + total > len) {
+            if (body_len == 0 || pos + total > len) [[unlikely]] {
                 err = "Truncated precinct body";
                 return false;
             }
@@ -2140,7 +2279,7 @@ bool decode_ticoraw_bayer_strided(
             pos += total;
         }
     }
-    if (pos + 2u > len || rd_be16(data + pos) != 0xFF11u) {
+    if (pos + 2u > len || rd_be16(data + pos) != 0xFF11u) [[unlikely]] {
         err = "Missing TicoRAW EOC marker (0xFF11)";
         return false;
     }
@@ -2153,17 +2292,13 @@ bool decode_ticoraw_bayer_strided(
     const int h_pix = geom.h_pix;
     const int n_prec = geom.n_prec;
     const size_t plane_elems = static_cast<size_t>(w_pix) * static_cast<size_t>(h_pix);
-    if (arena.planes.size() < 7u * plane_elems) {
-        arena.planes.resize(7u * plane_elems);
+    if (arena.planes.size() < 4u * plane_elems) {
+        arena.planes.resize(4u * plane_elems);
     }
 
     int32_t* const plane_base = arena.planes.data();
     int32_t* v_lh_planes[3] = {plane_base, plane_base + plane_elems, plane_base + 2u * plane_elems};
     int32_t* const plane_yh = plane_base + 3u * plane_elems;
-    int32_t* const plane_yl = plane_base + 4u * plane_elems;
-    int32_t* const plane_cr = plane_base + 5u * plane_elems;
-    int32_t* const plane_cb = plane_base + 6u * plane_elems;
-    int32_t* out_spatial[3] = {plane_yl, plane_cr, plane_cb};
 
     // Stage 1: Dynamic slice-stealing entropy decode + 1D horizontal IDWT
     std::atomic<int> err_flag{0};
@@ -2172,17 +2307,17 @@ bool decode_ticoraw_bayer_strided(
         SliceWorkBuf& ww = arena.workers[static_cast<size_t>(worker_idx)];
         ww.ensure_stage1(geom);
         for (size_t s = s0; s < s1; ++s) {
-            if (err_flag.load(std::memory_order_relaxed) != 0) {
+            if (err_flag.load(std::memory_order_relaxed) != 0) [[unlikely]] {
                 return;
             }
             if (!decode_single_slice_entropy_and_hdwt(
-                    data, hdr, geom, prec_spans, static_cast<int>(s), ww, v_lh_planes, plane_yh)) {
+                    data, hdr, geom, prec_spans, static_cast<int>(s), ww, v_lh_planes, plane_yh)) [[unlikely]] {
                 err_flag.store(1, std::memory_order_relaxed);
                 return;
             }
         }
     });
-    if (err_flag.load(std::memory_order_relaxed) != 0) {
+    if (err_flag.load(std::memory_order_relaxed) != 0) [[unlikely]] {
         err = "Corrupt TicoRAW packet entropy data";
         return false;
     }
@@ -2191,78 +2326,8 @@ bool decode_ticoraw_bayer_strided(
     const bool use_avx2 = detail::cpu_has_avx2();
 #endif
 
-    // Stage 1.5: Single-pass fused vertical 1-level 5/3 IDWT over all (component, strip) tasks
-    struct VIdwtTask {
-        int ci = 0;
-        int k0 = 0;
-        int k1 = 0;
-    };
-    const int n_strips = (threads <= 1)
-                             ? 1
-                             : std::min<int>(std::max<int>(1, n_prec / 32), std::max<int>(1, (threads * 4) / 3));
-    std::vector<VIdwtTask> vidwt_tasks;
-    vidwt_tasks.reserve(static_cast<size_t>(3 * n_strips));
-    for (int ci = 0; ci < 3; ++ci) {
-        for (int s = 0; s < n_strips; ++s) {
-            VIdwtTask vt;
-            vt.ci = ci;
-            vt.k0 = (s * n_prec) / n_strips;
-            vt.k1 = ((s + 1) * n_prec) / n_strips;
-            if (vt.k0 < vt.k1) {
-                vidwt_tasks.push_back(vt);
-            }
-        }
-    }
-
-    pool.parallel_chunks(vidwt_tasks.size(), 1u, threads, [&](size_t t0, size_t t1, int worker_idx) {
-        SliceWorkBuf& ww = arena.workers[static_cast<size_t>(worker_idx)];
-        ww.ensure_v_even_cap(w_pix);
-        int32_t* const ev_next_buf = ww.v_ev_next.data();
-        for (size_t ti = t0; ti < t1; ++ti) {
-            const int ci = vidwt_tasks[ti].ci;
-            const int k0 = vidwt_tasks[ti].k0;
-            const int k1 = vidwt_tasks[ti].k1;
-            const int32_t* const lo_base = v_lh_planes[ci];
-            const int32_t* const hi_base = v_lh_planes[ci] + static_cast<size_t>(n_prec) * static_cast<size_t>(w_pix);
-            int32_t* const dst_base = out_spatial[ci];
-
-#if NIJIN_X86_64
-            if (use_avx2) {
-                run_vidwt_task_avx2(lo_base, hi_base, dst_base, ev_next_buf, k0, k1, n_prec, w_pix);
-                continue;
-            }
-#endif
-
-            int32_t* ev_cur = dst_base + static_cast<size_t>(2 * k0) * static_cast<size_t>(w_pix);
-            if (k0 == 0) {
-                vert_idwt_even_k0(lo_base, hi_base, ev_cur, w_pix);
-            } else {
-                const int32_t* const L0 = lo_base + static_cast<size_t>(k0) * static_cast<size_t>(w_pix);
-                const int32_t* const Hp0 = hi_base + static_cast<size_t>(k0 - 1) * static_cast<size_t>(w_pix);
-                const int32_t* const Hc0 = hi_base + static_cast<size_t>(k0) * static_cast<size_t>(w_pix);
-                vert_idwt_even(L0, Hp0, Hc0, ev_cur, w_pix);
-            }
-
-            for (int k = k0; k < k1; ++k) {
-                const int32_t* const Hc = hi_base + static_cast<size_t>(k) * static_cast<size_t>(w_pix);
-                int32_t* const dst_odd = dst_base + static_cast<size_t>(2 * k + 1) * static_cast<size_t>(w_pix);
-                if (k + 1 < n_prec) {
-                    int32_t* const ev_nxt = (k + 1 < k1)
-                                                ? (dst_base + static_cast<size_t>(2 * (k + 1)) * static_cast<size_t>(w_pix))
-                                                : ev_next_buf;
-                    const int32_t* const Ln = lo_base + static_cast<size_t>(k + 1) * static_cast<size_t>(w_pix);
-                    const int32_t* const Hn = hi_base + static_cast<size_t>(k + 1) * static_cast<size_t>(w_pix);
-                    vert_idwt_even(Ln, Hc, Hn, ev_nxt, w_pix);
-                    vert_idwt_odd(Hc, ev_cur, ev_nxt, dst_odd, w_pix);
-                    ev_cur = ev_nxt;
-                } else {
-                    vert_idwt_odd_last(Hc, ev_cur, dst_odd, w_pix);
-                }
-            }
-        }
-    });
-
-    // Stage 2 + Stage 3 Fused: L1/L2-ring Inverse Star-Tetrix RCT + cached baked NLT LUT -> uint16 RGGB Bayer
+    // Stage 1.5 + 2 + 3 Fused: On-demand 4-row vertical 5/3 IDWT ring -> Star-Tetrix RCT -> NLT LUT -> uint16 RGGB Bayer
+    const int full_w = geom.full_w;
     const int full_h = geom.full_h;
     const int active_quad_h = full_h / 2;
 
@@ -2276,42 +2341,55 @@ bool decode_ticoraw_bayer_strided(
     const uint16_t* const baked_lut = hdr.gamma_enabled ? arena.nlt_cache.lut.data() : nullptr;
     const int lut_max_idx = hdr.gamma_enabled ? arena.nlt_cache.lut_max_idx : 0;
 
-    auto compute_y0_at = [&](int r, int32_t* out_y0) {
-        const int r_up = (r > 0) ? (r - 1) : 0;
-        const size_t row = static_cast<size_t>(r) * static_cast<size_t>(w_pix);
-        const size_t row_up = static_cast<size_t>(r_up) * static_cast<size_t>(w_pix);
-        compute_y0_row(plane_yl + row, plane_yh + row_up, plane_yh + row, out_y0, w_pix);
-    };
+    const int q_beg = has_crop ? static_cast<int>(crop->y >> 1) : 0;
+    const int q_end = has_crop
+        ? static_cast<int>(std::min<uint32_t>(static_cast<uint32_t>(active_quad_h), (crop->y + crop->h + 1u) >> 1))
+        : active_quad_h;
+    const int n_out_quads = std::max(0, q_end - q_beg);
+    const uint32_t dst_y0 = has_crop ? crop->y : 0u;
+    const bool full_width_crop = has_crop && (crop->x == 0u) && (crop->w == static_cast<uint32_t>(full_w));
+    const bool need_crop_rows = has_crop && !full_width_crop;
 
-    auto compute_g01_at = [&](int r, const int32_t* y0_r, const int32_t* y0_dn_r, int32_t* g0_r, int32_t* g1_r) {
-        const int r_up = (r > 0) ? (r - 1) : 0;
-        const int r_dn = (r + 1 < h_pix) ? (r + 1) : (h_pix - 1);
-        const size_t row = static_cast<size_t>(r) * static_cast<size_t>(w_pix);
-        const size_t row_up = static_cast<size_t>(r_up) * static_cast<size_t>(w_pix);
-        const size_t row_dn = static_cast<size_t>(r_dn) * static_cast<size_t>(w_pix);
-        compute_g0_g1_row(
-            y0_r, y0_dn_r, plane_yh + row,
-            plane_cr + row, plane_cr + row_dn,
-            plane_cb + row_up, plane_cb + row,
-            g0_r, g1_r, w_pix);
-    };
-
-    pool.parallel_strips(static_cast<size_t>(active_quad_h), 32u, threads,
-                         [&](size_t r0_s, size_t r1_s, int worker_idx) {
-        const int r0 = static_cast<int>(r0_s);
-        const int r1 = static_cast<int>(r1_s);
+    pool.parallel_strips(static_cast<size_t>(n_out_quads), 32u, threads,
+                         [&](size_t r0_rel, size_t r1_rel, int worker_idx) {
+        const int r0 = q_beg + static_cast<int>(r0_rel);
+        const int r1 = q_beg + static_cast<int>(r1_rel);
         SliceWorkBuf& ww = arena.workers[static_cast<size_t>(worker_idx)];
-        ww.ensure_ring_cap(w_pix);
+        ww.ensure_strip_cap(w_pix, full_w, need_crop_rows || has_crop);
+        ww.reset_ring_tags();
 
 #if NIJIN_X86_64
         if (use_avx2) {
             run_rct_nlt_strip_avx2(
-                r0, r1, ww, plane_yl, plane_yh, plane_cr, plane_cb,
-                dst, dst_stride_u16, w_pix, h_pix,
-                post_offset, scale, scale_off, max_value, baked_lut, lut_max_idx);
+                r0, r1, ww, v_lh_planes, plane_yh,
+                dst, dst_stride_u16, full_w, w_pix, h_pix, n_prec,
+                post_offset, scale, scale_off, max_value, baked_lut, lut_max_idx, crop);
             return;
         }
 #endif
+
+        auto compute_y0_at = [&](int r, int32_t* out_y0) {
+            const int r_up = (r > 0) ? (r - 1) : 0;
+            const size_t row = static_cast<size_t>(r) * static_cast<size_t>(w_pix);
+            const size_t row_up = static_cast<size_t>(r_up) * static_cast<size_t>(w_pix);
+            const int32_t* const yl_r = get_spatial_row_scalar(ww, 0, r, v_lh_planes, n_prec, w_pix);
+            compute_y0_row(yl_r, plane_yh + row_up, plane_yh + row, out_y0, w_pix);
+        };
+
+        auto compute_g01_at = [&](int r, const int32_t* y0_r, const int32_t* y0_dn_r, int32_t* g0_r, int32_t* g1_r) {
+            const int r_up = (r > 0) ? (r - 1) : 0;
+            const int r_dn = (r + 1 < h_pix) ? (r + 1) : (h_pix - 1);
+            const size_t row = static_cast<size_t>(r) * static_cast<size_t>(w_pix);
+            const int32_t* const cr_r = get_spatial_row_scalar(ww, 1, r, v_lh_planes, n_prec, w_pix);
+            const int32_t* const cr_rdn = (r_dn == r) ? cr_r : get_spatial_row_scalar(ww, 1, r_dn, v_lh_planes, n_prec, w_pix);
+            const int32_t* const cb_r = get_spatial_row_scalar(ww, 2, r, v_lh_planes, n_prec, w_pix);
+            const int32_t* const cb_rup = (r_up == r) ? cb_r : get_spatial_row_scalar(ww, 2, r_up, v_lh_planes, n_prec, w_pix);
+            compute_g0_g1_row(
+                y0_r, y0_dn_r, plane_yh + row,
+                cr_r, cr_rdn,
+                cb_rup, cb_r,
+                g0_r, g1_r, w_pix);
+        };
 
         int32_t* y0_cur = ww.y0_a.data();
         int32_t* y0_nxt = ww.y0_b.data();
@@ -2362,14 +2440,25 @@ bool decode_ticoraw_bayer_strided(
                 g0_dn_ptr = g0_cur;
             }
 
-            const size_t row = static_cast<size_t>(r) * static_cast<size_t>(w_pix);
-            uint16_t* const out_even = dst + static_cast<size_t>(2 * r) * dst_stride_u16;
-            uint16_t* const out_odd = out_even + dst_stride_u16;
+            const int32_t* const cr_cur = get_spatial_row_scalar(ww, 1, r, v_lh_planes, n_prec, w_pix);
+            const int32_t* const cb_cur = get_spatial_row_scalar(ww, 2, r, v_lh_planes, n_prec, w_pix);
+            const uint32_t by_ev = static_cast<uint32_t>(2 * r);
+            const bool direct_row = (!has_crop) ||
+                (full_width_crop && by_ev >= dst_y0 && by_ev + 1u < dst_y0 + crop->h);
+            uint16_t* const out_even = direct_row
+                ? (dst + static_cast<size_t>(by_ev - dst_y0) * dst_stride_u16)
+                : ww.crop_ev.data();
+            uint16_t* const out_odd = direct_row
+                ? (out_even + dst_stride_u16)
+                : ww.crop_od.data();
             emit_bayer_row_pair(
                 g1_up_ptr, g0_cur, g1_cur, g0_dn_ptr,
-                plane_cr + row, plane_cb + row,
+                cr_cur, cb_cur,
                 out_even, out_odd, w_pix,
                 post_offset, scale, scale_off, max_value, baked_lut, lut_max_idx);
+            if (!direct_row) {
+                flush_crop_row_pair(r, out_even, out_odd, dst, dst_stride_u16, *crop);
+            }
 
             if (r + 1 < r1) {
                 int32_t* const tmp0 = g0_up;

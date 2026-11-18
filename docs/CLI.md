@@ -1,4 +1,4 @@
-# CLI, C++17 & Pure C99 Library Reference
+# CLI, C++20 & Pure C99 Library Reference
 
 ## 1. CLI Synopsis
 
@@ -10,14 +10,14 @@ nijinWVDC --raw-jxs <in.jxs> -o <out.raw|out.dng> [options]
 nijinWVDC --extract-jxs <in.NEV | in.NEF> [--frame <N>] -o <out.jxs>
 nijinWVDC --extract-audio <in.NEV> -o <out.wav>
 nijinWVDC --extract-preview <in.NEV | in.NEF | in.ARW> [--thumb] -o <out.jpg>
-nijinWVDC --bench <in.NEV | in.ARW> [--frames N] [--threads N]
+nijinWVDC --bench <in.NEV | in.ARW | in.jxs> [--frames N] [--threads N]
 ```
 
 ### Options
 
 | Flag | Argument | Description |
 |---|---|---|
-| `-V`, `--version` | — | Prints library/CLI version string (`nijinWVDC 0.2.0`) and exits |
+| `-V`, `--version` | — | Prints library/CLI version string (`nijinWVDC 0.3.0`) and exits |
 | `-i`, `--input` | `<path>` | Input file (`.NEV`, `.NEF`, `.ARW`, or `.jxs`; also accepted positionally) |
 | `-o`, `--output` | `<path>` | Output file (`.dng`, `.raw`, `.jxs`, `.wav`, `.jpg`) or directory (creates directory and writes `frame_NNNN.<ext>`) |
 | `--frame` | `<N \| start-end \| all>` | Frame index, inclusive range (e.g., `0-29`), or `all` (default `0`; `.NEF` and `.ARW` accept `0`) |
@@ -172,7 +172,7 @@ done
 
 ---
 
-## 4. C++17 Stateful Pipeline (`MediaReader` + `DecoderSession`) & Pure C99 ABI (`nijinWVDC_c.h`)
+## 4. C++20 Stateful Pipeline (`MediaReader` + `DecoderSession`) & Pure C99 ABI (`nijinWVDC_c.h`)
 
 Link via CMake using `find_package(nijinWVDC CONFIG REQUIRED)` against either `nijinWVDC::static` or `nijinWVDC::shared`:
 
@@ -181,13 +181,15 @@ find_package(nijinWVDC CONFIG REQUIRED)
 target_link_libraries(my_app PRIVATE nijinWVDC::shared) # or nijinWVDC::static
 ```
 
-### 4.1 High-Throughput Video/Frame, Audio & Float-Plane C++17 Example (`include/nijinWVDC.h`)
+### 4.1 High-Throughput Video/Frame, Audio & Float-Plane C++20 Example (`include/nijinWVDC.h`)
 
 ```cpp
 #include "nijinWVDC.h"
+#include <span>
+#include <string_view>
 #include <vector>
 
-bool process_clip(const std::string& path, const std::string& out_wav, std::string& err) {
+bool process_clip(std::string_view path, std::string_view out_wav, std::string& err) {
     nijinwvdc::MediaReader reader;
     if (!reader.open_file(path, err)) return false;
 
@@ -216,13 +218,14 @@ bool process_clip(const std::string& path, const std::string& out_wav, std::stri
                                 : static_cast<float>((1u << info.bit_depth) - 1u);
         std::vector<float> norm(static_cast<size_t>(info.output_width) * info.output_height);
         nijinwvdc::normalize_bayer_to_float(
-            bayer.data(), 0, info.output_width, info.output_height, blk, white, true, norm.data(), 0);
+            std::span<const uint16_t>(bayer), info.output_width, info.output_height,
+            blk, white, true, std::span<float>(norm));
     }
     return true;
 }
 ```
 
-> **Note**: Custom I/O sources (`.NEV`, `.NEF`, `.ARW`, bare `.jxs`/`"A000"`) can open via `reader.open_memory(...)` or `reader.open_callbacks(...)`, and callers can supply strided destination buffers via `session.decode_frame_into(...)` or split 2x2 Bayer planes via `split_bayer_cfa_planes(...)`. Setting `opts.want_quant_profile = true` populates `info.quant_profile` (`WaveletQuantProfile`), which can be rescaled or vertically cropped via `recalibrate_quant_profile_range(...)` and `crop_quant_profile_vertical(...)`; `info.meta` also exposes `focal_length_opt_mm`, `focus_distance_m`, `focus_distance_low_m`, `focus_distance_high_m`, `focus_position`, `lens_position_abs`, and `focus_is_infinity`. All legacy free functions (`parse_nev_clip`, `read_nev_frame_meta_and_codestream`, `decode_ticoraw_bayer`, `decode_arw6_bayer`, `apply_bayer_crop`, `write_cfa_dng`) remain preserved in [`include/nijinWVDC.h`](../include/nijinWVDC.h).
+> **Note**: Custom I/O sources (`.NEV`, `.NEF`, `.ARW`, bare `.jxs`/`"A000"`) can open via `reader.open_memory(std::span<const uint8_t>, ...)` or `reader.open_callbacks(...)`, and callers can supply bounds-checked `std::span<uint16_t>` destinations via `session.decode_frame_into(...)` / `decode_codestream_into(...)`, or zero-copy views via `split_bayer_cfa_planes(...)` and `encode_cfa_dng_memory(...)`. Setting `opts.want_quant_profile = true` populates `info.quant_profile` (`WaveletQuantProfile`), which can be rescaled or vertically cropped via `recalibrate_quant_profile_range(...)` and `crop_quant_profile_vertical(...)`; `info.meta` also exposes `focal_length_opt_mm`, `focus_distance_m`, `focus_distance_low_m`, `focus_distance_high_m`, `focus_position`, `lens_position_abs`, and `focus_is_infinity`. All legacy free functions (`parse_nev_clip`, `read_nev_frame_meta_and_codestream`, `decode_ticoraw_bayer`, `decode_arw6_bayer`, `apply_bayer_crop`, `write_cfa_dng`) remain preserved in [`include/nijinWVDC.h`](../include/nijinWVDC.h).
 
 ### 4.2 Pure C99 FFI Example (`include/nijinWVDC_c.h`)
 

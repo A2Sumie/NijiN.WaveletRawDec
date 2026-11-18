@@ -25,7 +25,7 @@ jobs:
             os: macos-latest
             osx_arch: "arm64;x86_64"
           - name: linux-x86_64
-            os: ubuntu-22.04
+            os: ubuntu-24.04
             osx_arch: ""
     runs-on: ${{ matrix.os }}
     steps:
@@ -36,7 +36,7 @@ jobs:
           if [ -n "${{ matrix.osx_arch }}" ]; then
             cmake -S . -B build \
               -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
               "-DCMAKE_OSX_ARCHITECTURES=${{ matrix.osx_arch }}"
           else
             cmake -S . -B build \
@@ -54,7 +54,7 @@ jobs:
 
       - name: Package
         run: |
-          TAG="${GITHUB_REF_NAME:-v0.2.0}"
+          TAG="${GITHUB_REF_NAME:-v0.3.0}"
           PKG="nijinWVDC-${TAG}-${{ matrix.name }}"
           cmake --install build --prefix "${PWD}/dist/${PKG}"
           mkdir -p artifacts
@@ -81,7 +81,7 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          $tag = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "v0.2.0" }
+          $tag = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "v0.3.0" }
           $pkg = "nijinWVDC-$tag-windows-x86_64"
           cmake --install build --config Release --prefix "$PWD/dist/$pkg"
           New-Item -ItemType Directory -Force -Path artifacts | Out-Null

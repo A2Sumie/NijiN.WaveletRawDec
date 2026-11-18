@@ -4,7 +4,7 @@ libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
 includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
 
 Name: nijinWVDC
-Description: C++17 & C99 decoder library for Nikon TicoRAW (.NEV/.NEF) and Sony ARW6 (.ARW)
+Description: C++20 & C99 decoder library for Nikon TicoRAW (.NEV/.NEF) and Sony ARW6 (.ARW)
 Version: @PROJECT_VERSION@
 Libs: -L${libdir} -lnijinWVDC @NIJINWVDC_PC_LIBS@
 Libs.private: @NIJINWVDC_PC_LIBS_PRIVATE@

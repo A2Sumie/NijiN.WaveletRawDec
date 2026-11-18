@@ -310,7 +310,7 @@ const char* version_string() {
 }
 
 uint32_t simd_capabilities() {
-    return detail::detect_simd_capabilities();
+    return detail::cached_simd_capabilities();
 }
 
 bool split_bayer_cfa_planes(
@@ -509,7 +509,7 @@ MediaReader::~MediaReader() = default;
 MediaReader::MediaReader(MediaReader&&) noexcept = default;
 MediaReader& MediaReader::operator=(MediaReader&&) noexcept = default;
 
-bool MediaReader::open_file(const std::string& path, std::string& err) {
+bool MediaReader::open_file(std::string_view path, std::string& err) {
     if (!impl_) impl_.reset(new Impl());
     impl_->reset();
     if (!impl_->reader.open_file(path, err)) {
@@ -792,7 +792,7 @@ bool MediaReader::read_audio_pcm(
     return read_audio_pcm_into(start_frame, to_read, pcm_out.data(), pcm_out.size(), &got_frames, err);
 }
 
-bool MediaReader::export_audio_wav(const std::string& wav_path, std::string& err) const {
+bool MediaReader::export_audio_wav(std::string_view wav_path, std::string& err) const {
     if (!is_open()) {
         err = "MediaReader is not open";
         return false;
@@ -825,7 +825,7 @@ bool MediaReader::export_audio_wav(const std::string& wav_path, std::string& err
 
     FILE* fp = detail::open_c_file_write(wav_path);
     if (!fp) {
-        err = "Failed opening WAV output for writing: " + wav_path;
+        err = "Failed opening WAV output for writing: " + std::string(wav_path);
         return false;
     }
 
@@ -876,7 +876,7 @@ bool MediaReader::export_audio_wav(const std::string& wav_path, std::string& err
     }
     if (std::fclose(fp) != 0) ok = false;
     if (!ok && err.empty()) {
-        err = "Failed writing WAV output: " + wav_path;
+        err = "Failed writing WAV output: " + std::string(wav_path);
     }
     return ok;
 }
@@ -909,6 +909,14 @@ bool MediaReader::extract_preview_jpeg(std::vector<uint8_t>& jpeg_out, std::stri
 }
 
 struct DecoderSession::Impl {
+    struct ProbedHeader {
+        CodecFamily codec = CodecFamily::Unknown;
+        uint32_t coded_w = 0;
+        uint32_t coded_h = 0;
+        uint16_t bd = 14;
+        bool single_a000 = false;
+    };
+
     int default_threads = 0;
     detail::WorkerPool pool;
     detail::TicoArena* tico_arena = nullptr;
@@ -936,13 +944,22 @@ struct DecoderSession::Impl {
         size_t dst_row_stride_bytes,
         size_t dst_height_capacity,
         DecodedFrameInfo& info_out,
-        std::string& err) {
+        std::string& err,
+        const ProbedHeader* pre_probed = nullptr,
+        bool has_byte_cap = false,
+        size_t dst_byte_cap = 0) {
         info_out = DecodedFrameInfo();
         CodecFamily codec = CodecFamily::Unknown;
         uint32_t coded_w = 0, coded_h = 0;
         uint16_t bd = 14;
         bool single_a000 = false;
-        if (!probe_codestream_dims(data, len, codec, coded_w, coded_h, bd, single_a000, err)) {
+        if (pre_probed != nullptr) {
+            codec = pre_probed->codec;
+            coded_w = pre_probed->coded_w;
+            coded_h = pre_probed->coded_h;
+            bd = pre_probed->bd;
+            single_a000 = pre_probed->single_a000;
+        } else if (!probe_codestream_dims(data, len, codec, coded_w, coded_h, bd, single_a000, err)) {
             return false;
         }
 
@@ -958,7 +975,9 @@ struct DecoderSession::Impl {
             crop_y = opts.roi[1];
             crop_w = opts.roi[2];
             crop_h = opts.roi[3];
-            if (crop_w == 0 || crop_h == 0 || crop_x + crop_w > coded_w || crop_y + crop_h > coded_h) {
+            if (crop_w == 0 || crop_h == 0 ||
+                crop_x > coded_w || crop_w > coded_w - crop_x ||
+                crop_y > coded_h || crop_h > coded_h - crop_y) {
                 err = "Requested ROI exceeds coded sensor dimensions";
                 return false;
             }
@@ -969,14 +988,24 @@ struct DecoderSession::Impl {
             crop_y = opt_meta->crop[1];
             crop_w = opt_meta->crop[2];
             crop_h = opt_meta->crop[3];
-            if (crop_x + crop_w <= coded_w && crop_y + crop_h <= coded_h) {
+            if (crop_x <= coded_w && crop_w <= coded_w - crop_x &&
+                crop_y <= coded_h && crop_h <= coded_h - crop_y) {
                 use_crop = true;
+            } else {
+                crop_x = 0;
+                crop_y = 0;
+                crop_w = coded_w;
+                crop_h = coded_h;
             }
         }
 
         const size_t min_dst_stride = static_cast<size_t>(crop_w) * sizeof(uint16_t);
         const size_t actual_stride = (dst_row_stride_bytes == 0) ? min_dst_stride : dst_row_stride_bytes;
-        if (!dst || actual_stride < min_dst_stride || dst_height_capacity < crop_h) {
+        if (!dst || actual_stride < min_dst_stride ||
+            (!has_byte_cap && dst_height_capacity < crop_h) ||
+            (has_byte_cap &&
+             (dst_byte_cap < min_dst_stride ||
+              static_cast<size_t>(crop_h - 1u) > (dst_byte_cap - min_dst_stride) / actual_stride))) {
             err = "Destination Bayer buffer too small for output dimensions";
             return false;
         }
@@ -985,23 +1014,25 @@ struct DecoderSession::Impl {
         const int eff_threads = detail::resolve_worker_count(req_threads);
         detail::WorkerPool* ext_pool = (eff_threads > 1) ? &pool : nullptr;
 
-        const bool direct_to_dst = !use_crop && ((actual_stride & 1u) == 0);
+        const bool direct_to_dst = ((actual_stride & 1u) == 0);
         uint16_t* dec_dst = dst;
         size_t dec_stride_u16 = actual_stride / 2u;
-        size_t dec_h_cap = dst_height_capacity;
+        size_t dec_h_cap = crop_h;
         if (!direct_to_dst) {
-            scratch_pixels.resize(static_cast<size_t>(coded_w) * static_cast<size_t>(coded_h));
+            scratch_pixels.resize(static_cast<size_t>(crop_w) * static_cast<size_t>(crop_h));
             dec_dst = scratch_pixels.data();
-            dec_stride_u16 = coded_w;
-            dec_h_cap = coded_h;
+            dec_stride_u16 = crop_w;
+            dec_h_cap = crop_h;
         }
 
+        const detail::CropRect crop_rect{use_crop, crop_x, crop_y, crop_w, crop_h};
+        const detail::CropRect* crop_ptr = use_crop ? &crop_rect : nullptr;
         WaveletQuantProfile* q_ptr = opts.want_quant_profile ? &info_out.quant_profile : nullptr;
         if (codec == CodecFamily::TicoRaw) {
             TicoRawInfo jxs;
             if (!detail::decode_ticoraw_bayer_strided(
                     data, len, eff_threads, dec_dst, dec_stride_u16, dec_h_cap,
-                    jxs, err, ext_pool, tico_arena, q_ptr)) {
+                    jxs, err, ext_pool, tico_arena, q_ptr, crop_ptr)) {
                 return false;
             }
         } else if (single_a000) {
@@ -1009,14 +1040,14 @@ struct DecoderSession::Impl {
             if (!detail::decode_arw6_tile_strided(
                     data, len, eff_threads, 0, 0, coded_w, coded_h,
                     dec_dst, dec_stride_u16, dec_h_cap,
-                    arw, err, ext_pool, arw6_arena, q_ptr)) {
+                    arw, err, ext_pool, arw6_arena, q_ptr, crop_ptr)) {
                 return false;
             }
         } else {
             Arw6Info arw;
             if (!detail::decode_arw6_bayer_strided(
                     data, len, eff_threads, dec_dst, dec_stride_u16, dec_h_cap,
-                    arw, err, ext_pool, arw6_arena, q_ptr)) {
+                    arw, err, ext_pool, arw6_arena, q_ptr, crop_ptr)) {
                 return false;
             }
         }
@@ -1045,25 +1076,32 @@ struct DecoderSession::Impl {
         }
 
         uint8_t out_cfa[4] = {0, 1, 1, 2};
+        const uint32_t dy = use_crop ? (crop_y & 1u) : 0u;
+        const uint32_t dx = use_crop ? (crop_x & 1u) : 0u;
+        for (uint32_t ry = 0; ry < 2u; ++ry) {
+            for (uint32_t rx = 0; rx < 2u; ++rx) {
+                out_cfa[ry * 2u + rx] = active_cfa[((ry ^ dy) * 2u) + (rx ^ dx)];
+            }
+        }
+
         if (!direct_to_dst) {
+            uint8_t tmp_cfa[4] = {};
             if (!copy_bayer_roi_strided(
                     dec_dst,
-                    static_cast<size_t>(coded_w) * sizeof(uint16_t),
-                    coded_w,
-                    coded_h,
-                    crop_x,
-                    crop_y,
+                    static_cast<size_t>(crop_w) * sizeof(uint16_t),
                     crop_w,
                     crop_h,
-                    active_cfa,
+                    0u,
+                    0u,
+                    crop_w,
+                    crop_h,
+                    out_cfa,
                     dst,
                     actual_stride,
-                    out_cfa)) {
+                    tmp_cfa)) {
                 err = "Failed extracting ROI into caller buffer";
                 return false;
             }
-        } else {
-            std::memcpy(out_cfa, active_cfa, 4);
         }
 
         info_out.codec = codec;
@@ -1108,6 +1146,21 @@ bool DecoderSession::decode_codestream_into(
         data, len, opts, nullptr, nullptr, dst, dst_row_stride_bytes, dst_height_capacity, info_out, err);
 }
 
+bool DecoderSession::decode_codestream_into_checked(
+    const uint8_t* data,
+    size_t len,
+    const DecodeOptions& opts,
+    uint16_t* dst,
+    size_t dst_elems,
+    size_t dst_row_stride_bytes,
+    DecodedFrameInfo& info_out,
+    std::string& err) {
+    if (!impl_) impl_.reset(new Impl(0));
+    return impl_->decode_codestream_core(
+        data, len, opts, nullptr, nullptr, dst, dst_row_stride_bytes, 0u, info_out, err,
+        nullptr, true, dst_elems * sizeof(uint16_t));
+}
+
 bool DecoderSession::decode_codestream(
     const uint8_t* data,
     size_t len,
@@ -1115,23 +1168,24 @@ bool DecoderSession::decode_codestream(
     std::vector<uint16_t>& bayer_out,
     DecodedFrameInfo& info_out,
     std::string& err) {
-    CodecFamily codec = CodecFamily::Unknown;
-    uint32_t coded_w = 0, coded_h = 0;
-    uint16_t bd = 14;
-    bool single_a000 = false;
-    if (!probe_codestream_dims(data, len, codec, coded_w, coded_h, bd, single_a000, err)) {
+    if (!impl_) impl_.reset(new Impl(0));
+    Impl::ProbedHeader probed;
+    if (!probe_codestream_dims(
+            data, len, probed.codec, probed.coded_w, probed.coded_h, probed.bd, probed.single_a000, err)) {
         return false;
     }
-    const uint32_t out_w = opts.has_roi ? opts.roi[2] : coded_w;
-    const uint32_t out_h = opts.has_roi ? opts.roi[3] : coded_h;
-    if (out_w == 0 || out_h == 0) {
-        err = "Invalid output dimensions";
+    const uint32_t out_w = opts.has_roi ? opts.roi[2] : probed.coded_w;
+    const uint32_t out_h = opts.has_roi ? opts.roi[3] : probed.coded_h;
+    if (out_w == 0 || out_h == 0 ||
+        (opts.has_roi && (opts.roi[0] > probed.coded_w || opts.roi[2] > probed.coded_w - opts.roi[0] ||
+                          opts.roi[1] > probed.coded_h || opts.roi[3] > probed.coded_h - opts.roi[1]))) {
+        err = opts.has_roi ? "Requested ROI exceeds coded sensor dimensions" : "Invalid output dimensions";
         return false;
     }
     bayer_out.resize(static_cast<size_t>(out_w) * static_cast<size_t>(out_h));
-    return decode_codestream_into(
-        data, len, opts, bayer_out.data(),
-        static_cast<size_t>(out_w) * sizeof(uint16_t), out_h, info_out, err);
+    return impl_->decode_codestream_core(
+        data, len, opts, nullptr, nullptr, bayer_out.data(),
+        static_cast<size_t>(out_w) * sizeof(uint16_t), out_h, info_out, err, &probed);
 }
 
 bool DecoderSession::decode_frame_into(
@@ -1170,6 +1224,45 @@ bool DecoderSession::decode_frame_into(
     return true;
 }
 
+bool DecoderSession::decode_frame_into_checked(
+    const MediaReader& reader,
+    uint32_t frame_index,
+    const DecodeOptions& opts,
+    uint16_t* dst,
+    size_t dst_elems,
+    size_t dst_row_stride_bytes,
+    DecodedFrameInfo& info_out,
+    std::string& err) {
+    if (!impl_) impl_.reset(new Impl(0));
+    NevFrameMeta meta;
+    if (!reader.read_frame_packet(frame_index, meta, &impl_->packet_buf, err)) {
+        return false;
+    }
+    if (!impl_->decode_codestream_core(
+            impl_->packet_buf.data(),
+            impl_->packet_buf.size(),
+            opts,
+            meta.cfa_pattern,
+            &meta,
+            dst,
+            dst_row_stride_bytes,
+            0u,
+            info_out,
+            err,
+            nullptr,
+            true,
+            dst_elems * sizeof(uint16_t))) {
+        return false;
+    }
+    info_out.has_meta = true;
+    info_out.meta = meta;
+    std::string t_err;
+    if (reader.get_frame_timing(frame_index, info_out.timing, t_err)) {
+        info_out.has_timing = true;
+    }
+    return true;
+}
+
 bool DecoderSession::decode_frame(
     const MediaReader& reader,
     uint32_t frame_index,
@@ -1182,24 +1275,27 @@ bool DecoderSession::decode_frame(
     if (!reader.read_frame_packet(frame_index, meta, &impl_->packet_buf, err)) {
         return false;
     }
-    CodecFamily codec = CodecFamily::Unknown;
-    uint32_t coded_w = 0, coded_h = 0;
-    uint16_t bd = 14;
-    bool single_a000 = false;
+    Impl::ProbedHeader probed;
     if (!probe_codestream_dims(
             impl_->packet_buf.data(), impl_->packet_buf.size(),
-            codec, coded_w, coded_h, bd, single_a000, err)) {
+            probed.codec, probed.coded_w, probed.coded_h, probed.bd, probed.single_a000, err)) {
         return false;
     }
-    uint32_t out_w = coded_w;
-    uint32_t out_h = coded_h;
+    uint32_t out_w = probed.coded_w;
+    uint32_t out_h = probed.coded_h;
     if (opts.has_roi) {
         out_w = opts.roi[2];
         out_h = opts.roi[3];
+        if (out_w == 0 || out_h == 0 ||
+            opts.roi[0] > probed.coded_w || out_w > probed.coded_w - opts.roi[0] ||
+            opts.roi[1] > probed.coded_h || out_h > probed.coded_h - opts.roi[1]) {
+            err = "Requested ROI exceeds coded sensor dimensions";
+            return false;
+        }
     } else if (opts.apply_active_crop && meta.has_crop &&
                meta.crop[2] > 0 && meta.crop[3] > 0 &&
-               static_cast<uint32_t>(meta.crop[0]) + meta.crop[2] <= coded_w &&
-               static_cast<uint32_t>(meta.crop[1]) + meta.crop[3] <= coded_h) {
+               static_cast<uint32_t>(meta.crop[0]) + meta.crop[2] <= probed.coded_w &&
+               static_cast<uint32_t>(meta.crop[1]) + meta.crop[3] <= probed.coded_h) {
         out_w = meta.crop[2];
         out_h = meta.crop[3];
     }
@@ -1218,7 +1314,8 @@ bool DecoderSession::decode_frame(
             static_cast<size_t>(out_w) * sizeof(uint16_t),
             out_h,
             info_out,
-            err)) {
+            err,
+            &probed)) {
         return false;
     }
     info_out.has_meta = true;

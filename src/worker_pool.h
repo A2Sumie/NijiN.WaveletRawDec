@@ -6,17 +6,26 @@
 
 #include <algorithm>
 #include <atomic>
-#include <condition_variable>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <thread>
 #include <type_traits>
+#include <version>
 #include <vector>
 
 namespace nijinwvdc {
 namespace detail {
+
+#ifdef __APPLE__
+using NativeWaitInt = int64_t;
+#else
+using NativeWaitInt = int32_t;
+#endif
+
+inline constexpr size_t kCacheLine = 128u;
 
 inline void cpu_relax() {
 #if defined(_MSC_VER)
@@ -45,23 +54,24 @@ public:
     WorkerPool() = default;
 
     ~WorkerPool() {
-        {
-            std::lock_guard<std::mutex> lk(cv_mtx_);
-            stop_ = true;
-            stop_flag_.store(true, std::memory_order_release);
-        }
-        cv_start_.notify_all();
+        stop_flag_.store(true, std::memory_order_seq_cst);
+        const NativeWaitInt next_ep = epoch_.load(std::memory_order_relaxed) + 1;
+        epoch_.store(next_ep, std::memory_order_seq_cst);
+        epoch_.notify_all();
+#if !(defined(__cpp_lib_jthread) && __cpp_lib_jthread >= 201911L)
         for (size_t i = 0; i < threads_.size(); ++i) {
             if (threads_[i].joinable()) {
                 threads_[i].join();
             }
         }
+#endif
     }
 
     WorkerPool(const WorkerPool&) = delete;
     WorkerPool& operator=(const WorkerPool&) = delete;
 
     template <typename Fn>
+        requires std::invocable<Fn&, size_t, size_t, int>
     void parallel_for_chunks(size_t total, size_t grain, int num_workers, Fn&& fn) {
         if (total == 0u) {
             return;
@@ -79,7 +89,7 @@ public:
 
         ensure_workers(static_cast<size_t>(nw - 1));
 
-        typedef typename std::remove_reference<Fn>::type FnType;
+        using FnType = std::remove_reference_t<Fn>;
         total_items_ = total;
         grain_ = safe_grain;
         active_bg_ = nw - 1;
@@ -87,29 +97,33 @@ public:
         fn_ptr_ = &invoke_fn<FnType>;
         next_idx_.store(0u, std::memory_order_relaxed);
 
-        const int participants = 1 + static_cast<int>(threads_.size());
+        const NativeWaitInt participants = static_cast<NativeWaitInt>(1u + threads_.size());
         active_rem_.store(participants, std::memory_order_release);
 
-        {
-            std::lock_guard<std::mutex> lk(cv_mtx_);
-            const uint64_t next_ep = epoch_.load(std::memory_order_relaxed) + 1u;
-            epoch_.store(next_ep, std::memory_order_release);
+        const NativeWaitInt next_ep = epoch_.load(std::memory_order_relaxed) + 1;
+        epoch_.store(next_ep, std::memory_order_seq_cst);
+        if (sleeping_workers_.load(std::memory_order_seq_cst) > 0u) [[unlikely]] {
+            epoch_.notify_all();
         }
-        cv_start_.notify_all();
 
         run_work(0);
 
-        if (active_rem_.fetch_sub(1, std::memory_order_acq_rel) > 1) {
+        if (active_rem_.fetch_sub(1, std::memory_order_seq_cst) > 1) {
             for (int spin = 0; spin < 4000; ++spin) {
                 if (active_rem_.load(std::memory_order_acquire) == 0) {
                     return;
                 }
                 cpu_relax();
             }
-            std::unique_lock<std::mutex> lk(cv_mtx_);
-            cv_done_.wait(lk, [this]() {
-                return active_rem_.load(std::memory_order_acquire) == 0;
-            });
+            main_waiting_.store(true, std::memory_order_seq_cst);
+            for (;;) {
+                const NativeWaitInt cur = active_rem_.load(std::memory_order_seq_cst);
+                if (cur == 0) {
+                    break;
+                }
+                active_rem_.wait(cur, std::memory_order_acquire);
+            }
+            main_waiting_.store(false, std::memory_order_relaxed);
         }
     }
 
@@ -123,7 +137,7 @@ private:
         if (threads_.size() >= needed_bg) {
             return;
         }
-        const uint64_t init_ep = epoch_.load(std::memory_order_relaxed);
+        const NativeWaitInt init_ep = epoch_.load(std::memory_order_relaxed);
         threads_.reserve(needed_bg);
         while (threads_.size() < needed_bg) {
             const size_t bg_id = threads_.size();
@@ -147,13 +161,13 @@ private:
         }
     }
 
-    void worker_loop(size_t bg_id, uint64_t seen_epoch) {
+    void worker_loop(size_t bg_id, NativeWaitInt seen_epoch) {
         for (;;) {
-            uint64_t cur = epoch_.load(std::memory_order_acquire);
+            NativeWaitInt cur = epoch_.load(std::memory_order_acquire);
             if (cur == seen_epoch) {
                 for (int spin = 0; spin < 2000; ++spin) {
                     cpu_relax();
-                    if (stop_flag_.load(std::memory_order_acquire)) {
+                    if (stop_flag_.load(std::memory_order_acquire)) [[unlikely]] {
                         return;
                     }
                     cur = epoch_.load(std::memory_order_acquire);
@@ -161,46 +175,56 @@ private:
                         break;
                     }
                 }
-                if (cur == seen_epoch) {
-                    std::unique_lock<std::mutex> lk(cv_mtx_);
-                    cv_start_.wait(lk, [this, seen_epoch]() {
-                        return stop_ || epoch_.load(std::memory_order_acquire) != seen_epoch;
-                    });
-                    if (stop_ && epoch_.load(std::memory_order_acquire) == seen_epoch) {
+                while (cur == seen_epoch) {
+                    if (stop_flag_.load(std::memory_order_acquire)) [[unlikely]] {
                         return;
                     }
+                    sleeping_workers_.fetch_add(1u, std::memory_order_seq_cst);
+                    cur = epoch_.load(std::memory_order_seq_cst);
+                    if (cur == seen_epoch && !stop_flag_.load(std::memory_order_seq_cst)) {
+                        epoch_.wait(seen_epoch, std::memory_order_acquire);
+                    }
+                    sleeping_workers_.fetch_sub(1u, std::memory_order_relaxed);
                     cur = epoch_.load(std::memory_order_acquire);
                 }
             }
-            if (stop_flag_.load(std::memory_order_acquire)) {
+            if (stop_flag_.load(std::memory_order_acquire)) [[unlikely]] {
                 return;
             }
             seen_epoch = cur;
             if (static_cast<int>(bg_id) < active_bg_) {
                 run_work(static_cast<int>(bg_id + 1u));
             }
-            if (active_rem_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                std::lock_guard<std::mutex> lk(cv_mtx_);
-                cv_done_.notify_one();
+            if (active_rem_.fetch_sub(1, std::memory_order_seq_cst) == 1) {
+                if (main_waiting_.load(std::memory_order_seq_cst)) [[unlikely]] {
+                    active_rem_.notify_one();
+                }
             }
         }
     }
 
-    std::vector<std::thread> threads_;
-    std::mutex cv_mtx_;
-    std::condition_variable cv_start_;
-    std::condition_variable cv_done_;
-    std::atomic<uint64_t> epoch_{0};
-    std::atomic<size_t> next_idx_{0};
-    std::atomic<int> active_rem_{0};
+    // Group 1: Read-only per-epoch dispatch metadata + wakeup epoch
+    alignas(kCacheLine) std::atomic<NativeWaitInt> epoch_{0};
     std::atomic<bool> stop_flag_{false};
-    bool stop_ = false;
-
+    std::atomic<uint32_t> sleeping_workers_{0};
+    std::atomic<bool> main_waiting_{false};
     size_t total_items_ = 0;
     size_t grain_ = 1;
     int active_bg_ = 0;
     void* fn_ctx_ = nullptr;
     void (*fn_ptr_)(void*, size_t, size_t, int) = nullptr;
+
+    // Group 2: Contended work-stealing counter isolated on its own coherency line
+    alignas(kCacheLine) std::atomic<size_t> next_idx_{0};
+
+    // Group 3: Completion counter isolated on its own coherency line
+    alignas(kCacheLine) std::atomic<NativeWaitInt> active_rem_{0};
+
+#if defined(__cpp_lib_jthread) && __cpp_lib_jthread >= 201911L
+    std::vector<std::jthread> threads_;
+#else
+    std::vector<std::thread> threads_;
+#endif
 };
 
 inline std::mutex& global_pool_dispatch_mutex() {
@@ -236,6 +260,7 @@ struct PoolLease {
     }
 
     template <typename Fn>
+        requires std::invocable<Fn&, size_t, size_t, int>
     void parallel_chunks(size_t total, size_t grain, int num_workers, Fn&& fn) {
         if (total == 0u) {
             return;
@@ -248,6 +273,7 @@ struct PoolLease {
     }
 
     template <typename Fn>
+        requires std::invocable<Fn&, size_t, size_t, int>
     void parallel_strips(size_t total_rows, size_t min_rows, int num_workers, Fn&& fn) {
         if (total_rows == 0u) {
             return;

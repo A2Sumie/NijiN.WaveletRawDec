@@ -3,11 +3,14 @@
 #define NIJINWVDC_TIFF_INTERNAL_H
 
 #include "../include/nijinWVDC.h"
+#include "simd_platform.h"
 
+#include <bit>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #ifdef _WIN32
@@ -28,52 +31,64 @@
 namespace nijinwvdc {
 namespace detail {
 
-inline uint16_t rd_be16(const uint8_t* p) {
-    return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
+inline uint16_t rd_be16(const uint8_t* p) noexcept {
+    uint16_t v = 0;
+    std::memcpy(&v, p, sizeof(v));
+    if constexpr (std::endian::native == std::endian::little) {
+        return bswap16(v);
+    } else {
+        return v;
+    }
 }
 
-inline uint32_t rd_be32(const uint8_t* p) {
-    return (static_cast<uint32_t>(p[0]) << 24) |
-           (static_cast<uint32_t>(p[1]) << 16) |
-           (static_cast<uint32_t>(p[2]) << 8) |
-           static_cast<uint32_t>(p[3]);
+inline uint32_t rd_be32(const uint8_t* p) noexcept {
+    uint32_t v = 0;
+    std::memcpy(&v, p, sizeof(v));
+    if constexpr (std::endian::native == std::endian::little) {
+        return bswap32(v);
+    } else {
+        return v;
+    }
 }
 
-inline uint64_t rd_be64(const uint8_t* p) {
-    return (static_cast<uint64_t>(rd_be32(p)) << 32) | static_cast<uint64_t>(rd_be32(p + 4));
+inline uint64_t rd_be64(const uint8_t* p) noexcept {
+    return rd_be64_fast(p);
 }
 
-inline uint16_t rd_le16(const uint8_t* p) {
-    return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
+inline uint16_t rd_le16(const uint8_t* p) noexcept {
+    uint16_t v = 0;
+    std::memcpy(&v, p, sizeof(v));
+    if constexpr (std::endian::native == std::endian::big) {
+        return bswap16(v);
+    } else {
+        return v;
+    }
 }
 
-inline uint32_t rd_le32(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
+inline uint32_t rd_le32(const uint8_t* p) noexcept {
+    uint32_t v = 0;
+    std::memcpy(&v, p, sizeof(v));
+    if constexpr (std::endian::native == std::endian::big) {
+        return bswap32(v);
+    } else {
+        return v;
+    }
 }
 
-inline uint16_t rd_u16_e(const uint8_t* p, bool be) {
+inline uint16_t rd_u16_e(const uint8_t* p, bool be) noexcept {
     return be ? rd_be16(p) : rd_le16(p);
 }
 
-inline uint32_t rd_u32_e(const uint8_t* p, bool be) {
+inline uint32_t rd_u32_e(const uint8_t* p, bool be) noexcept {
     return be ? rd_be32(p) : rd_le32(p);
 }
 
-inline float rd_be_f32(const uint8_t* p) {
-    uint32_t u = rd_be32(p);
-    float f = 0.0f;
-    std::memcpy(&f, &u, sizeof(f));
-    return f;
+inline float rd_be_f32(const uint8_t* p) noexcept {
+    return std::bit_cast<float>(rd_be32(p));
 }
 
-inline double rd_be_f64(const uint8_t* p) {
-    uint64_t u = rd_be64(p);
-    double d = 0.0;
-    std::memcpy(&d, &u, sizeof(d));
-    return d;
+inline double rd_be_f64(const uint8_t* p) noexcept {
+    return std::bit_cast<double>(rd_be64(p));
 }
 
 inline std::string fourcc_to_str(const uint8_t* p) {
@@ -92,7 +107,7 @@ inline std::string rstrip_ascii(const uint8_t* p, size_t n) {
 }
 
 #ifdef _WIN32
-inline std::wstring utf8_to_wide(const std::string& utf8) {
+inline std::wstring utf8_to_wide(std::string_view utf8) {
     if (utf8.empty()) {
         return std::wstring();
     }
@@ -105,20 +120,37 @@ inline std::wstring utf8_to_wide(const std::string& utf8) {
     return w;
 }
 
-inline FILE* open_c_file_read(const std::string& path) {
+inline FILE* open_c_file_read(std::string_view path) {
     return _wfopen(utf8_to_wide(path).c_str(), L"rb");
 }
 
-inline FILE* open_c_file_write(const std::string& path) {
+inline FILE* open_c_file_write(std::string_view path) {
     return _wfopen(utf8_to_wide(path).c_str(), L"wb");
 }
+
+struct ScopedThreadEvent {
+    HANDLE ev = nullptr;
+    HANDLE get() {
+        if (!ev) {
+            ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        }
+        return ev;
+    }
+    ~ScopedThreadEvent() {
+        if (ev) {
+            CloseHandle(ev);
+        }
+    }
+};
 #else
-inline FILE* open_c_file_read(const std::string& path) {
-    return std::fopen(path.c_str(), "rb");
+inline FILE* open_c_file_read(std::string_view path) {
+    std::string p(path);
+    return std::fopen(p.c_str(), "rb");
 }
 
-inline FILE* open_c_file_write(const std::string& path) {
-    return std::fopen(path.c_str(), "wb");
+inline FILE* open_c_file_write(std::string_view path) {
+    std::string p(path);
+    return std::fopen(p.c_str(), "wb");
 }
 #endif
 
@@ -161,7 +193,7 @@ public:
         callbacks_ = IoCallbacks{};
     }
 
-    bool open_file(const std::string& path, std::string& err) {
+    bool open_file(std::string_view path, std::string& err) {
         close();
 #ifdef _WIN32
         std::wstring wpath = utf8_to_wide(path);
@@ -174,13 +206,15 @@ public:
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
             nullptr);
         if (h == INVALID_HANDLE_VALUE) {
-            err = "Cannot open input file: " + path;
+            err = "Cannot open input file: ";
+            err.append(path);
             return false;
         }
         LARGE_INTEGER li{};
         if (!GetFileSizeEx(h, &li) || li.QuadPart < 0) {
             CloseHandle(h);
-            err = "Cannot determine size of input file: " + path;
+            err = "Cannot determine size of input file: ";
+            err.append(path);
             return false;
         }
         win_handle_ = h;
@@ -188,15 +222,18 @@ public:
         mode_ = Mode::File;
         return true;
 #else
-        int fd = ::open(path.c_str(), O_RDONLY);
+        std::string p_str(path);
+        int fd = ::open(p_str.c_str(), O_RDONLY);
         if (fd < 0) {
-            err = "Cannot open input file: " + path;
+            err = "Cannot open input file: ";
+            err.append(path);
             return false;
         }
         struct stat st {};
         if (::fstat(fd, &st) != 0 || st.st_size < 0) {
             ::close(fd);
-            err = "Cannot stat input file: " + path;
+            err = "Cannot stat input file: ";
+            err.append(path);
             return false;
         }
         fd_ = fd;
@@ -253,7 +290,8 @@ public:
         uint64_t cur = off;
 #ifdef _WIN32
         HANDLE h = static_cast<HANDLE>(win_handle_);
-        HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        thread_local ScopedThreadEvent tl_ev;
+        HANDLE ev = tl_ev.get();
         if (!ev) {
             return false;
         }
@@ -282,7 +320,6 @@ public:
             cur += got;
             rem -= got;
         }
-        CloseHandle(ev);
         return ok;
 #else
         while (rem > 0) {
@@ -336,7 +373,7 @@ private:
 
 struct ScopedFile {
     FILE* fp = nullptr;
-    explicit ScopedFile(const std::string& path) : fp(open_c_file_read(path)) {}
+    explicit ScopedFile(std::string_view path) : fp(open_c_file_read(path)) {}
     ~ScopedFile() {
         if (fp) {
             std::fclose(fp);
@@ -394,7 +431,7 @@ bool parse_sony_arw_tiff_reader(
 
 bool parse_nev_clip_reader(
     const RandomAccessReader& r,
-    const std::string& display_path,
+    std::string_view display_path,
     NevClipInfo& clip,
     std::string& err);
 

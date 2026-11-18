@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 CXX      ?= clang++
 CC       ?= cc
-CXXFLAGS ?= -O3 -std=c++17 -Wall -Wextra -Werror
+CXXFLAGS ?= -O3 -std=c++20 -Wall -Wextra -Werror
 CFLAGS   ?= -O2 -std=c11 -Wall -Wextra -Werror
 BUILD    ?= build
 
@@ -22,7 +22,7 @@ STATIC_OBJS := $(patsubst src/%.cpp,$(BUILD)/static/%.o,$(LIB_SRCS))
 SHARED_OBJS := $(patsubst src/%.cpp,$(BUILD)/shared/%.o,$(LIB_SRCS))
 HDRS := include/nijinWVDC.h include/nijinWVDC_c.h include/nijinWVDC_export.h \
         src/tiff_internal.h src/worker_pool.h src/simd_platform.h src/codec_internal.h \
-        src/focus_meta_internal.h
+        src/focus_meta_internal.h src/quant_model_internal.h
 
 STATIC_LIB   := $(BUILD)/libnijinWVDC.a
 SHARED_LIB   := $(BUILD)/libnijinWVDC.$(SHLIB_EXT)
@@ -64,16 +64,16 @@ $(TEST_C): tests/test_c_api.c $(SHARED_LIB) include/nijinWVDC_c.h include/nijinW
 	$(CC) $(CFLAGS) tests/test_c_api.c $(SHARED_LIB) $(RPATH_FLAG) -lm -o $@
 
 asan: | $(BUILD)
-	$(CXX) -O1 -g -std=c++17 -Wall -Wextra -Werror -DNIJINWVDC_STATIC \
+	$(CXX) -O1 -g -std=c++20 -Wall -Wextra -Werror -DNIJINWVDC_STATIC \
 		-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
 		src/main.cpp $(LIB_SRCS) -lpthread -lm -o $(ASAN_CLI)
-	$(CXX) -O1 -g -std=c++17 -Wall -Wextra -Werror -DNIJINWVDC_STATIC \
+	$(CXX) -O1 -g -std=c++20 -Wall -Wextra -Werror -DNIJINWVDC_STATIC \
 		-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
 		tests/test_nijinWVDC.cpp $(LIB_SRCS) -lpthread -lm -o $(ASAN_TEST)
 	$(CC) -O1 -g -std=c11 -Wall -Wextra -Werror -DNIJINWVDC_STATIC \
 		-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
 		-c tests/test_c_api.c -o $(BUILD)/test_c_api_asan.o
-	$(CXX) -O1 -g -std=c++17 -DNIJINWVDC_STATIC \
+	$(CXX) -O1 -g -std=c++20 -DNIJINWVDC_STATIC \
 		-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
 		$(BUILD)/test_c_api_asan.o $(LIB_SRCS) -lpthread -lm -o $(ASAN_C_TEST)
 

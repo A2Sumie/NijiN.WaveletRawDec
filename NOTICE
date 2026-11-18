@@ -5,7 +5,7 @@ This software is licensed under the Apache License, Version 2.0 (see the
 LICENSE file in this directory for the full text).
 
 Provenance and Interoperability Notice:
-  This package is an independent, clean-room C++17 implementation based on
+  This package is an independent, clean-room C++20 implementation based on
   observable QuickTime/ISOBMFF NRAW container structures, TIFF-EP / Nikon
   HE/HE* SubIFD layouts, ISO/IEC 21122 (JPEG XS) / TicoRAW R0 codestream
   mathematics, Sony ARW6 (Compressed HQ / Compressed, Compression=32766)

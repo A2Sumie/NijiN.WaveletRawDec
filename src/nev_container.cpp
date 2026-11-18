@@ -94,7 +94,7 @@ struct RawTrackData {
 };
 
 bool parse_nctg_buffer(const uint8_t* data, size_t len, NevClipInfo& clip) {
-    static const size_t kTypeSizes[13] = {0, 1, 1, 2, 4, 8, 1, 1, 2, 4, 8, 4, 8};
+    static constexpr uint8_t kTypeSizes[13] = {0, 1, 1, 2, 4, 8, 1, 1, 2, 4, 8, 4, 8};
     size_t pos = 0;
     while (pos + 8 <= len) {
         uint32_t tag = rd_be32(data + pos);
@@ -503,7 +503,7 @@ void parse_sequential_makernote(const uint8_t* buf, size_t len, NevFrameMeta& me
     if (len < 2 || buf[0] != 'I' || buf[1] != 'I') {
         return;
     }
-    static const size_t kTypeSizes[13] = {0, 1, 1, 2, 4, 8, 1, 1, 2, 4, 8, 4, 8};
+    static constexpr uint8_t kTypeSizes[13] = {0, 1, 1, 2, 4, 8, 1, 1, 2, 4, 8, 4, 8};
     size_t pos = 2;
     while (pos + 8 <= len) {
         uint16_t tag = rd_le16(buf + pos);
@@ -527,7 +527,7 @@ void parse_sequential_makernote(const uint8_t* buf, size_t len, NevFrameMeta& me
 namespace detail {
 
 size_t tiff_dtype_size(uint16_t dtype) {
-    static const size_t kSizes[14] = {0, 1, 1, 2, 4, 8, 1, 1, 2, 4, 8, 4, 8, 4};
+    static constexpr uint8_t kSizes[14] = {0, 1, 1, 2, 4, 8, 1, 1, 2, 4, 8, 4, 8, 4};
     return (dtype < 14) ? kSizes[dtype] : 0;
 }
 
@@ -895,11 +895,11 @@ namespace detail {
 
 bool parse_nev_clip_reader(
     const RandomAccessReader& r,
-    const std::string& display_path,
+    std::string_view display_path,
     NevClipInfo& clip,
     std::string& err) {
     clip = NevClipInfo();
-    clip.file_path = display_path;
+    clip.file_path.assign(display_path);
     if (!r.is_open() || r.size() == 0) {
         err = "Input reader is empty or not open";
         return false;
@@ -1244,9 +1244,9 @@ bool extract_blob_reader(
 
 } // namespace detail
 
-bool parse_nev_clip(const std::string& path, NevClipInfo& clip, std::string& err) {
+bool parse_nev_clip(std::string_view path, NevClipInfo& clip, std::string& err) {
     clip = NevClipInfo();
-    clip.file_path = path;
+    clip.file_path.assign(path);
     RandomAccessReader r;
     if (!r.open_file(path, err)) {
         return false;
@@ -1269,7 +1269,7 @@ bool read_nev_frame_meta_and_codestream(
 }
 
 bool extract_nev_blob(
-    const std::string& path,
+    std::string_view path,
     uint64_t offset,
     uint32_t size,
     std::vector<uint8_t>& out,

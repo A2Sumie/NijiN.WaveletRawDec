@@ -7,7 +7,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace nijinwvdc {
@@ -353,7 +355,7 @@ struct DngWriteOptions {
 };
 
 // Container parsing (64-bit file I/O)
-NIJINWVDC_API bool parse_nev_clip(const std::string& path, NevClipInfo& clip, std::string& err);
+NIJINWVDC_API bool parse_nev_clip(std::string_view path, NevClipInfo& clip, std::string& err);
 NIJINWVDC_API bool read_nev_frame_meta_and_codestream(
     const NevClipInfo& clip,
     uint32_t frame_index,
@@ -361,7 +363,7 @@ NIJINWVDC_API bool read_nev_frame_meta_and_codestream(
     std::vector<uint8_t>* codestream_out,
     std::string& err);
 NIJINWVDC_API bool extract_nev_blob(
-    const std::string& path,
+    std::string_view path,
     uint64_t offset,
     uint32_t size,
     std::vector<uint8_t>& out,
@@ -374,6 +376,13 @@ NIJINWVDC_API bool probe_ticoraw_header(
     TicoRawInfo& info,
     std::string& err);
 
+inline bool probe_ticoraw_header(
+    std::span<const uint8_t> data,
+    TicoRawInfo& info,
+    std::string& err) {
+    return probe_ticoraw_header(data.data(), data.size(), info, err);
+}
+
 NIJINWVDC_API bool decode_ticoraw_bayer(
     const uint8_t* data,
     size_t len,
@@ -382,6 +391,15 @@ NIJINWVDC_API bool decode_ticoraw_bayer(
     TicoRawInfo& info_out,
     std::string& err);
 
+inline bool decode_ticoraw_bayer(
+    std::span<const uint8_t> data,
+    int num_threads,
+    std::vector<uint16_t>& bayer_out,
+    TicoRawInfo& info_out,
+    std::string& err) {
+    return decode_ticoraw_bayer(data.data(), data.size(), num_threads, bayer_out, info_out, err);
+}
+
 // Sony ARW6 (Compression=32766, SonyRawFileType=6) multi-tile & "A000" wavelet decoding
 NIJINWVDC_API bool probe_arw6_codestream(
     const uint8_t* data,
@@ -389,11 +407,25 @@ NIJINWVDC_API bool probe_arw6_codestream(
     Arw6Info& info,
     std::string& err);
 
+inline bool probe_arw6_codestream(
+    std::span<const uint8_t> data,
+    Arw6Info& info,
+    std::string& err) {
+    return probe_arw6_codestream(data.data(), data.size(), info, err);
+}
+
 NIJINWVDC_API bool probe_arw6_strip(
     const uint8_t* strip_data,
     size_t strip_len,
     Arw6Info& info,
     std::string& err);
+
+inline bool probe_arw6_strip(
+    std::span<const uint8_t> strip_data,
+    Arw6Info& info,
+    std::string& err) {
+    return probe_arw6_strip(strip_data.data(), strip_data.size(), info, err);
+}
 
 NIJINWVDC_API bool decode_arw6_tile(
     const uint8_t* cs_data,
@@ -407,6 +439,21 @@ NIJINWVDC_API bool decode_arw6_tile(
     Arw6Info& tile_info_out,
     std::string& err);
 
+inline bool decode_arw6_tile(
+    std::span<const uint8_t> cs_data,
+    int num_threads,
+    uint32_t tile_x,
+    uint32_t tile_y,
+    uint32_t full_w,
+    uint32_t full_h,
+    std::vector<uint16_t>& bayer_out,
+    Arw6Info& tile_info_out,
+    std::string& err) {
+    return decode_arw6_tile(
+        cs_data.data(), cs_data.size(), num_threads,
+        tile_x, tile_y, full_w, full_h, bayer_out, tile_info_out, err);
+}
+
 NIJINWVDC_API bool decode_arw6_bayer(
     const uint8_t* strip_data,
     size_t strip_len,
@@ -415,9 +462,18 @@ NIJINWVDC_API bool decode_arw6_bayer(
     Arw6Info& info_out,
     std::string& err);
 
+inline bool decode_arw6_bayer(
+    std::span<const uint8_t> strip_data,
+    int num_threads,
+    std::vector<uint16_t>& bayer_out,
+    Arw6Info& info_out,
+    std::string& err) {
+    return decode_arw6_bayer(strip_data.data(), strip_data.size(), num_threads, bayer_out, info_out, err);
+}
+
 // DNG 1.4 writer & camera matrix lookup
-NIJINWVDC_API bool lookup_nikon_d65_colormatrix(const std::string& model, double out_cm[9]);
-NIJINWVDC_API bool lookup_camera_d65_colormatrix(const std::string& make, const std::string& model, double out_cm[9]);
+NIJINWVDC_API bool lookup_nikon_d65_colormatrix(std::string_view model, double out_cm[9]);
+NIJINWVDC_API bool lookup_camera_d65_colormatrix(std::string_view make, std::string_view model, double out_cm[9]);
 NIJINWVDC_API void build_dng_options_from_clip_and_frame(
     const NevClipInfo& clip,
     const NevFrameMeta& meta,
@@ -440,11 +496,40 @@ NIJINWVDC_API bool apply_bayer_crop(
     const uint8_t src_cfa[4],
     std::vector<uint16_t>& dst,
     uint8_t dst_cfa[4]);
+
+inline bool apply_bayer_crop(
+    std::span<const uint16_t> src,
+    uint32_t src_w,
+    uint32_t src_h,
+    const uint16_t crop_xywh[4],
+    const uint8_t src_cfa[4],
+    std::vector<uint16_t>& dst,
+    uint8_t dst_cfa[4]) {
+    if (src_w == 0 || src_h == 0 ||
+        src.size() < static_cast<size_t>(src_w) * static_cast<size_t>(src_h)) {
+        return false;
+    }
+    return apply_bayer_crop(src.data(), src_w, src_h, crop_xywh, src_cfa, dst, dst_cfa);
+}
+
 NIJINWVDC_API bool write_cfa_dng(
-    const std::string& path,
+    std::string_view path,
     const uint16_t* pixels,
     const DngWriteOptions& opts,
     std::string& err);
+
+inline bool write_cfa_dng(
+    std::string_view path,
+    std::span<const uint16_t> pixels,
+    const DngWriteOptions& opts,
+    std::string& err) {
+    if (opts.width == 0 || opts.height == 0 ||
+        pixels.size() < static_cast<size_t>(opts.width) * static_cast<size_t>(opts.height)) {
+        err = "Pixel span smaller than DNG dimensions";
+        return false;
+    }
+    return write_cfa_dng(path, pixels.data(), opts, err);
+}
 
 // High-throughput strided post-processing & in-memory DNG helpers
 NIJINWVDC_API bool apply_bayer_crop_strided(
@@ -469,6 +554,28 @@ NIJINWVDC_API bool split_bayer_cfa_planes(
     uint16_t* c11,
     size_t plane_row_stride_bytes);
 
+inline bool split_bayer_cfa_planes(
+    std::span<const uint16_t> src,
+    uint32_t width,
+    uint32_t height,
+    std::span<uint16_t> c00,
+    std::span<uint16_t> c01,
+    std::span<uint16_t> c10,
+    std::span<uint16_t> c11) {
+    if (width == 0 || height == 0 || (width & 1u) != 0 || (height & 1u) != 0) {
+        return false;
+    }
+    const size_t full_px = static_cast<size_t>(width) * static_cast<size_t>(height);
+    const size_t q_px = static_cast<size_t>(width / 2u) * static_cast<size_t>(height / 2u);
+    if (src.size() < full_px || c00.size() < q_px || c01.size() < q_px ||
+        c10.size() < q_px || c11.size() < q_px) {
+        return false;
+    }
+    return split_bayer_cfa_planes(
+        src.data(), 0, width, height,
+        c00.data(), c01.data(), c10.data(), c11.data(), 0);
+}
+
 NIJINWVDC_API bool normalize_bayer_to_float(
     const uint16_t* src,
     size_t src_row_stride_bytes,
@@ -479,6 +586,21 @@ NIJINWVDC_API bool normalize_bayer_to_float(
     bool clamp_01,
     float* dst,
     size_t dst_row_stride_bytes);
+
+inline bool normalize_bayer_to_float(
+    std::span<const uint16_t> src,
+    uint32_t width,
+    uint32_t height,
+    const float black[4],
+    float white_level,
+    bool clamp_01,
+    std::span<float> dst) {
+    const size_t px = static_cast<size_t>(width) * static_cast<size_t>(height);
+    if (width == 0 || height == 0 || src.size() < px || dst.size() < px) {
+        return false;
+    }
+    return normalize_bayer_to_float(src.data(), 0, width, height, black, white_level, clamp_01, dst.data(), 0);
+}
 
 NIJINWVDC_API bool build_cfa_dng_header(
     const DngWriteOptions& opts,
@@ -491,6 +613,19 @@ NIJINWVDC_API bool encode_cfa_dng_memory(
     std::vector<uint8_t>& dng_out,
     std::string& err);
 
+inline bool encode_cfa_dng_memory(
+    std::span<const uint16_t> pixels,
+    const DngWriteOptions& opts,
+    std::vector<uint8_t>& dng_out,
+    std::string& err) {
+    if (opts.width == 0 || opts.height == 0 ||
+        pixels.size() < static_cast<size_t>(opts.width) * static_cast<size_t>(opts.height)) {
+        err = "Pixel span smaller than DNG dimensions";
+        return false;
+    }
+    return encode_cfa_dng_memory(pixels.data(), opts, dng_out, err);
+}
+
 // Stateful, thread-safe container & media reader (file / memory / callbacks)
 class MediaReader {
 public:
@@ -501,8 +636,11 @@ public:
     MediaReader(const MediaReader&) = delete;
     MediaReader& operator=(const MediaReader&) = delete;
 
-    NIJINWVDC_API bool open_file(const std::string& path, std::string& err);
+    NIJINWVDC_API bool open_file(std::string_view path, std::string& err);
     NIJINWVDC_API bool open_memory(const uint8_t* data, size_t size, std::string& err);
+    inline bool open_memory(std::span<const uint8_t> data, std::string& err) {
+        return open_memory(data.data(), data.size(), err);
+    }
     NIJINWVDC_API bool open_callbacks(const IoCallbacks& callbacks, std::string& err);
     NIJINWVDC_API void close();
 
@@ -536,7 +674,15 @@ public:
         size_t dst_bytes,
         uint64_t* frames_read_out,
         std::string& err) const;
-    NIJINWVDC_API bool export_audio_wav(const std::string& wav_path, std::string& err) const;
+    inline bool read_audio_pcm_into(
+        uint64_t start_frame,
+        uint64_t frame_count,
+        std::span<uint8_t> dst,
+        uint64_t* frames_read_out,
+        std::string& err) const {
+        return read_audio_pcm_into(start_frame, frame_count, dst.data(), dst.size(), frames_read_out, err);
+    }
+    NIJINWVDC_API bool export_audio_wav(std::string_view wav_path, std::string& err) const;
     NIJINWVDC_API bool extract_preview_jpeg(std::vector<uint8_t>& jpeg_out, std::string& err) const;
 
     struct Impl;
@@ -565,6 +711,15 @@ public:
         DecodedFrameInfo& info_out,
         std::string& err);
 
+    inline bool decode_codestream(
+        std::span<const uint8_t> data,
+        const DecodeOptions& opts,
+        std::vector<uint16_t>& bayer_out,
+        DecodedFrameInfo& info_out,
+        std::string& err) {
+        return decode_codestream(data.data(), data.size(), opts, bayer_out, info_out, err);
+    }
+
     NIJINWVDC_API bool decode_codestream_into(
         const uint8_t* data,
         size_t len,
@@ -574,6 +729,17 @@ public:
         size_t dst_height_capacity,
         DecodedFrameInfo& info_out,
         std::string& err);
+
+    inline bool decode_codestream_into(
+        std::span<const uint8_t> data,
+        const DecodeOptions& opts,
+        std::span<uint16_t> dst,
+        size_t dst_row_stride_bytes,
+        DecodedFrameInfo& info_out,
+        std::string& err) {
+        return decode_codestream_into_checked(
+            data.data(), data.size(), opts, dst.data(), dst.size(), dst_row_stride_bytes, info_out, err);
+    }
 
     NIJINWVDC_API bool decode_frame(
         const MediaReader& reader,
@@ -593,8 +759,40 @@ public:
         DecodedFrameInfo& info_out,
         std::string& err);
 
+    inline bool decode_frame_into(
+        const MediaReader& reader,
+        uint32_t frame_index,
+        const DecodeOptions& opts,
+        std::span<uint16_t> dst,
+        size_t dst_row_stride_bytes,
+        DecodedFrameInfo& info_out,
+        std::string& err) {
+        return decode_frame_into_checked(
+            reader, frame_index, opts, dst.data(), dst.size(), dst_row_stride_bytes, info_out, err);
+    }
+
     struct Impl;
 private:
+    NIJINWVDC_API bool decode_codestream_into_checked(
+        const uint8_t* data,
+        size_t len,
+        const DecodeOptions& opts,
+        uint16_t* dst,
+        size_t dst_elems,
+        size_t dst_row_stride_bytes,
+        DecodedFrameInfo& info_out,
+        std::string& err);
+
+    NIJINWVDC_API bool decode_frame_into_checked(
+        const MediaReader& reader,
+        uint32_t frame_index,
+        const DecodeOptions& opts,
+        uint16_t* dst,
+        size_t dst_elems,
+        size_t dst_row_stride_bytes,
+        DecodedFrameInfo& info_out,
+        std::string& err);
+
     std::unique_ptr<Impl> impl_;
 };
 

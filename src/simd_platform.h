@@ -4,8 +4,11 @@
 
 #include "../include/nijinWVDC_export.h"
 
+#include <array>
+#include <bit>
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
 
 #if defined(__ARM_NEON) || defined(__aarch64__) || defined(_M_ARM64)
 #define NIJIN_ARM_NEON 1
@@ -47,43 +50,89 @@
 namespace nijinwvdc {
 namespace detail {
 
-inline uint64_t rd_be64_fast(const uint8_t* p) {
+constexpr uint16_t bswap16(uint16_t v) noexcept {
+    if (!std::is_constant_evaluated()) {
 #if defined(__GNUC__) || defined(__clang__)
-    uint64_t v = 0;
-    std::memcpy(&v, p, sizeof(v));
-    return __builtin_bswap64(v);
+        return __builtin_bswap16(v);
 #elif defined(_MSC_VER)
-    uint64_t v = 0;
-    std::memcpy(&v, p, sizeof(v));
-    return _byteswap_uint64(v);
-#else
-    return (static_cast<uint64_t>(p[0]) << 56) |
-           (static_cast<uint64_t>(p[1]) << 48) |
-           (static_cast<uint64_t>(p[2]) << 40) |
-           (static_cast<uint64_t>(p[3]) << 32) |
-           (static_cast<uint64_t>(p[4]) << 24) |
-           (static_cast<uint64_t>(p[5]) << 16) |
-           (static_cast<uint64_t>(p[6]) << 8) |
-           static_cast<uint64_t>(p[7]);
+        return _byteswap_ushort(v);
 #endif
+    }
+    return static_cast<uint16_t>((v << 8) | (v >> 8));
 }
 
-inline int32_t clz64_nz(uint64_t v) {
+constexpr uint32_t bswap32(uint32_t v) noexcept {
+    if (!std::is_constant_evaluated()) {
 #if defined(__GNUC__) || defined(__clang__)
-    return __builtin_clzll(v);
-#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64))
-    unsigned long idx = 0;
-    _BitScanReverse64(&idx, v);
-    return static_cast<int32_t>(63u - idx);
-#else
-    int32_t n = 0;
-    while ((v >> 63) == 0ULL) {
-        v <<= 1;
-        ++n;
-    }
-    return n;
+        return __builtin_bswap32(v);
+#elif defined(_MSC_VER)
+        return _byteswap_ulong(v);
 #endif
+    }
+    return ((v & 0x000000FFu) << 24) |
+           ((v & 0x0000FF00u) << 8) |
+           ((v & 0x00FF0000u) >> 8) |
+           ((v & 0xFF000000u) >> 24);
 }
+
+constexpr uint64_t bswap64(uint64_t v) noexcept {
+    if (!std::is_constant_evaluated()) {
+#if defined(__GNUC__) || defined(__clang__)
+        return __builtin_bswap64(v);
+#elif defined(_MSC_VER)
+        return _byteswap_uint64(v);
+#endif
+    }
+    return ((v & 0x00000000000000FFULL) << 56) |
+           ((v & 0x000000000000FF00ULL) << 40) |
+           ((v & 0x0000000000FF0000ULL) << 24) |
+           ((v & 0x00000000FF000000ULL) << 8) |
+           ((v & 0x000000FF00000000ULL) >> 8) |
+           ((v & 0x0000FF0000000000ULL) >> 24) |
+           ((v & 0x00FF000000000000ULL) >> 40) |
+           ((v & 0xFF00000000000000ULL) >> 56);
+}
+
+inline uint64_t rd_be64_fast(const uint8_t* p) noexcept {
+    uint64_t v = 0;
+    std::memcpy(&v, p, sizeof(v));
+    if constexpr (std::endian::native == std::endian::little) {
+        return bswap64(v);
+    } else {
+        return v;
+    }
+}
+
+constexpr int32_t clz64_nz(uint64_t v) noexcept {
+    return static_cast<int32_t>(std::countl_zero(v));
+}
+
+// Lookup mapping [nzmask (0..15)][s_nib (0..15)] -> 4-bit negative lane mask.
+struct SignExpandTable {
+    uint8_t mask[16][16] = {};
+};
+
+consteval SignExpandTable make_sign_expand_table() noexcept {
+    SignExpandTable t{};
+    for (int nz = 0; nz < 16; ++nz) {
+        for (int sn = 0; sn < 16; ++sn) {
+            int sbit = 3;
+            uint8_t out = 0;
+            for (int lane = 0; lane < 4; ++lane) {
+                if ((nz >> lane) & 1) {
+                    if ((sn >> sbit) & 1) {
+                        out = static_cast<uint8_t>(out | (1u << lane));
+                    }
+                    --sbit;
+                }
+            }
+            t.mask[nz][sn] = out;
+        }
+    }
+    return t;
+}
+
+inline constexpr SignExpandTable kSignExpandTable = make_sign_expand_table();
 
 inline uint32_t detect_simd_capabilities() {
     uint32_t caps = NIJIN_SIMD_NONE;

@@ -7,7 +7,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <span>
 #include <string>
+#include <string_view>
 #include <sys/stat.h>
 #include <thread>
 #include <vector>
@@ -1185,6 +1187,41 @@ void test_optional_real_corpus() {
             CHECK(nijinwvdc::apply_bayer_crop(
                 b4.data(), info4.width, info4.height, m0.crop, m0.cfa_pattern, cropped, out_cfa));
             CHECK(cropped.size() == static_cast<size_t>(m0.crop[2]) * m0.crop[3]);
+
+            nijinwvdc::MediaReader mr_nef;
+            CHECK(mr_nef.open_file(env_nef, err));
+            nijinwvdc::DecoderSession ds_nef(4);
+            nijinwvdc::DecodeOptions dopts_nef_crop;
+            dopts_nef_crop.apply_active_crop = true;
+            std::vector<uint16_t> nef_direct;
+            nijinwvdc::DecodedFrameInfo nef_ci;
+            CHECK(ds_nef.decode_frame(mr_nef, 0, dopts_nef_crop, nef_direct, nef_ci, err));
+            CHECK(nef_direct == cropped);
+            CHECK(std::memcmp(nef_ci.cfa_pattern, out_cfa, 4) == 0);
+        }
+        {
+            nijinwvdc::DecoderSession ds_t(4);
+            nijinwvdc::DecodeOptions troi;
+            troi.has_roi = true;
+            troi.roi[0] = 64u; troi.roi[1] = 66u; troi.roi[2] = 512u; troi.roi[3] = 516u;
+            std::vector<uint16_t> r_dir, r_ref;
+            nijinwvdc::DecodedFrameInfo di_t;
+            CHECK(ds_t.decode_codestream(std::span<const uint8_t>(cs0), troi, r_dir, di_t, err));
+            uint8_t rcfa[4] = {};
+            const uint8_t src_cfa[4] = {0, 1, 1, 2};
+            const uint16_t roi16_a[4] = {64u, 66u, 512u, 516u};
+            CHECK(nijinwvdc::apply_bayer_crop(
+                b4.data(), info4.width, info4.height, roi16_a, src_cfa, r_ref, rcfa));
+            CHECK(r_dir == r_ref);
+            CHECK(std::memcmp(di_t.cfa_pattern, rcfa, 4) == 0);
+
+            troi.roi[0] = 65u; troi.roi[1] = 67u; troi.roi[2] = 511u; troi.roi[3] = 513u;
+            CHECK(ds_t.decode_codestream(std::span<const uint8_t>(cs0), troi, r_dir, di_t, err));
+            const uint16_t roi16_b[4] = {65u, 67u, 511u, 513u};
+            CHECK(nijinwvdc::apply_bayer_crop(
+                b4.data(), info4.width, info4.height, roi16_b, src_cfa, r_ref, rcfa));
+            CHECK(r_dir == r_ref);
+            CHECK(std::memcmp(di_t.cfa_pattern, rcfa, 4) == 0);
         }
     }
 
@@ -1248,6 +1285,131 @@ void test_optional_real_corpus() {
         nijinwvdc::DecodedFrameInfo ds_info;
         CHECK(ds.decode_frame(mr, 0, dopts_s, bs, ds_info, err));
         CHECK(bs == b1);
+        if (m0.has_crop) {
+            std::vector<uint16_t> cropped, direct_crop;
+            uint8_t out_cfa[4] = {0};
+            CHECK(nijinwvdc::apply_bayer_crop(
+                b8.data(), info8.width, info8.height, m0.crop, m0.cfa_pattern, cropped, out_cfa));
+            nijinwvdc::DecodeOptions dopts_c;
+            dopts_c.num_threads = 4;
+            dopts_c.apply_active_crop = true;
+            nijinwvdc::DecodedFrameInfo crop_info;
+            CHECK(ds.decode_frame(mr, 0, dopts_c, direct_crop, crop_info, err));
+            CHECK(direct_crop == cropped);
+            CHECK(std::memcmp(crop_info.cfa_pattern, out_cfa, 4) == 0);
+        }
+    }
+}
+
+void test_cpp20_spans_and_direct_roi() {
+    std::string err;
+    auto cs_tile = build_synth_arw6_16x16(-700, 20, -20);
+    auto arw_tiff = build_synth_arw_4tile_tiff();
+
+    // 1. std::span overloads on MediaReader + DecoderSession + helpers
+    nijinwvdc::MediaReader r_span;
+    CHECK(r_span.open_memory(std::span<const uint8_t>(arw_tiff), err));
+    CHECK(r_span.frame_count() == 1u);
+
+    nijinwvdc::DecoderSession sess(2);
+    nijinwvdc::DecodeOptions dopts;
+    std::vector<uint16_t> full_bayer, span_bayer;
+    nijinwvdc::DecodedFrameInfo fi_full, fi_span;
+    CHECK(sess.decode_frame(r_span, 0, dopts, full_bayer, fi_full, err));
+    CHECK(sess.decode_codestream(std::span<const uint8_t>(cs_tile), dopts, span_bayer, fi_span, err));
+    CHECK(fi_span.output_width == 16u && fi_span.output_height == 16u);
+
+    std::vector<uint16_t> tile_into(16u * 16u, 0u);
+    CHECK(sess.decode_codestream_into(
+        std::span<const uint8_t>(cs_tile), dopts, std::span<uint16_t>(tile_into), 0u, fi_span, err));
+    CHECK(tile_into == span_bayer);
+
+    // Undersized destination span must fail cleanly
+    std::vector<uint16_t> too_small(16u * 15u, 0u);
+    CHECK(!sess.decode_codestream_into(
+        std::span<const uint8_t>(cs_tile), dopts, std::span<uint16_t>(too_small), 0u, fi_span, err));
+    std::vector<uint16_t> frame_small(32u * 31u, 0u);
+    CHECK(!sess.decode_frame_into(
+        r_span, 0u, dopts, std::span<uint16_t>(frame_small), 0u, fi_full, err));
+
+    // Exact-fit decode_frame_into span + helper std::span overloads
+    std::vector<uint16_t> frame_into(32u * 32u, 0u);
+    CHECK(sess.decode_frame_into(
+        r_span, 0u, dopts, std::span<uint16_t>(frame_into), 0u, fi_span, err));
+    CHECK(frame_into == full_bayer);
+
+    std::vector<uint16_t> p00(16u * 16u), p01(16u * 16u), p10(16u * 16u), p11(16u * 16u);
+    CHECK(nijinwvdc::split_bayer_cfa_planes(
+        std::span<const uint16_t>(full_bayer), 32u, 32u, p00, p01, p10, p11));
+    CHECK(!nijinwvdc::split_bayer_cfa_planes(
+        std::span<const uint16_t>(too_small), 32u, 32u, p00, p01, p10, p11));
+
+    const float blk[4] = {100.0f, 100.0f, 100.0f, 100.0f};
+    std::vector<float> fn_out(32u * 32u);
+    CHECK(nijinwvdc::normalize_bayer_to_float(
+        std::span<const uint16_t>(full_bayer), 32u, 32u, blk, 16383.0f, true, std::span<float>(fn_out)));
+
+    nijinwvdc::DngWriteOptions dopt;
+    dopt.width = 32u;
+    dopt.height = 32u;
+    std::vector<uint8_t> dng_mem, dng_ref;
+    CHECK(nijinwvdc::encode_cfa_dng_memory(std::span<const uint16_t>(full_bayer), dopt, dng_mem, err));
+    CHECK(nijinwvdc::encode_cfa_dng_memory(full_bayer.data(), dopt, dng_ref, err));
+    CHECK(dng_mem == dng_ref);
+
+    // 2. Direct Stage 3 ROI / crop parity (4-tile quadrant-spanning + single-tile + odd stride)
+    const uint32_t rois[][4] = {
+        {1u, 1u, 17u, 15u},
+        {16u, 16u, 16u, 16u},
+        {5u, 7u, 20u, 19u},
+        {0u, 14u, 32u, 6u},
+    };
+    for (const auto& r : rois) {
+        nijinwvdc::DecodeOptions ropts;
+        ropts.num_threads = 2;
+        ropts.has_roi = true;
+        std::memcpy(ropts.roi, r, sizeof(ropts.roi));
+
+        std::vector<uint16_t> dir_out, ref_out;
+        nijinwvdc::DecodedFrameInfo rinfo;
+        CHECK(sess.decode_frame(r_span, 0u, ropts, dir_out, rinfo, err));
+        uint8_t ref_cfa[4] = {};
+        const uint16_t r16[4] = {
+            static_cast<uint16_t>(r[0]), static_cast<uint16_t>(r[1]),
+            static_cast<uint16_t>(r[2]), static_cast<uint16_t>(r[3])
+        };
+        CHECK(nijinwvdc::apply_bayer_crop(
+            full_bayer.data(), 32u, 32u, r16, fi_full.meta.cfa_pattern, ref_out, ref_cfa));
+        CHECK(dir_out == ref_out);
+        CHECK(std::memcmp(rinfo.cfa_pattern, ref_cfa, 4) == 0);
+
+        // Unaligned odd byte stride (fallback copy_bayer_roi_strided path) must match identically
+        const size_t odd_stride = static_cast<size_t>(r[2]) * 2u + 1u;
+        std::vector<uint8_t> odd_buf(static_cast<size_t>(r[3]) * odd_stride + 16u, 0xAAu);
+        CHECK(sess.decode_frame_into(
+            r_span, 0u, ropts, reinterpret_cast<uint16_t*>(odd_buf.data()), odd_stride, r[3], rinfo, err));
+        for (uint32_t row = 0; row < r[3]; ++row) {
+            CHECK(std::memcmp(
+                odd_buf.data() + static_cast<size_t>(row) * odd_stride,
+                reinterpret_cast<const uint8_t*>(ref_out.data() + static_cast<size_t>(row) * r[2]),
+                static_cast<size_t>(r[2]) * 2u) == 0);
+        }
+    }
+
+    // Single-tile A000 direct odd ROI parity
+    {
+        nijinwvdc::DecodeOptions tropts;
+        tropts.has_roi = true;
+        tropts.roi[0] = 1u; tropts.roi[1] = 3u; tropts.roi[2] = 10u; tropts.roi[3] = 9u;
+        std::vector<uint16_t> dir_t, ref_t;
+        nijinwvdc::DecodedFrameInfo tinfo;
+        CHECK(sess.decode_codestream(std::span<const uint8_t>(cs_tile), tropts, dir_t, tinfo, err));
+        const uint8_t cfa0[4] = {0, 1, 1, 2};
+        uint8_t tcfa[4] = {};
+        const uint16_t tc16[4] = {1u, 3u, 10u, 9u};
+        CHECK(nijinwvdc::apply_bayer_crop(span_bayer.data(), 16u, 16u, tc16, cfa0, ref_t, tcfa));
+        CHECK(dir_t == ref_t);
+        CHECK(std::memcmp(tinfo.cfa_pattern, tcfa, 4) == 0);
     }
 }
 
@@ -1442,6 +1604,7 @@ int main() {
     test_dng_roundtrip_synthetic();
     test_session_reader_postproc_and_threading();
     test_optional_real_corpus();
+    test_cpp20_spans_and_direct_roi();
     test_focus_meta_parsing_and_dng_tags();
     std::printf("test_nijinWVDC: ALL PASSED\n");
     return 0;

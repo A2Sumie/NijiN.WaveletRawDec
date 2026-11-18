@@ -6,9 +6,31 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <string_view>
 
 namespace nijinwvdc {
 namespace {
+
+constexpr char ascii_tolower(char c) noexcept {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+}
+
+constexpr bool contains_ci_ascii(std::string_view haystack, std::string_view needle) noexcept {
+    if (needle.empty()) return true;
+    if (haystack.size() < needle.size()) return false;
+    const size_t limit = haystack.size() - needle.size();
+    for (size_t i = 0; i <= limit; ++i) {
+        bool match = true;
+        for (size_t j = 0; j < needle.size(); ++j) {
+            if (ascii_tolower(haystack[i + j]) != ascii_tolower(needle[j])) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
 
 enum TiffType : uint16_t {
     T_BYTE = 1,
@@ -98,21 +120,13 @@ struct IfdBuilder {
     }
 };
 
-std::string to_lower_copy(const std::string& s) {
-    std::string out = s;
-    for (char& c : out) {
-        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-    }
-    return out;
-}
-
 struct CameraMatrixEntry {
-    const char* key;
+    std::string_view key;
     double cm[9];
 };
 
-bool lookup_sony_d65_colormatrix(const std::string& lm, double out_cm[9]) {
-    static const CameraMatrixEntry kSonyTable[] = {
+bool lookup_sony_d65_colormatrix(std::string_view model, double out_cm[9]) {
+    static constexpr CameraMatrixEntry kSonyTable[] = {
         {"ilce-7m5",  {0.9089, -0.3577, -0.0787, -0.3563, 1.1326, 0.2557, -0.0114, 0.0928, 0.5904}},
         {"ilce-7rm6", {1.1765, -0.5595, -0.1192, -0.3689, 1.1507, 0.2485,  0.0051, 0.0681, 0.5731}},
         {"ilce-7rm5", {0.8200, -0.2976, -0.0719, -0.4296, 1.2053, 0.2532, -0.0429, 0.1282, 0.5774}},
@@ -126,7 +140,7 @@ bool lookup_sony_d65_colormatrix(const std::string& lm, double out_cm[9]) {
         {"ilme-fx3",  {0.6912, -0.2127, -0.0469, -0.4470, 1.2175, 0.2587, -0.0398, 0.1478, 0.6492}},
     };
     for (const auto& ent : kSonyTable) {
-        if (lm.find(ent.key) != std::string::npos) {
+        if (contains_ci_ascii(model, ent.key)) {
             std::memcpy(out_cm, ent.cm, sizeof(ent.cm));
             return true;
         }
@@ -176,8 +190,7 @@ void populate_dng_options_common(
         opts.crop_size[1] = meta.crop[3];
     }
 
-    const bool is_sony = (clip.major_brand == "ARW") ||
-                         (to_lower_copy(clip.make).find("sony") != std::string::npos);
+    const bool is_sony = (clip.major_brand == "ARW") || contains_ci_ascii(clip.make, "sony");
     opts.make = clip.make.empty() ? (is_sony ? "SONY" : "NIKON CORPORATION") : clip.make;
     opts.model = clip.model.empty() ? (is_sony ? "ILCE-7M5" : "NIKON Z 8") : clip.model;
     opts.unique_model = opts.model;
@@ -205,8 +218,8 @@ void populate_dng_options_common(
 
 } // namespace
 
-bool lookup_nikon_d65_colormatrix(const std::string& model, double out_cm[9]) {
-    static const CameraMatrixEntry kTable[] = {
+bool lookup_nikon_d65_colormatrix(std::string_view model, double out_cm[9]) {
+    static constexpr CameraMatrixEntry kTable[] = {
         {"z 8",   { 1.1423, -0.4564, -0.1123, -0.4816, 1.2895, 0.2119, -0.0210, 0.1061, 0.7282}},
         {"z 9",   { 1.3389, -0.6049, -0.1441, -0.4544, 1.2757, 0.1969,  0.0229, 0.0498, 0.7390}},
         {"z6_3",  { 1.1206, -0.4286, -0.0941, -0.4879, 1.2847, 0.2251, -0.0745, 0.1654, 0.7374}},
@@ -215,9 +228,8 @@ bool lookup_nikon_d65_colormatrix(const std::string& model, double out_cm[9]) {
         {"z50_2", { 1.1640, -0.4829, -0.1079, -0.5107, 1.3006, 0.2325, -0.0972, 0.1711, 0.7380}},
         {"z5_2",  { 0.9874, -0.3784, -0.0823, -0.4728, 1.2673, 0.2286, -0.0648, 0.1513, 0.6375}},
     };
-    std::string lm = to_lower_copy(model);
     for (const auto& ent : kTable) {
-        if (lm.find(ent.key) != std::string::npos) {
+        if (contains_ci_ascii(model, ent.key)) {
             std::memcpy(out_cm, ent.cm, sizeof(ent.cm));
             return true;
         }
@@ -227,14 +239,12 @@ bool lookup_nikon_d65_colormatrix(const std::string& model, double out_cm[9]) {
     return false;
 }
 
-bool lookup_camera_d65_colormatrix(const std::string& make, const std::string& model, double out_cm[9]) {
-    std::string lmake = to_lower_copy(make);
-    std::string lmodel = to_lower_copy(model);
-    if (lmake.find("sony") != std::string::npos ||
-        lmodel.find("ilce-") != std::string::npos ||
-        lmodel.find("ilme-") != std::string::npos ||
-        lmodel.find("zv-e") != std::string::npos) {
-        return lookup_sony_d65_colormatrix(lmodel, out_cm);
+bool lookup_camera_d65_colormatrix(std::string_view make, std::string_view model, double out_cm[9]) {
+    if (contains_ci_ascii(make, "sony") ||
+        contains_ci_ascii(model, "ilce-") ||
+        contains_ci_ascii(model, "ilme-") ||
+        contains_ci_ascii(model, "zv-e")) {
+        return lookup_sony_d65_colormatrix(model, out_cm);
     }
     return lookup_nikon_d65_colormatrix(model, out_cm);
 }
@@ -430,14 +440,14 @@ bool build_cfa_dng_header(
         b.add(37386, T_RATIONAL, 1, rat);                  // FocalLength
     }
     {
-        const uint8_t ver[4] = {1, 4, 0, 0};
+        static constexpr uint8_t ver[4] = {1, 4, 0, 0};
         b.add(50706, T_BYTE, 4, ver);                      // DNGVersion
-        const uint8_t bver[4] = {1, 1, 0, 0};
+        static constexpr uint8_t bver[4] = {1, 1, 0, 0};
         b.add(50707, T_BYTE, 4, bver);                     // DNGBackwardVersion
     }
     b.add_ascii(50708, opts.unique_model.empty() ? "NIKON Z 8" : opts.unique_model);
     {
-        const uint8_t pc[3] = {0, 1, 2};
+        static constexpr uint8_t pc[3] = {0, 1, 2};
         b.add(50710, T_BYTE, 3, pc);                       // CFAPlaneColor
     }
     b.add_u16(50711, 1u);                                  // CFALayout = Rectangular
@@ -517,7 +527,7 @@ bool build_cfa_dng_header(
 
     header_out.resize(strip_off);
     uint8_t* hp = header_out.data();
-    const uint8_t tiff_hdr[8] = {'I', 'I', 42, 0, 8, 0, 0, 0};
+    static constexpr uint8_t tiff_hdr[8] = {'I', 'I', 42, 0, 8, 0, 0, 0};
     std::memcpy(hp, tiff_hdr, 8);
     put_le16(hp + 8, static_cast<uint16_t>(b.entries.size()));
 
@@ -562,7 +572,7 @@ bool encode_cfa_dng_memory(
 }
 
 bool write_cfa_dng(
-    const std::string& path,
+    std::string_view path,
     const uint16_t* pixels,
     const DngWriteOptions& opts,
     std::string& err) {
@@ -578,7 +588,8 @@ bool write_cfa_dng(
 
     FILE* fp = detail::open_c_file_write(path);
     if (!fp) {
-        err = "Failed opening DNG output for writing: " + path;
+        err = "Failed opening DNG output for writing: ";
+        err.append(path);
         return false;
     }
 
@@ -586,7 +597,8 @@ bool write_cfa_dng(
               (std::fwrite(pixels, 1, strip_bytes, fp) == strip_bytes);
     if (std::fclose(fp) != 0) ok = false;
     if (!ok) {
-        err = "Write failure while writing DNG: " + path;
+        err = "Write failure while writing DNG: ";
+        err.append(path);
         return false;
     }
     return true;

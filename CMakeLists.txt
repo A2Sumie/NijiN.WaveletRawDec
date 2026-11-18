@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 cmake_minimum_required(VERSION 3.16)
-project(nijinWVDC VERSION 0.2.0 LANGUAGES C CXX)
+if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum macOS deployment version")
+endif()
+project(nijinWVDC VERSION 0.3.0 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -28,7 +31,7 @@ set(NIJINWVDC_LIB_SOURCES
 
 function(nijinwvdc_apply_target_options tgt)
     if(MSVC)
-        target_compile_options(${tgt} PRIVATE /W4 /WX /EHsc /MP)
+        target_compile_options(${tgt} PRIVATE /W4 /WX /EHsc /MP /Zc:__cplusplus)
         target_compile_definitions(${tgt} PRIVATE
             _CRT_SECURE_NO_WARNINGS
             NOMINMAX
@@ -36,6 +39,9 @@ function(nijinwvdc_apply_target_options tgt)
         )
     else()
         target_compile_options(${tgt} PRIVATE -Wall -Wextra -Werror)
+        if(MINGW)
+            target_compile_definitions(${tgt} PRIVATE __USE_MINGW_ANSI_STDIO=1)
+        endif()
     endif()
 endfunction()
 
@@ -46,7 +52,7 @@ if(MSVC)
 else()
     set_target_properties(nijinWVDC_static PROPERTIES OUTPUT_NAME "nijinWVDC" EXPORT_NAME "static")
 endif()
-target_compile_features(nijinWVDC_static PUBLIC cxx_std_17)
+target_compile_features(nijinWVDC_static PUBLIC cxx_std_20)
 target_compile_definitions(nijinWVDC_static PUBLIC NIJINWVDC_STATIC)
 target_include_directories(nijinWVDC_static PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -85,7 +91,7 @@ if(NIJINWVDC_BUILD_SHARED)
             INSTALL_RPATH "$ORIGIN"
         )
     endif()
-    target_compile_features(nijinWVDC_shared PUBLIC cxx_std_17)
+    target_compile_features(nijinWVDC_shared PUBLIC cxx_std_20)
     target_compile_definitions(nijinWVDC_shared PRIVATE NIJINWVDC_BUILDING_DLL)
     target_include_directories(nijinWVDC_shared PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -101,7 +107,7 @@ endif()
 
 if(NIJINWVDC_BUILD_CLI)
     add_executable(nijinWVDC src/main.cpp)
-    target_compile_features(nijinWVDC PRIVATE cxx_std_17)
+    target_compile_features(nijinWVDC PRIVATE cxx_std_20)
     target_link_libraries(nijinWVDC PRIVATE nijinWVDC_static)
     nijinwvdc_apply_target_options(nijinWVDC)
     if(APPLE)
@@ -115,7 +121,7 @@ endif()
 if(NIJINWVDC_BUILD_TESTS)
     enable_testing()
     add_executable(test_nijinWVDC tests/test_nijinWVDC.cpp)
-    target_compile_features(test_nijinWVDC PRIVATE cxx_std_17)
+    target_compile_features(test_nijinWVDC PRIVATE cxx_std_20)
     target_link_libraries(test_nijinWVDC PRIVATE nijinWVDC_static)
     nijinwvdc_apply_target_options(test_nijinWVDC)
     add_test(NAME test_nijinWVDC COMMAND test_nijinWVDC)

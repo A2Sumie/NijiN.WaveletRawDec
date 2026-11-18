@@ -86,29 +86,26 @@ Nikon N-RAW (`.NEV`) and HE / HE\* (`.NEF`) share the **wavelet-subband + block-
 2. **2D LeGall 5/3 Lifting Wavelet (`5H + 1V`)**: `Yl`, `Cr`, and `Cb` undergo 5 horizontal and 1 vertical integer 5/3 lifting levels while `Yh` bypasses wavelet filtering (`0` levels), forming 25 weighted subbands across 26 segments (`SegmentDesc`).
 3. **Per-Precinct Bitrate Tiers**: Each precinct encodes 2 lines of `(Yl, Cr, Cb)` with adaptive quantization `Qp` and refinement threshold `Rp` (`gtli = clamp(Qp - gain - [prio < Rp], 0, 15)`). Thus `N-RAW Normal (~1.5 bpp)`, `N-RAW High (~2.3–2.5 bpp)`, `HE (~3.0 bpp)`, and `HE* (~5.0 bpp)` use one identical codestream grammar and decoder kernel, differing only in bit budget and per-precinct `(Qp, Rp)` operating points.
 
-### 4.2 Four-Stage Parallel Decoding Pipeline (`src/ticoraw_dec.cpp`)
+### 4.2 Fused Parallel Decoding Pipeline (`src/ticoraw_dec.cpp`)
 
 ```text
 [TicoRAW R0 Codestream]
    │
-   ├─► parse_r0_header & CodecGeometry::init
+   ├─► parse_r0_header & CodecGeometry::init (via consteval kTicoTopology)
    │     └─ Parses SOC(0xFF10), CAP(0xFF50), PIH (39B + 13B Star-Tetrix/Fliproot extension),
-   │        CDT(16B), WGT(54B); builds 26 segments, 25 subbands, and slice/precinct offsets.
+   │        CDT(16B), WGT(54B); populates 26 segments, 25 subbands, and slice/precinct offsets.
    │
-   ├─► Stage 1 [Slice-Parallel Threads]: decode_slice_entropy_and_hdwt
+   ├─► Stage 1 [Slice-Parallel Threads]: decode_single_slice_entropy_and_hdwt
    │     ├─ Parses precinct headers (Qp, Rp, bsig/bvpred modes, subband pkt_len).
    │     ├─ Decodes 4-coefficient GCLI groups: raw or bounded vertical prediction (u <= 2 * bw).
-   │     ├─ Deadzone-free mid-tread uniform dequantization with exact (data_B, gcli_B, sign_B) checks.
-   │     └─ 5-level / 1-level integer 5/3 lifting horizontal IDWT via portable asr_s32.
+   │     ├─ Branchless mid-tread uniform dequantization + compile-time kSignExpandTable sign unpack.
+   │     └─ 5-level / 1-level integer 5/3 lifting horizontal IDWT into 4 arena planes (v_lh_planes[0..2], plane_yh).
    │
-   ├─► Stage 1.5 [Full-Frame Parallel Rows]: Global 1-Level Vertical 5/3 IDWT
-   │     ├─ Pass A: computes all even rows even[2k] = L[k] - ((H[k-1] + H[k] + 2) >> 2).
-   │     └─ Pass B: interpolates all odd rows odd[2k+1] = H[k] + ((even[2k] + even[2k+2]) >> 1).
-   │        Handles arbitrary even heights (including H % 64 == 0 / 4) with zero overlap re-decoding.
-   │
-   ├─► Stage 2 [Parallel Rows]: Inverse Star-Tetrix Step 1 -> reconstructs (G0, G1).
-   │
-   └─► Stage 3 [Parallel Rows]: Inverse Star-Tetrix Step 2 (R, B) + build_inverse_nlt_lut -> 14-bit RGGB.
+   └─► Stage 1.5 + 2 + 3 Fused [Strip-Parallel L1/L2 Ring]: Vertical 5/3 IDWT + RCT + NLT -> RGGB
+         ├─ Computes vertical 5/3 even/odd rows on demand inside a per-worker 4-row ring cache (comp_ring[3][4]),
+         │  eliminating intermediate full-frame spatial buffers (4 arena planes instead of 7).
+         ├─ Evaluates Inverse Star-Tetrix Step 1 (G0, G1) and Step 2 (R, B) in strip-local rolling rings.
+         └─ Applies cached baked inverse-NLT LUT directly into strided full-frame or CropRect/ROI RGGB rows.
 ```
 
 ### 4.3 Boundary & Memory-Safety Invariants
@@ -202,10 +199,10 @@ Each tile points to a big-endian `"A000"` wavelet codestream:
 
 ---
 
-## 7. Cross-Architecture SIMD & Work-Stealing Execution
+## 7. Cross-Architecture SIMD & C++20 Work-Stealing Execution
 
-- **Persistent Work-Stealing Pool & Reusable Arenas (`src/worker_pool.h`, `src/codec_internal.h`)**: `DecoderSession` retains one work-stealing `WorkerPool` and opaque `TicoArena` / `Arw6Arena` allocations across sequential frames, eliminating per-frame thread spawn and scratch heap allocation overhead while writing directly into strided caller buffers (`dst_row_stride_bytes`) when uncropped.
-- **ARM64 NEON & x86-64 AVX2 / SSE2**: Both wavelet pipelines (`src/ticoraw_dec.cpp`, `src/arw6_dec.cpp`) and Bayer post-processing kernels (`src/session_api.cpp`) implement ARM64 NEON vector paths, runtime-dispatched x86-64 AVX2 kernels (`CPUID` leaf 1 + leaf 7 + `XGETBV` OSXSAVE verification in `src/simd_platform.h`), and pure SSE2 baselines. `arw6_dec.cpp` further uses 64-bit SWAR bit-matrix transposition for zero-run predictive Golomb-Rice decoding and L1/L2 ring-buffered vertical-first/horizontal-second 5/3 lifting.
+- **C++20 `std::atomic::wait` Pool, Cache Isolation & Direct Stage 3 ROI (`src/worker_pool.h`, `src/codec_internal.h`)**: `DecoderSession` retains a cache-line-isolated (`alignas(128)`) work-stealing `WorkerPool` backed by native `std::atomic::wait`/`notify_*` (`int64_t` `ulock` on Apple, `int32_t` `futex`/WOA elsewhere) and `std::jthread` (when `__cpp_lib_jthread >= 201911L`), alongside opaque `TicoArena` / `Arw6Arena` allocations across sequential frames. Both decoders emit `detail::CropRect` / `--active-crop` regions directly into strided caller buffers from Stage 3 without allocating full-frame intermediate staging copies.
+- **ARM64 NEON, x86-64 AVX2 / SSE2 & `consteval` Tables**: Both wavelet pipelines (`src/ticoraw_dec.cpp`, `src/arw6_dec.cpp`) and Bayer post-processing kernels (`src/session_api.cpp`) implement ARM64 NEON vector paths, runtime-dispatched x86-64 AVX2 kernels (`CPUID` + `XGETBV` OSXSAVE cached once via `cached_simd_capabilities()`), and pure SSE2 baselines, backed by compile-time `.rodata` tables (`kSignExpandTable`, `kTicoTopology`, `kArw6NltLut14`, `kSony94xxInvLut`) and C++20 `<bit>` primitives (`std::countl_zero`, `std::countl_one`, `std::popcount`, `std::bit_width`, `std::bit_cast`).
 
 ---
 
@@ -213,7 +210,7 @@ Each tile points to a big-endian `"A000"` wavelet codestream:
 
 When requested (`DecodeOptions::want_quant_profile = true` or CLI `--quant`), both decoders compute a deterministic `WaveletQuantProfile` directly from the bitstream's active quantization parameters without stochastic sampling or learned priors:
 
-- **Exact Impulse-Response Synthesis Weights**: `TicoSubbandWeightTable` (`72` subband slots across `5H+1V` `5/3` IDWT + Star-Tetrix inverse RCT) and `Arw6SubbandWeightTable` (`3`-level `Vert->Horiz` `5/3` IDWT + Quincunx green synthesis) propagate uniform mid-tread quantization variance per precinct/chunk row through `build_1d_53_impulse` and `accumulate_grid_walsh`.
+- **Compile-Time (`consteval`) Exact Impulse-Response Weights**: `kTicoSubbandWeightTable` (`72` subband slots evaluated on `grid_n = 256` to avoid high-level `H5` boundary truncation) and `kArw6SubbandWeightTable` (`3`-level `Vert->Horiz` `5/3` IDWT + Quincunx green synthesis) bake exact `1D` separable 5/3 IDWT impulse synthesis gains and sparse-stencil 4x4 Walsh-Hadamard autocorrelation bins directly into `.rodata` at compile time (`kWalsh4x4Autocorr`).
 - **Per-Row Code-Domain RMS (`q_luma_code_row`, `q_chroma_code_row`)**: Stored at codec precinct/tile row granularity (`row_step = 4` for TicoRAW, `8` for ARW6) and clipped consistently under `--active-crop` or ROI via `crop_quant_profile_vertical`.
 - **Spectral Decomposition (`luma_scale_psd[6]`, `chroma_scale_psd[6]`, `walsh16_*_norm[16]`)**: Reports normalized variance across `6` dyadic scale bins (`[DC/LL, coarse..fine, Nyquist/G_H]`) and `16` sequency-ordered 4x4 Walsh-Hadamard autocorrelation bins (normalized so white noise equals `1.0` per bin, sum `16`).
-- **Calibrated Inverse-NLT Slope (`nlt_slope_lut[256]`)**: Derived from codec NLT derivative `d(ADU)/du` (`compute_dadu_du_raw_from_lut`) and scaled to caller linear `[black_ref, white_ref]` (`recalibrate_quant_profile_range`), converting code-domain RMS directly to linear normalized quantization standard deviation.
+- **Calibrated Inverse-NLT Slope (`nlt_slope_lut[256]`)**: Uses compile-time `kArw6DefaultDaduDuRaw` (14-bit raw white `16383`) or TicoRAW's cached baked NLT derivative `d(ADU)/du` (`compute_dadu_du_raw_from_lut`) and scales to caller linear `[black_ref, white_ref]` (`recalibrate_quant_profile_range`), converting code-domain RMS directly to linear normalized quantization standard deviation.

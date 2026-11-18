@@ -6,50 +6,54 @@
 
 #include <algorithm>
 #include <array>
-#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace nijinwvdc {
 namespace detail {
 
-inline bool starts_with_ci_ascii(const std::string& s, const char* prefix) {
-    size_t n = std::strlen(prefix);
-    if (s.size() < n) return false;
-    for (size_t i = 0; i < n; ++i) {
-        if (std::tolower(static_cast<unsigned char>(s[i])) !=
-            std::tolower(static_cast<unsigned char>(prefix[i]))) {
+constexpr char ascii_tolower(char c) noexcept {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+}
+
+constexpr char ascii_toupper(char c) noexcept {
+    return (c >= 'a' && c <= 'z') ? static_cast<char>(c - 'a' + 'A') : c;
+}
+
+constexpr bool starts_with_ci_ascii(std::string_view s, std::string_view prefix) noexcept {
+    if (s.size() < prefix.size()) return false;
+    for (size_t i = 0; i < prefix.size(); ++i) {
+        if (ascii_tolower(s[i]) != ascii_tolower(prefix[i])) {
             return false;
         }
     }
     return true;
 }
 
-inline bool ends_with_ci_ascii(const std::string& s, const char* suffix) {
-    size_t n = std::strlen(suffix);
-    if (s.size() < n) return false;
-    size_t off = s.size() - n;
-    for (size_t i = 0; i < n; ++i) {
-        if (std::tolower(static_cast<unsigned char>(s[off + i])) !=
-            std::tolower(static_cast<unsigned char>(suffix[i]))) {
+constexpr bool ends_with_ci_ascii(std::string_view s, std::string_view suffix) noexcept {
+    if (s.size() < suffix.size()) return false;
+    const size_t off = s.size() - suffix.size();
+    for (size_t i = 0; i < suffix.size(); ++i) {
+        if (ascii_tolower(s[off + i]) != ascii_tolower(suffix[i])) {
             return false;
         }
     }
     return true;
 }
 
-inline std::string to_upper_ascii(const std::string& s) {
-    std::string out = s;
+inline std::string to_upper_ascii(std::string_view s) {
+    std::string out(s);
     for (char& c : out) {
-        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        c = ascii_toupper(c);
     }
     return out;
 }
 
-constexpr uint8_t sony_pow_mod_249(uint8_t base, uint8_t exp) {
+consteval uint8_t sony_pow_mod_249(uint8_t base, uint8_t exp) noexcept {
     uint32_t res = 1u;
     uint32_t b = base % 249u;
     uint8_t e = exp;
@@ -61,7 +65,7 @@ constexpr uint8_t sony_pow_mod_249(uint8_t base, uint8_t exp) {
     return static_cast<uint8_t>(res);
 }
 
-constexpr std::array<uint8_t, 256> make_sony_94xx_inv_lut() {
+consteval std::array<uint8_t, 256> make_sony_94xx_inv_lut() noexcept {
     std::array<uint8_t, 256> lut{};
     for (uint32_t c = 0; c < 249u; ++c) {
         lut[c] = sony_pow_mod_249(static_cast<uint8_t>(c), 55u);
@@ -71,6 +75,8 @@ constexpr std::array<uint8_t, 256> make_sony_94xx_inv_lut() {
     }
     return lut;
 }
+
+inline constexpr std::array<uint8_t, 256> kSony94xxInvLut = make_sony_94xx_inv_lut();
 
 inline void set_focus_distance_with_rel_sigma(NevFrameMeta& meta, double dist_m, double rel_sig) {
     if (!(dist_m > 0.0) || !std::isfinite(dist_m)) return;
@@ -120,7 +126,7 @@ inline void parse_sony_makernote_focus(
         return;
     }
 
-    static constexpr auto kInvLut = make_sony_94xx_inv_lut();
+    const auto& kInvLut = kSony94xxInvLut;
     const TiffTagValue* tag_9402 = nullptr;
     const TiffTagValue* tag_9403 = nullptr;
     const TiffTagValue* tag_9404 = nullptr;

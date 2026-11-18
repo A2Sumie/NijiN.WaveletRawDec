@@ -15,6 +15,14 @@ namespace detail {
 struct TicoArena;
 struct Arw6Arena;
 
+struct CropRect {
+    bool enabled = false;
+    uint32_t x = 0;
+    uint32_t y = 0;
+    uint32_t w = 0;
+    uint32_t h = 0;
+};
+
 TicoArena* create_tico_arena();
 void destroy_tico_arena(TicoArena* arena);
 
@@ -32,7 +40,8 @@ bool decode_ticoraw_bayer_strided(
     std::string& err,
     WorkerPool* external_pool,
     TicoArena* external_arena,
-    WaveletQuantProfile* quant_out = nullptr);
+    WaveletQuantProfile* quant_out = nullptr,
+    const CropRect* crop = nullptr);
 
 bool decode_arw6_bayer_strided(
     const uint8_t* strip_data,
@@ -45,7 +54,8 @@ bool decode_arw6_bayer_strided(
     std::string& err,
     WorkerPool* external_pool,
     Arw6Arena* external_arena,
-    WaveletQuantProfile* quant_out = nullptr);
+    WaveletQuantProfile* quant_out = nullptr,
+    const CropRect* crop = nullptr);
 
 bool decode_arw6_tile_strided(
     const uint8_t* cs_data,
@@ -62,7 +72,8 @@ bool decode_arw6_tile_strided(
     std::string& err,
     WorkerPool* external_pool,
     Arw6Arena* external_arena,
-    WaveletQuantProfile* quant_out = nullptr);
+    WaveletQuantProfile* quant_out = nullptr,
+    const CropRect* crop = nullptr);
 
 } // namespace detail
 } // namespace nijinwvdc

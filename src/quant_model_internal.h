@@ -8,7 +8,6 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
-#include <vector>
 
 namespace nijinwvdc {
 namespace detail {
@@ -21,13 +20,12 @@ struct SubbandSynthWeight {
     double walsh16_chroma[16] = {};
 };
 
-inline void walsh4_1d_basis(int w, double out[4]) {
-    // 1D 4-point sequency-ordered orthonormal Walsh-Hadamard basis.
-    static constexpr double kBasis[4][4] = {
-        { 0.5,  0.5,  0.5,  0.5}, // 0 zero crossings
-        { 0.5,  0.5, -0.5, -0.5}, // 1 zero crossing
-        { 0.5, -0.5, -0.5,  0.5}, // 2 zero crossings
-        { 0.5, -0.5,  0.5, -0.5}, // 3 zero crossings (Nyquist)
+constexpr void walsh4_1d_basis(int w, double out[4]) noexcept {
+    constexpr double kBasis[4][4] = {
+        { 0.5,  0.5,  0.5,  0.5},
+        { 0.5,  0.5, -0.5, -0.5},
+        { 0.5, -0.5, -0.5,  0.5},
+        { 0.5, -0.5,  0.5, -0.5},
     };
     for (int i = 0; i < 4; ++i) {
         out[i] = kBasis[w][i];
@@ -35,397 +33,413 @@ inline void walsh4_1d_basis(int w, double out[4]) {
 }
 
 struct Walsh4x4Autocorr {
-    // A[k][ty + 3][tx + 3] for ty, tx in [-3, +3].
     double a[16][7][7] = {};
+};
 
-    Walsh4x4Autocorr() {
-        for (int wy = 0; wy < 4; ++wy) {
-            double by[4];
-            walsh4_1d_basis(wy, by);
-            for (int wx = 0; wx < 4; ++wx) {
-                double bx[4];
-                walsh4_1d_basis(wx, bx);
-                const int k = wy * 4 + wx;
-                for (int y1 = 0; y1 < 4; ++y1) {
-                    for (int x1 = 0; x1 < 4; ++x1) {
-                        const double p1 = by[y1] * bx[x1];
-                        for (int y2 = 0; y2 < 4; ++y2) {
-                            for (int x2 = 0; x2 < 4; ++x2) {
-                                a[k][(y2 - y1) + 3][(x2 - x1) + 3] += p1 * by[y2] * bx[x2];
-                            }
+consteval Walsh4x4Autocorr make_walsh4x4_autocorr() noexcept {
+    Walsh4x4Autocorr out{};
+    for (int wy = 0; wy < 4; ++wy) {
+        double by[4]{};
+        walsh4_1d_basis(wy, by);
+        for (int wx = 0; wx < 4; ++wx) {
+            double bx[4]{};
+            walsh4_1d_basis(wx, bx);
+            const int k = wy * 4 + wx;
+            for (int y1 = 0; y1 < 4; ++y1) {
+                for (int x1 = 0; x1 < 4; ++x1) {
+                    const double p1 = by[y1] * bx[x1];
+                    for (int y2 = 0; y2 < 4; ++y2) {
+                        for (int x2 = 0; x2 < 4; ++x2) {
+                            out.a[k][(y2 - y1) + 3][(x2 - x1) + 3] += p1 * by[y2] * bx[x2];
                         }
                     }
                 }
             }
         }
     }
+    return out;
+}
+
+inline constexpr Walsh4x4Autocorr kWalsh4x4Autocorr = make_walsh4x4_autocorr();
+
+inline constexpr const Walsh4x4Autocorr& get_walsh4x4_autocorr() noexcept {
+    return kWalsh4x4Autocorr;
+}
+
+struct Autocorr1D {
+    double r[8] = {};
 };
 
-inline const Walsh4x4Autocorr& get_walsh4x4_autocorr() {
-    static const Walsh4x4Autocorr kAuto;
-    return kAuto;
-}
-
-// 1-level 1D 5/3 IDWT from split low (len_l) and high (len_h) arrays into out (len = len_l + len_h).
-inline void idwt53_1d_level(const double* lo, int len_l, const double* hi, int len_h, double* out) {
-    const int n = len_l + len_h;
-    if (n <= 0) {
-        return;
-    }
-    if (n == 1) {
-        out[0] = (len_l > 0) ? lo[0] : 0.0;
-        return;
-    }
-    for (int i = 0; i < len_l; ++i) {
-        const double hp = (i > 0) ? hi[i - 1] : ((len_h > 0) ? hi[0] : 0.0);
-        const double hc = (i < len_h) ? hi[i] : ((i > 0) ? hi[i - 1] : 0.0);
-        out[2 * i] = lo[i] - 0.25 * (hp + hc);
-    }
-    for (int i = 0; i < len_h; ++i) {
-        const double e0 = out[2 * i];
-        const double e1 = (2 * i + 2 < n) ? out[2 * i + 2] : e0;
-        out[2 * i + 1] = hi[i] + 0.5 * (e0 + e1);
-    }
-}
-
-// Build 1D 5/3 impulse response of length G centered at index G/2.
-// level_from_finest = 0 for LL at depth `total_levels`; 1..total_levels for highpass (1 = finest, total_levels = coarsest).
-inline void build_1d_53_impulse(
-    int total_levels,
-    int level_from_finest,
-    bool is_ll,
-    int grid_n,
-    std::vector<double>& out_1d,
-    int& stride_out) {
+// Exact infinite-domain 1D LeGall 5/3 synthesis autocorrelation R[0..7] / stride.
+// grid_n=256 (5-level) and 128 (3-level) eliminate boundary reflection on all subbands.
+consteval Autocorr1D build_1d_53_autocorr(int total_levels, int level_from_finest, bool is_ll) noexcept {
+    Autocorr1D out{};
     if (total_levels == 0) {
-        out_1d.assign(grid_n, 0.0);
-        out_1d[grid_n / 2] = 1.0;
-        stride_out = 1;
-        return;
+        out.r[0] = 1.0;
+        return out;
     }
-    std::vector<int> ll_lens(total_levels + 1);
-    std::vector<int> hi_lens(total_levels + 1);
+    const int grid_n = (total_levels >= 5) ? 256 : 128;
+    int ll_lens[6] = {};
+    int hi_lens[6] = {};
     ll_lens[0] = grid_n;
     for (int l = 1; l <= total_levels; ++l) {
         hi_lens[l] = ll_lens[l - 1] >> 1;
         ll_lens[l] = (ll_lens[l - 1] + 1) >> 1;
     }
-
-    std::vector<double> ll_cur(ll_lens[total_levels], 0.0);
+    double cur[256] = {};
     if (is_ll) {
-        ll_cur[ll_lens[total_levels] / 2] = 1.0;
+        cur[ll_lens[total_levels] / 2] = 1.0;
     }
-
-    std::vector<double> hi_buf;
-    std::vector<double> next_buf;
     for (int l = total_levels; l >= 1; --l) {
-        hi_buf.assign(hi_lens[l], 0.0);
-        if (!is_ll && l == level_from_finest) {
-            hi_buf[hi_lens[l] / 2] = 1.0;
+        const int len_l = ll_lens[l];
+        const int len_h = hi_lens[l];
+        const int n = len_l + len_h;
+        const int hi_imp = (!is_ll && l == level_from_finest) ? (len_h / 2) : -1;
+        double nxt[256] = {};
+        for (int i = 0; i < len_l; ++i) {
+            const double hp = (i > 0) ? ((i - 1 == hi_imp) ? 1.0 : 0.0) : ((hi_imp == 0) ? 1.0 : 0.0);
+            const double hc = (i < len_h) ? ((i == hi_imp) ? 1.0 : 0.0) : ((i > 0 && i - 1 == hi_imp) ? 1.0 : 0.0);
+            nxt[2 * i] = cur[i] - 0.25 * (hp + hc);
         }
-        next_buf.assign(ll_lens[l] + hi_lens[l], 0.0);
-        idwt53_1d_level(ll_cur.data(), ll_lens[l], hi_buf.data(), hi_lens[l], next_buf.data());
-        ll_cur.swap(next_buf);
+        for (int i = 0; i < len_h; ++i) {
+            const double e0 = nxt[2 * i];
+            const double e1 = (2 * i + 2 < n) ? nxt[2 * i + 2] : e0;
+            nxt[2 * i + 1] = ((i == hi_imp) ? 1.0 : 0.0) + 0.5 * (e0 + e1);
+        }
+        for (int i = 0; i < n; ++i) {
+            cur[i] = nxt[i];
+        }
     }
-    out_1d = std::move(ll_cur);
     const int ds = is_ll ? total_levels : level_from_finest;
-    stride_out = 1 << ds;
+    const double inv_s = 1.0 / static_cast<double>(1 << ds);
+    for (int d = 0; d < 8; ++d) {
+        double s = 0.0;
+        for (int i = 0; i + d < grid_n; ++i) {
+            s += cur[i] * cur[i + d];
+        }
+        out.r[d] = s * inv_s;
+    }
+    return out;
 }
 
-inline void accumulate_grid_walsh(
-    const double* g,
-    int n,
-    double area_stride,
-    double& var_out,
-    double walsh_out[16]) {
-    constexpr int kMargin = 4;
-    double r[7][7] = {};
-    for (int y = kMargin; y < n - kMargin; ++y) {
-        for (int x = kMargin; x < n - kMargin; ++x) {
-            const double c = g[static_cast<size_t>(y) * n + x];
-            if (c == 0.0) {
+struct SparseStencilAutocorr {
+    int8_t dy[81] = {};
+    int8_t dx[81] = {};
+    double w[81] = {};
+    int count = 0;
+};
+
+template <int M>
+consteval SparseStencilAutocorr make_sparse_pair_autocorr(const double (&k0)[M][M], const double (&k1)[M][M]) noexcept {
+    double rk[9][9] = {};
+    for (int y = 0; y < M; ++y) {
+        for (int x = 0; x < M; ++x) {
+            const double v0 = k0[y][x];
+            const double v1 = k1[y][x];
+            if (v0 == 0.0 && v1 == 0.0) {
                 continue;
             }
-            for (int ty = -3; ty <= 3; ++ty) {
-                const double* row = g + static_cast<size_t>(y + ty) * n;
-                for (int tx = -3; tx <= 3; ++tx) {
-                    r[ty + 3][tx + 3] += c * row[x + tx];
+            for (int dy = -4; dy <= 4; ++dy) {
+                const int y2 = y + dy;
+                if (y2 < 0 || y2 >= M) {
+                    continue;
+                }
+                for (int dx = -4; dx <= 4; ++dx) {
+                    const int x2 = x + dx;
+                    if (x2 < 0 || x2 >= M) {
+                        continue;
+                    }
+                    rk[dy + 4][dx + 4] += 0.5 * (v0 * k0[y2][x2] + v1 * k1[y2][x2]);
                 }
             }
         }
     }
-    const double inv_s = 1.0 / area_stride;
-    for (int ty = 0; ty < 7; ++ty) {
-        for (int tx = 0; tx < 7; ++tx) {
-            r[ty][tx] *= inv_s;
-        }
-    }
-    var_out = r[3][3];
-    const Walsh4x4Autocorr& auto_w = get_walsh4x4_autocorr();
-    for (int k = 0; k < 16; ++k) {
-        double p = 0.0;
-        for (int ty = 0; ty < 7; ++ty) {
-            for (int tx = 0; tx < 7; ++tx) {
-                p += auto_w.a[k][ty][tx] * r[ty][tx];
+    SparseStencilAutocorr out{};
+    for (int dy = -4; dy <= 4; ++dy) {
+        for (int dx = -4; dx <= 4; ++dx) {
+            const double val = rk[dy + 4][dx + 4];
+            if (val != 0.0) {
+                out.dy[out.count] = static_cast<int8_t>(dy);
+                out.dx[out.count] = static_cast<int8_t>(dx);
+                out.w[out.count] = val;
+                ++out.count;
             }
         }
-        walsh_out[k] += std::max(0.0, p);
     }
+    return out;
 }
 
-inline void finalize_ticoraw_subband_weight(
-    int comp_id,
-    int v_lvl,
-    int h_lvl,
-    SubbandSynthWeight& out) {
-    constexpr int G = 128;
-    const size_t G2 = static_cast<size_t>(G) * G;
+consteval void eval_sparse_walsh(
+    const SparseStencilAutocorr& rk_l,
+    const SparseStencilAutocorr& rk_c,
+    const Autocorr1D& ay,
+    const Autocorr1D& ax,
+    SubbandSynthWeight& out) noexcept {
+    double rl[7][7] = {};
+    double rc[7][7] = {};
+    for (int ty = -3; ty <= 3; ++ty) {
+        for (int tx = -3; tx <= 3; ++tx) {
+            double sl = 0.0;
+            for (int i = 0; i < rk_l.count; ++i) {
+                const int dy = ty - static_cast<int>(rk_l.dy[i]);
+                const int dx = tx - static_cast<int>(rk_l.dx[i]);
+                const int ly = (dy < 0) ? -dy : dy;
+                const int lx = (dx < 0) ? -dx : dx;
+                sl += rk_l.w[i] * ay.r[ly] * ax.r[lx];
+            }
+            rl[ty + 3][tx + 3] = sl;
 
-    std::vector<double> h1_x;
-    std::vector<double> h1_y;
-    int sx = 1;
-    int sy = 1;
-
-    if (comp_id == 2) {
-        h1_x.assign(G, 0.0);
-        h1_x[G / 2] = 1.0;
-        h1_y.assign(G, 0.0);
-        h1_y[G / 2] = 1.0;
-        sx = 1;
-        sy = 1;
-        out.scale_bin = 5u;
-    } else {
-        const bool is_ll_x = (h_lvl == 0);
-        const int hl_from_finest = is_ll_x ? 0 : (6 - h_lvl);
-        build_1d_53_impulse(5, hl_from_finest, is_ll_x, G, h1_x, sx);
-        build_1d_53_impulse(1, 1, (v_lvl == 0), G, h1_y, sy);
-        if (v_lvl == 0 && h_lvl == 0) {
-            out.scale_bin = 0u;
-        } else if (v_lvl == 0 && h_lvl == 1) {
-            out.scale_bin = 1u;
-        } else if (v_lvl == 0 && h_lvl == 2) {
-            out.scale_bin = 2u;
-        } else if (v_lvl == 0 && h_lvl == 3) {
-            out.scale_bin = 3u;
-        } else {
-            out.scale_bin = 4u;
+            double sc = 0.0;
+            for (int i = 0; i < rk_c.count; ++i) {
+                const int dy = ty - static_cast<int>(rk_c.dy[i]);
+                const int dx = tx - static_cast<int>(rk_c.dx[i]);
+                const int ly = (dy < 0) ? -dy : dy;
+                const int lx = (dx < 0) ? -dx : dx;
+                sc += rk_c.w[i] * ay.r[ly] * ax.r[lx];
+            }
+            rc[ty + 3][tx + 3] = sc;
         }
     }
-
-    std::vector<double> yl(G2, 0.0);
-    std::vector<double> yh(G2, 0.0);
-    std::vector<double> cr(G2, 0.0);
-    std::vector<double> cb(G2, 0.0);
-
-    double* target = (comp_id == 0) ? yl.data()
-                   : (comp_id == 1) ? cr.data()
-                   : (comp_id == 2) ? yh.data()
-                                    : cb.data();
-    for (int y = 0; y < G; ++y) {
-        const double vy = h1_y[y];
-        if (vy == 0.0) continue;
-        for (int x = 0; x < G; ++x) {
-            target[static_cast<size_t>(y) * G + x] = vy * h1_x[x];
-        }
-    }
-
-    std::vector<double> y0(G2, 0.0);
-    std::vector<double> g0(G2, 0.0);
-    std::vector<double> g1(G2, 0.0);
-    std::vector<double> dr(G2, 0.0);
-    std::vector<double> db(G2, 0.0);
-
-    for (int r = 1; r < G - 1; ++r) {
-        for (int c = 1; c < G - 1; ++c) {
-            const size_t idx = static_cast<size_t>(r) * G + c;
-            const double yh_s = yh[idx - G] + yh[idx - G + 1] + yh[idx] + yh[idx + 1];
-            y0[idx] = yl[idx] - 0.125 * yh_s;
-        }
-    }
-    for (int r = 1; r < G - 1; ++r) {
-        for (int c = 1; c < G - 1; ++c) {
-            const size_t idx = static_cast<size_t>(r) * G + c;
-            g0[idx] = y0[idx] - 0.125 * (cb[idx] + cb[idx - G] + cr[idx] + cr[idx + 1]);
-            g1[idx] = 0.25 * (y0[idx + G] + y0[idx] + y0[idx + G - 1] + y0[idx - 1]) +
-                      yh[idx] - 0.125 * (cb[idx - 1] + cb[idx] + cr[idx] + cr[idx + G]);
-        }
-    }
-    for (int r = 2; r < G - 2; ++r) {
-        for (int c = 2; c < G - 2; ++c) {
-            const size_t idx = static_cast<size_t>(r) * G + c;
-            const double red = 0.25 * (g1[idx] + g0[idx] + g0[idx - 1] + g1[idx - G]) + cr[idx];
-            const double blu = 0.25 * (g1[idx] + g0[idx] + g1[idx + 1] + g0[idx + G]) + cb[idx];
-            const double gavg = 0.5 * (g0[idx] + g1[idx]);
-            dr[idx] = red - gavg;
-            db[idx] = blu - gavg;
-        }
-    }
-
-    const double area_s = static_cast<double>(sy) * static_cast<double>(sx);
-    double v_g0 = 0.0, v_g1 = 0.0, v_dr = 0.0, v_db = 0.0;
-    double w_g0[16] = {}, w_g1[16] = {}, w_dr[16] = {}, w_db[16] = {};
-    accumulate_grid_walsh(g0.data(), G, area_s, v_g0, w_g0);
-    accumulate_grid_walsh(g1.data(), G, area_s, v_g1, w_g1);
-    accumulate_grid_walsh(dr.data(), G, area_s, v_dr, w_dr);
-    accumulate_grid_walsh(db.data(), G, area_s, v_db, w_db);
-
-    out.luma_gain = 0.5 * (v_g0 + v_g1);
-    out.chroma_gain = 0.5 * (v_dr + v_db);
+    out.luma_gain = rl[3][3];
+    out.chroma_gain = rc[3][3];
     for (int k = 0; k < 16; ++k) {
-        out.walsh16_luma[k] = 0.5 * (w_g0[k] + w_g1[k]);
-        out.walsh16_chroma[k] = 0.5 * (w_dr[k] + w_db[k]);
+        double pl = 0.0;
+        double pc = 0.0;
+        for (int ty = 0; ty < 7; ++ty) {
+            for (int tx = 0; tx < 7; ++tx) {
+                const double wa = kWalsh4x4Autocorr.a[k][ty][tx];
+                pl += wa * rl[ty][tx];
+                pc += wa * rc[ty][tx];
+            }
+        }
+        out.walsh16_luma[k] = (pl > 0.0) ? pl : 0.0;
+        out.walsh16_chroma[k] = (pc > 0.0) ? pc : 0.0;
     }
 }
 
 struct TicoSubbandWeightTable {
-    // Indexed by sb_id in [0, 71].
     std::array<SubbandSynthWeight, 72> by_sb{};
+};
 
-    TicoSubbandWeightTable() {
-        for (int vl = 0; vl < 2; ++vl) {
-            for (int c = 0; c < 4; ++c) {
-                const int h_max = (c == 2) ? 1 : ((vl == 0) ? 6 : 2);
-                for (int hl = 0; hl < h_max; ++hl) {
-                    const int sb = (c == 2) ? (hl + 18 * c) : (hl + 6 * (vl + 3 * c));
-                    finalize_ticoraw_subband_weight(c, vl, hl, by_sb[sb]);
+consteval TicoSubbandWeightTable make_ticoraw_subband_weights() noexcept {
+    constexpr int M = 13;
+    SparseStencilAutocorr rk_l[4]{};
+    SparseStencilAutocorr rk_c[4]{};
+    for (int c = 0; c < 4; ++c) {
+        double yl[M][M]{};
+        double yh[M][M]{};
+        double cr[M][M]{};
+        double cb[M][M]{};
+        if (c == 0) yl[M / 2][M / 2] = 1.0;
+        else if (c == 1) cr[M / 2][M / 2] = 1.0;
+        else if (c == 2) yh[M / 2][M / 2] = 1.0;
+        else cb[M / 2][M / 2] = 1.0;
+
+        double y0[M][M]{};
+        double g0[M][M]{};
+        double g1[M][M]{};
+        double dr[M][M]{};
+        double db[M][M]{};
+
+        for (int r = 1; r < M - 1; ++r) {
+            for (int col = 1; col < M - 1; ++col) {
+                y0[r][col] = yl[r][col] - 0.125 * (yh[r - 1][col] + yh[r - 1][col + 1] + yh[r][col] + yh[r][col + 1]);
+            }
+        }
+        for (int r = 1; r < M - 1; ++r) {
+            for (int col = 1; col < M - 1; ++col) {
+                g0[r][col] = y0[r][col] - 0.125 * (cb[r][col] + cb[r - 1][col] + cr[r][col] + cr[r][col + 1]);
+                g1[r][col] = 0.25 * (y0[r + 1][col] + y0[r][col] + y0[r + 1][col - 1] + y0[r][col - 1]) +
+                             yh[r][col] - 0.125 * (cb[r][col - 1] + cb[r][col] + cr[r][col] + cr[r + 1][col]);
+            }
+        }
+        for (int r = 2; r < M - 2; ++r) {
+            for (int col = 2; col < M - 2; ++col) {
+                const double red = 0.25 * (g1[r][col] + g0[r][col] + g0[r][col - 1] + g1[r - 1][col]) + cr[r][col];
+                const double blu = 0.25 * (g1[r][col] + g0[r][col] + g1[r][col + 1] + g0[r + 1][col]) + cb[r][col];
+                const double gavg = 0.5 * (g0[r][col] + g1[r][col]);
+                dr[r][col] = red - gavg;
+                db[r][col] = blu - gavg;
+            }
+        }
+        rk_l[c] = make_sparse_pair_autocorr(g0, g1);
+        rk_c[c] = make_sparse_pair_autocorr(dr, db);
+    }
+
+    Autocorr1D ax_v[6]{};
+    ax_v[0] = build_1d_53_autocorr(5, 0, true);
+    for (int hl = 1; hl < 6; ++hl) {
+        ax_v[hl] = build_1d_53_autocorr(5, 6 - hl, false);
+    }
+    const Autocorr1D ay_v[2] = {
+        build_1d_53_autocorr(1, 1, true),
+        build_1d_53_autocorr(1, 1, false),
+    };
+    const Autocorr1D a_yh = build_1d_53_autocorr(0, 0, true);
+
+    TicoSubbandWeightTable tbl{};
+    for (int vl = 0; vl < 2; ++vl) {
+        for (int c = 0; c < 4; ++c) {
+            const int h_max = (c == 2) ? 1 : ((vl == 0) ? 6 : 2);
+            for (int hl = 0; hl < h_max; ++hl) {
+                const int sb = (c == 2) ? (hl + 18 * c) : (hl + 6 * (vl + 3 * c));
+                SubbandSynthWeight& out = tbl.by_sb[sb];
+                if (c == 2) {
+                    out.scale_bin = 5u;
+                    eval_sparse_walsh(rk_l[c], rk_c[c], a_yh, a_yh, out);
+                } else {
+                    out.scale_bin = (vl == 0 && hl <= 3) ? static_cast<uint32_t>(hl) : 4u;
+                    eval_sparse_walsh(rk_l[c], rk_c[c], ay_v[vl], ax_v[hl], out);
                 }
             }
         }
     }
-};
-
-inline const TicoSubbandWeightTable& get_ticoraw_subband_weights() {
-    static const TicoSubbandWeightTable tbl;
     return tbl;
 }
 
+inline constexpr TicoSubbandWeightTable kTicoSubbandWeightTable = make_ticoraw_subband_weights();
+
+inline constexpr const TicoSubbandWeightTable& get_ticoraw_subband_weights() noexcept {
+    return kTicoSubbandWeightTable;
+}
+
 struct Arw6SubbandWeightTable {
-    // [c in 0..3][r in 0..3][b in 0..3]:
-    // c=0: G_L, c=1: R, c=2: B (all decomp_levels = 3); c=3: G_H (r=0,b=0).
     SubbandSynthWeight w[4][4][4]{};
+};
 
-    Arw6SubbandWeightTable() {
-        constexpr int G = 64;
-        const size_t G2 = static_cast<size_t>(G) * G;
-        for (int c = 0; c < 4; ++c) {
-            const int max_r = (c == 3) ? 0 : 3;
-            for (int r = 0; r <= max_r; ++r) {
-                const int b0 = (r == 0) ? 0 : 1;
-                const int b1 = (r == 0) ? 0 : 3;
-                for (int b = b0; b <= b1; ++b) {
-                    std::vector<double> hx, hy;
-                    int sx = 1, sy = 1;
-                    if (c == 3) {
-                        hx.assign(G, 0.0);
-                        hx[G / 2] = 1.0;
-                        hy.assign(G, 0.0);
-                        hy[G / 2] = 1.0;
-                        w[c][r][b].scale_bin = 5u;
-                    } else if (r == 0) {
-                        build_1d_53_impulse(3, 0, true, G, hx, sx);
-                        build_1d_53_impulse(3, 0, true, G, hy, sy);
-                        w[c][r][b].scale_bin = 0u;
-                    } else {
-                        const bool hi_x = (b == 1 || b == 3);
-                        const bool hi_y = (b == 2 || b == 3);
-                        const int lv = 4 - r; // r=1 -> coarsest level 3; r=3 -> finest level 1
-                        build_1d_53_impulse(3, lv, !hi_x, G, hx, sx);
-                        build_1d_53_impulse(3, lv, !hi_y, G, hy, sy);
-                        // For HL+LH+HH: r=1->bin 2, r=2->bin 3, r=3->bin 4
-                        w[c][r][b].scale_bin = static_cast<uint32_t>(r + 1);
-                    }
+consteval Arw6SubbandWeightTable make_arw6_subband_weights() noexcept {
+    constexpr int M = 13;
+    SparseStencilAutocorr rk_l[4]{};
+    SparseStencilAutocorr rk_c[4]{};
+    for (int c = 0; c < 4; ++c) {
+        double gl[M][M]{};
+        double rp[M][M]{};
+        double bp[M][M]{};
+        double gh[M][M]{};
+        if (c == 0) gl[M / 2][M / 2] = 1.0;
+        else if (c == 1) rp[M / 2][M / 2] = 1.0;
+        else if (c == 2) bp[M / 2][M / 2] = 1.0;
+        else gh[M / 2][M / 2] = 1.0;
 
-                    std::vector<double> gl(G2, 0.0), rp(G2, 0.0), bp(G2, 0.0), gh(G2, 0.0);
-                    double* target = (c == 0) ? gl.data()
-                                   : (c == 1) ? rp.data()
-                                   : (c == 2) ? bp.data()
-                                              : gh.data();
-                    for (int y = 0; y < G; ++y) {
-                        const double vy = hy[y];
-                        if (vy == 0.0) continue;
-                        for (int x = 0; x < G; ++x) {
-                            target[static_cast<size_t>(y) * G + x] = vy * hx[x];
-                        }
-                    }
+        double g0[M][M]{};
+        double g1[M][M]{};
+        double dr[M][M]{};
+        double db[M][M]{};
+        for (int row = 1; row < M - 1; ++row) {
+            for (int col = 1; col < M - 1; ++col) {
+                g0[row][col] = gl[row][col] - 0.125 * (gh[row - 1][col] + gh[row - 1][col + 1] + gh[row][col] + gh[row][col + 1]);
+            }
+        }
+        for (int row = 2; row < M - 2; ++row) {
+            for (int col = 2; col < M - 2; ++col) {
+                g1[row][col] = gh[row][col] + 0.25 * (g0[row][col - 1] + g0[row][col] + g0[row + 1][col - 1] + g0[row + 1][col]);
+                dr[row][col] = 2.0 * rp[row][col];
+                db[row][col] = 2.0 * bp[row][col];
+            }
+        }
+        rk_l[c] = make_sparse_pair_autocorr(g0, g1);
+        rk_c[c] = make_sparse_pair_autocorr(dr, db);
+    }
 
-                    std::vector<double> g0(G2, 0.0), g1(G2, 0.0), dr(G2, 0.0), db(G2, 0.0);
-                    for (int row = 1; row < G - 1; ++row) {
-                        for (int col = 1; col < G - 1; ++col) {
-                            const size_t idx = static_cast<size_t>(row) * G + col;
-                            g0[idx] = gl[idx] - 0.125 * (gh[idx - G] + gh[idx - G + 1] + gh[idx] + gh[idx + 1]);
-                        }
-                    }
-                    for (int row = 2; row < G - 2; ++row) {
-                        for (int col = 2; col < G - 2; ++col) {
-                            const size_t idx = static_cast<size_t>(row) * G + col;
-                            g1[idx] = gh[idx] + 0.25 * (g0[idx - 1] + g0[idx] + g0[idx + G - 1] + g0[idx + G]);
-                            dr[idx] = 2.0 * rp[idx];
-                            db[idx] = 2.0 * bp[idx];
-                        }
-                    }
+    const Autocorr1D ll3 = build_1d_53_autocorr(3, 0, true);
+    Autocorr1D hi[4]{};
+    for (int r = 1; r <= 3; ++r) {
+        hi[r] = build_1d_53_autocorr(3, 4 - r, false);
+    }
+    const Autocorr1D a_gh = build_1d_53_autocorr(0, 0, true);
 
-                    const double area_s = static_cast<double>(sy) * static_cast<double>(sx);
-                    double v_g0 = 0.0, v_g1 = 0.0, v_dr = 0.0, v_db = 0.0;
-                    double w_g0[16] = {}, w_g1[16] = {}, w_dr[16] = {}, w_db[16] = {};
-                    accumulate_grid_walsh(g0.data(), G, area_s, v_g0, w_g0);
-                    accumulate_grid_walsh(g1.data(), G, area_s, v_g1, w_g1);
-                    accumulate_grid_walsh(dr.data(), G, area_s, v_dr, w_dr);
-                    accumulate_grid_walsh(db.data(), G, area_s, v_db, w_db);
-
-                    SubbandSynthWeight& dst = w[c][r][b];
-                    dst.luma_gain = 0.5 * (v_g0 + v_g1);
-                    dst.chroma_gain = 0.5 * (v_dr + v_db);
-                    for (int k = 0; k < 16; ++k) {
-                        dst.walsh16_luma[k] = 0.5 * (w_g0[k] + w_g1[k]);
-                        dst.walsh16_chroma[k] = 0.5 * (w_dr[k] + w_db[k]);
-                    }
+    Arw6SubbandWeightTable tbl{};
+    for (int c = 0; c < 4; ++c) {
+        if (c == 2) {
+            for (int r = 0; r <= 3; ++r) {
+                for (int b = 0; b < 4; ++b) {
+                    tbl.w[2][r][b] = tbl.w[1][r][b];
+                }
+            }
+            continue;
+        }
+        const int max_r = (c == 3) ? 0 : 3;
+        for (int r = 0; r <= max_r; ++r) {
+            const int b0 = (r == 0) ? 0 : 1;
+            const int b1 = (r == 0) ? 0 : 3;
+            for (int b = b0; b <= b1; ++b) {
+                SubbandSynthWeight& dst = tbl.w[c][r][b];
+                if (c == 3) {
+                    dst.scale_bin = 5u;
+                    eval_sparse_walsh(rk_l[c], rk_c[c], a_gh, a_gh, dst);
+                } else if (r == 0) {
+                    dst.scale_bin = 0u;
+                    eval_sparse_walsh(rk_l[c], rk_c[c], ll3, ll3, dst);
+                } else {
+                    const bool hi_x = (b == 1 || b == 3);
+                    const bool hi_y = (b == 2 || b == 3);
+                    dst.scale_bin = static_cast<uint32_t>(r + 1);
+                    eval_sparse_walsh(rk_l[c], rk_c[c], hi_y ? hi[r] : ll3, hi_x ? hi[r] : ll3, dst);
                 }
             }
         }
     }
-};
-
-inline const Arw6SubbandWeightTable& get_arw6_subband_weights() {
-    static const Arw6SubbandWeightTable tbl;
     return tbl;
+}
+
+inline constexpr Arw6SubbandWeightTable kArw6SubbandWeightTable = make_arw6_subband_weights();
+
+inline constexpr const Arw6SubbandWeightTable& get_arw6_subband_weights() noexcept {
+    return kArw6SubbandWeightTable;
+}
+
+constexpr int lower_bound_u16_idx(const uint16_t* lut, int n, uint16_t tgt) noexcept {
+    int lo = 0;
+    int hi = n;
+    while (lo < hi) {
+        const int mid = lo + ((hi - lo) >> 1);
+        if (lut[mid] < tgt) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
 }
 
 // Compute smoothed d(ADU)/du curve indexed by raw ADU ratio r in [0, 1] (= raw / raw_white_adu)
 // from a monotonically non-decreasing NLT LUT `lut[0..lut_len-1]`.
-inline void compute_dadu_du_raw_from_lut(
+constexpr void compute_dadu_du_raw_from_lut(
     const uint16_t* lut,
     int lut_len,
     int half_win,
     uint32_t raw_white_adu,
-    float out_dadu_du_raw[WaveletQuantProfile::kNltSlopeLutSize]) {
+    float out_dadu_du_raw[WaveletQuantProfile::kNltSlopeLutSize]) noexcept {
     if (!lut || lut_len < 4 || raw_white_adu == 0u) {
-        std::fill(out_dadu_du_raw, out_dadu_du_raw + WaveletQuantProfile::kNltSlopeLutSize, 1.0f);
+        for (uint32_t j = 0; j < WaveletQuantProfile::kNltSlopeLutSize; ++j) {
+            out_dadu_du_raw[j] = 1.0f;
+        }
         return;
     }
-    const int hw = std::max(1, std::min(half_win, lut_len / 4));
+    const int lim_hw = lut_len / 4;
+    const int hw = (half_win < 1) ? 1 : ((half_win > lim_hw) ? lim_hw : half_win);
     for (uint32_t j = 0; j < WaveletQuantProfile::kNltSlopeLutSize; ++j) {
         const double target_adu = (static_cast<double>(j) / 255.0) * static_cast<double>(raw_white_adu);
-        const uint16_t tgt_u16 = static_cast<uint16_t>(std::min<double>(65535.0, std::max(0.0, target_adu)));
-        const uint16_t* it = std::lower_bound(lut, lut + lut_len, tgt_u16);
-        int idx = static_cast<int>(it - lut);
+        const double clamped_adu = (target_adu < 0.0) ? 0.0 : ((target_adu > 65535.0) ? 65535.0 : target_adu);
+        const uint16_t tgt_u16 = static_cast<uint16_t>(clamped_adu);
+        int idx = lower_bound_u16_idx(lut, lut_len, tgt_u16);
         if (idx >= lut_len) {
             idx = lut_len - 1;
         }
-        // Step back from top saturation plateau so slope reflects the curve rather than clamped flat cap.
         while (idx > 2 * hw && lut[idx] == lut[idx - 1]) {
             --idx;
         }
-        int u0 = std::max(0, idx - hw);
-        int u1 = std::min(lut_len - 1, idx + hw);
+        int u0 = (idx - hw > 0) ? (idx - hw) : 0;
+        int u1 = (idx + hw < lut_len - 1) ? (idx + hw) : (lut_len - 1);
         while (u1 > u0 + 2 && lut[u1] == lut[u1 - 1]) {
             --u1;
         }
         if (u1 - u0 < hw && u1 > 2 * hw) {
-            u0 = std::max(0, u1 - 2 * hw);
+            u0 = (u1 - 2 * hw > 0) ? (u1 - 2 * hw) : 0;
         }
-        const int du = std::max(1, u1 - u0);
+        const int du = (u1 - u0 > 1) ? (u1 - u0) : 1;
         const double slope = static_cast<double>(lut[u1] - lut[u0]) / static_cast<double>(du);
-        out_dadu_du_raw[j] = static_cast<float>(std::max(1e-4, slope));
+        out_dadu_du_raw[j] = static_cast<float>((slope > 1e-4) ? slope : 1e-4);
     }
 }
 
