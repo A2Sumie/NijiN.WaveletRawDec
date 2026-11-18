@@ -76,22 +76,25 @@ Single-threaded and multi-threaded runs (`1 / 4 / 8 / 16` threads) produce bit-i
 
 | Platform / Compiler / ISA | Format (`W x H`) | Threads | Decode Only (`ms/frame`) | Decode Throughput (`fps`) |
 |---|---|---:|---:|---:|
-| **Apple M1 Max** (`v0.3.0`, `AppleClang 21`, `NEON`, 30f avg) | Sony ARW6 (`7040 x 4688`) | `1` | `171.17` | `5.84` |
-| **Apple M1 Max** (`v0.3.0`, `AppleClang 21`, `NEON`, 30f avg) | Sony ARW6 (`7040 x 4688`) | `auto` | **`24.63`** | **`40.60`** |
-| **Apple M1 Max** (`v0.3.0`, `AppleClang 21`, `NEON`, 30f avg) | Nikon `.jxs` (`8268 x 5512`) | `1` | `187.02` | `5.35` |
-| **Apple M1 Max** (`v0.3.0`, `AppleClang 21`, `NEON`, 30f avg) | Nikon `.jxs` (`8268 x 5512`) | `auto` | **`26.76`** | **`37.37`** |
-| **AMD Ryzen 7 5800X3D** (`v0.2.0` ref, `Linux GCC 11.4`, `AVX2`, 40f avg) | Sony ARW6 (`7040 x 4688`) | `1` | `192.05` | `5.21` |
-| **AMD Ryzen 7 5800X3D** (`v0.2.0` ref, `Linux GCC 11.4`, `AVX2`, 40f avg) | Sony ARW6 (`7040 x 4688`) | `8` | `34.85` | `28.70` |
-| **AMD Ryzen 7 5800X3D** (`v0.2.0` ref, `Linux GCC 11.4`, `AVX2`, 40f avg) | Sony ARW6 (`7040 x 4688`) | `16` | **`28.98`** | **`34.50`** |
-| **AMD Ryzen 7 5800X3D** (`v0.2.0` ref, `Linux GCC 11.4`, `AVX2`, 40f avg) | Nikon `.jxs` (`8268 x 5512`) | `1` | `219.76` | `4.55` |
-| **AMD Ryzen 7 5800X3D** (`v0.2.0` ref, `Linux GCC 11.4`, `AVX2`, 40f avg) | Nikon `.jxs` (`8268 x 5512`) | `8` | `49.40` | `20.24` |
-| **AMD Ryzen 7 5800X3D** (`v0.2.0` ref, `Linux GCC 11.4`, `AVX2`, 40f avg) | Nikon `.jxs` (`8268 x 5512`) | `16` | **`45.22`** | **`22.11`** |
-| **AMD Ryzen 7 5800X3D** (`v0.2.0` ref, `Windows MSVC 19.44`, `AVX2`, 40f avg) | Sony ARW6 (`7040 x 4688`) | `1` | `248.76` | `4.02` |
-| **AMD Ryzen 7 5800X3D** (`v0.2.0` ref, `Windows MSVC 19.44`, `AVX2`, 40f avg) | Sony ARW6 (`7040 x 4688`) | `8` | `41.23` | `24.25` |
-| **AMD Ryzen 7 5800X3D** (`v0.2.0` ref, `Windows MSVC 19.44`, `AVX2`, 40f avg) | Sony ARW6 (`7040 x 4688`) | `16` | **`31.72`** | **`31.52`** |
-| **AMD Ryzen 7 5800X3D** (`v0.2.0` ref, `Windows MSVC 19.44`, `AVX2`, 40f avg) | Nikon `.jxs` (`8268 x 5512`) | `1` | `301.72` | `3.31` |
-| **AMD Ryzen 7 5800X3D** (`v0.2.0` ref, `Windows MSVC 19.44`, `AVX2`, 40f avg) | Nikon `.jxs` (`8268 x 5512`) | `8` | `55.34` | `18.07` |
-| **AMD Ryzen 7 5800X3D** (`v0.2.0` ref, `Windows MSVC 19.44`, `AVX2`, 40f avg) | Nikon `.jxs` (`8268 x 5512`) | `16` | **`47.90`** | **`20.88`** |
+| **Apple M1 Max** (`v0.3.0`, `AppleClang 21`, `NEON`, 30f avg) | Sony ARW6 HQ (`7040 x 4688`) | `1` | `171.29` | `5.84` |
+| **Apple M1 Max** (`v0.3.0`, `AppleClang 21`, `NEON`, 30f avg) | Sony ARW6 HQ (`7040 x 4688`) | `auto` | **`24.73`** | **`40.44`** |
+| **Apple M1 Max** (`v0.3.0`, `AppleClang 21`, `NEON`, 30f avg) | Sony ARW6 Compressed (`7040 x 4688`) | `auto` | **`23.32`** | **`42.87`** |
+| **Apple M1 Max** (`v0.3.0`, `AppleClang 21`, `NEON`, 30f avg) | Nikon `.jxs` (`8268 x 5512`) | `1` | `190.65` | `5.25` |
+| **Apple M1 Max** (`v0.3.0`, `AppleClang 21`, `NEON`, 30f avg) | Nikon `.jxs` (`8268 x 5512`) | `auto` | **`27.21`** | **`36.75`** |
+| **AMD Ryzen 7 5800X3D** (`v0.3.0`, `Linux GCC 15.2`, `AVX2`, 40f avg) | Sony ARW6 HQ (`7040 x 4688`) | `1` | `181.48` | `5.51` |
+| **AMD Ryzen 7 5800X3D** (`v0.3.0`, `Linux GCC 15.2`, `AVX2`, 40f avg) | Sony ARW6 HQ (`7040 x 4688`) | `8` | `33.97` | `29.44` |
+| **AMD Ryzen 7 5800X3D** (`v0.3.0`, `Linux GCC 15.2`, `AVX2`, 40f avg) | Sony ARW6 HQ (`7040 x 4688`) | `16` | **`31.64`** | **`31.60`** |
+| **AMD Ryzen 7 5800X3D** (`v0.3.0`, `Linux GCC 15.2`, `AVX2`, 40f avg) | Sony ARW6 Compressed (`7040 x 4688`) | `16` | **`27.55`** | **`36.30`** |
+| **AMD Ryzen 7 5800X3D** (`v0.3.0`, `Linux GCC 15.2`, `AVX2`, 40f avg) | Nikon `.jxs` (`8268 x 5512`) | `1` | `292.28` | `3.42` |
+| **AMD Ryzen 7 5800X3D** (`v0.3.0`, `Linux GCC 15.2`, `AVX2`, 40f avg) | Nikon `.jxs` (`8268 x 5512`) | `8` | `47.50` | `21.05` |
+| **AMD Ryzen 7 5800X3D** (`v0.3.0`, `Linux GCC 15.2`, `AVX2`, 40f avg) | Nikon `.jxs` (`8268 x 5512`) | `16` | **`35.44`** | **`28.22`** |
+| **AMD Ryzen 7 5800X3D** (`v0.3.0`, `Windows MinGW-w64 GCC 16.2`, `AVX2`, 40f avg) | Sony ARW6 HQ (`7040 x 4688`) | `1` | `173.53` | `5.76` |
+| **AMD Ryzen 7 5800X3D** (`v0.3.0`, `Windows MinGW-w64 GCC 16.2`, `AVX2`, 40f avg) | Sony ARW6 HQ (`7040 x 4688`) | `8` | `35.02` | `28.55` |
+| **AMD Ryzen 7 5800X3D** (`v0.3.0`, `Windows MinGW-w64 GCC 16.2`, `AVX2`, 40f avg) | Sony ARW6 HQ (`7040 x 4688`) | `16` | **`27.31`** | **`36.61`** |
+| **AMD Ryzen 7 5800X3D** (`v0.3.0`, `Windows MinGW-w64 GCC 16.2`, `AVX2`, 40f avg) | Sony ARW6 Compressed (`7040 x 4688`) | `16` | **`27.08`** | **`36.93`** |
+| **AMD Ryzen 7 5800X3D** (`v0.3.0`, `Windows MinGW-w64 GCC 16.2`, `AVX2`, 40f avg) | Nikon `.jxs` (`8268 x 5512`) | `1` | `260.52` | `3.84` |
+| **AMD Ryzen 7 5800X3D** (`v0.3.0`, `Windows MinGW-w64 GCC 16.2`, `AVX2`, 40f avg) | Nikon `.jxs` (`8268 x 5512`) | `8` | `45.29` | `22.08` |
+| **AMD Ryzen 7 5800X3D** (`v0.3.0`, `Windows MinGW-w64 GCC 16.2`, `AVX2`, 40f avg) | Nikon `.jxs` (`8268 x 5512`) | `16` | **`34.56`** | **`28.94`** |
 
 ---
 
@@ -109,7 +112,7 @@ Prebuilt SDK + CLI archives are published on [**GitHub Releases**](https://githu
 
 ## Build & Quick Start
 
-Requires a `C++20` / `C11` toolchain (macOS `14.0+` / AppleClang, Linux `GCC 13+` / Ubuntu `24.04+`, or Windows `MSVC 2022` / `MinGW GCC`), with zero external third-party libraries. x86-64 builds detect `AVX2` at runtime via `CPUID` + `XGETBV` and fall back automatically to pure `SSE2`.
+Requires a `C++20` / `C11` toolchain (macOS `14.0+` / AppleClang, Linux `GCC 15+`, or Windows `MinGW-w64 GCC 16+` / `MSVC 2022`), with zero external third-party libraries. x86-64 builds detect `AVX2` at runtime via `CPUID` + `XGETBV` and fall back automatically to pure `SSE2`.
 
 ### Build & Test with Make (includes AddressSanitizer + UBSan & C11 ABI test)
 
