@@ -18,17 +18,9 @@ import zipfile
 
 ALL_TARGETS = (
     "macos-arm64",
-    "macos-x86_64",
-    "macos-universal2",
     "linux-x86_64",
     "windows-x86_64",
 )
-
-MACOS_ARCH_MAP = {
-    "macos-arm64": "arm64",
-    "macos-x86_64": "x86_64",
-    "macos-universal2": "arm64;x86_64",
-}
 
 
 def read_project_version(root: Path) -> str:
@@ -52,16 +44,6 @@ def run_cmd(cmd: list[str], cwd: Path) -> None:
 def jobs_count() -> str:
     """Return parallel build concurrency string."""
     return str(max(1, os.cpu_count() or 4))
-
-
-def can_run_macos_x86_64() -> bool:
-    """Check whether x86_64 macOS test binaries can run on the current host."""
-    if sys.platform != "darwin":
-        return False
-    if platform.machine().lower() == "x86_64":
-        return True
-    probe = subprocess.run(["arch", "-x86_64", "/usr/bin/true"], check=False)
-    return probe.returncode == 0
 
 
 def find_tool(candidates: list[str], label: str) -> str:
@@ -140,25 +122,22 @@ def configure_build_install(
 
 def build_macos_target(
     root: Path,
-    target: str,
     tag: str,
     build_root: Path,
     stage_root: Path,
     out_dir: Path,
 ) -> Path:
-    """Build, test, and package a macOS target."""
+    """Build, test, and package macOS arm64."""
     if sys.platform != "darwin":
-        raise RuntimeError(f"Target {target} requires a macOS host")
-    arch = MACOS_ARCH_MAP[target]
-    pkg_name = f"nijinWVDC-{tag}-{target}"
-    bdir = build_root / target
+        raise RuntimeError("Target macos-arm64 requires a macOS host")
+    pkg_name = f"nijinWVDC-{tag}-macos-arm64"
+    bdir = build_root / "macos-arm64"
     stage_pkg = stage_root / pkg_name
-    run_tests = True if target != "macos-x86_64" else can_run_macos_x86_64()
     cmake_args = [
         "-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0",
-        f"-DCMAKE_OSX_ARCHITECTURES={arch}",
+        "-DCMAKE_OSX_ARCHITECTURES=arm64",
     ]
-    configure_build_install(root, bdir, stage_pkg, cmake_args, run_tests)
+    configure_build_install(root, bdir, stage_pkg, cmake_args, run_tests=True)
     out_path = out_dir / f"{pkg_name}.tar.gz"
     create_tar_gz(stage_pkg, out_path)
     return out_path
@@ -329,8 +308,8 @@ def main() -> int:
 
     built: list[Path] = []
     for target in targets:
-        if target in MACOS_ARCH_MAP:
-            built.append(build_macos_target(root, target, args.tag, build_root, stage_root, out_dir))
+        if target == "macos-arm64":
+            built.append(build_macos_target(root, args.tag, build_root, stage_root, out_dir))
         elif target == "linux-x86_64":
             built.append(build_linux_target(root, args.tag, build_root, stage_root, out_dir, args.linux_prefix))
         elif target == "windows-x86_64":

@@ -102,8 +102,6 @@ Prebuilt SDK + CLI archives are published on [**GitHub Releases**](https://githu
 | Platform Archive | Contents |
 |---|---|
 | `nijinWVDC-v0.3.0-macos-arm64.tar.gz` | Apple Silicon `arm64` static (`.a`), shared (`.dylib`), CLI, headers, CMake/pkg-config |
-| `nijinWVDC-v0.3.0-macos-x86_64.tar.gz` | Intel macOS `x86_64` static (`.a`), shared (`.dylib`), CLI, headers, CMake/pkg-config |
-| `nijinWVDC-v0.3.0-macos-universal2.tar.gz` | Universal fat binary (`arm64` + `x86_64`) static, shared, CLI, headers, CMake/pkg-config |
 | `nijinWVDC-v0.3.0-linux-x86_64.tar.gz` | Linux `x86_64` (GCC 15.2, glibc 2.25+, SSE2 + runtime AVX2 dispatch) `.a`, `.so`, CLI, headers, CMake/pkg-config |
 | `nijinWVDC-v0.3.0-windows-x86_64.zip` | Windows `x64` (MinGW-w64 GCC 16.2, `nijinWVDC.dll`, `.dll.a` / `.lib` import libs, `.a`), `nijinWVDC.exe`, headers, CMake/pkg-config |
 
