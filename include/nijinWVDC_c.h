@@ -98,6 +98,14 @@ typedef struct nijin_frame_meta_t {
     double pts_seconds;
     double duration_seconds;
     char timecode_str[16];
+    float focal_length_opt_mm;
+    float focus_distance_m;
+    float focus_distance_low_m;
+    float focus_distance_high_m;
+    uint16_t focus_position;
+    uint8_t has_lens_position_abs;
+    uint8_t focus_is_infinity;
+    int32_t lens_position_abs;
 } nijin_frame_meta_t;
 
 typedef struct nijin_decode_options_t {
@@ -187,6 +195,9 @@ typedef struct nijin_dng_options_t {
     char unique_model[64];
     char software[64];
     char datetime[32];
+    float focal_length_mm;
+    float focus_distance_m;
+    uint8_t focus_is_infinity;
 } nijin_dng_options_t;
 
 typedef struct nijin_reader_s nijin_reader_t;

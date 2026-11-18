@@ -78,6 +78,14 @@ void fill_c_frame_meta(
     out->fnumber = m.fnumber;
     out->iso = m.iso;
     out->focal_length_mm = m.focal_length_mm;
+    out->focal_length_opt_mm = m.focal_length_opt_mm;
+    out->focus_distance_m = m.focus_distance_m;
+    out->focus_distance_low_m = m.focus_distance_low_m;
+    out->focus_distance_high_m = m.focus_distance_high_m;
+    out->focus_position = m.focus_position;
+    out->has_lens_position_abs = m.has_lens_position_abs ? 1u : 0u;
+    out->focus_is_infinity = m.focus_is_infinity ? 1u : 0u;
+    out->lens_position_abs = m.lens_position_abs;
     out->sample_offset = m.sample_offset;
     out->sample_size = m.sample_size;
     out->codestream_offset = m.codestream_offset;
@@ -183,6 +191,9 @@ nijin_status_t to_cpp_dng_options(const nijin_dng_options_t* opts, nijinwvdc::Dn
     std::memcpy(out.crop_size, opts->crop_size, sizeof(out.crop_size));
     out.exposure_time_s = opts->exposure_time_s;
     out.fnumber = opts->fnumber;
+    out.focal_length_mm = opts->focal_length_mm;
+    out.focus_distance_m = opts->focus_distance_m;
+    out.focus_is_infinity = (opts->focus_is_infinity != 0);
     std::memcpy(out.as_shot_neutral, opts->as_shot_neutral, sizeof(out.as_shot_neutral));
     std::memcpy(out.color_matrix1, opts->color_matrix1, sizeof(out.color_matrix1));
     out.make = opts->make;
@@ -208,6 +219,9 @@ void to_c_dng_options(const nijinwvdc::DngWriteOptions& src, nijin_dng_options_t
     std::memcpy(dst->crop_size, src.crop_size, sizeof(dst->crop_size));
     dst->exposure_time_s = src.exposure_time_s;
     dst->fnumber = src.fnumber;
+    dst->focal_length_mm = src.focal_length_mm;
+    dst->focus_distance_m = src.focus_distance_m;
+    dst->focus_is_infinity = src.focus_is_infinity ? 1u : 0u;
     std::memcpy(dst->as_shot_neutral, src.as_shot_neutral, sizeof(dst->as_shot_neutral));
     std::memcpy(dst->color_matrix1, src.color_matrix1, sizeof(dst->color_matrix1));
     copy_str_trunc(dst->make, sizeof(dst->make), src.make);

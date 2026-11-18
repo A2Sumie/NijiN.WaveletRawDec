@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "../include/nijinWVDC.h"
+#include "../src/focus_meta_internal.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1250,6 +1251,188 @@ void test_optional_real_corpus() {
     }
 }
 
+void test_focus_meta_parsing_and_dng_tags() {
+    std::string err;
+
+    // 1. Sony 0x94xx inverse LUT matches x^3 mod 249
+    const auto inv_lut = nijinwvdc::detail::make_sony_94xx_inv_lut();
+    for (uint32_t x = 0; x < 249u; ++x) {
+        uint8_t c = static_cast<uint8_t>((x * x * x) % 249u);
+        CHECK(inv_lut[c] == static_cast<uint8_t>(x));
+    }
+
+    // 2. End-to-end synthetic ARW with ExifIFD + Sony MakerNote 0x9402
+    {
+        auto build_sony_synth_arw = [&](uint8_t pos2, const char* fname) -> std::string {
+            auto strip_base = build_synth_arw_4tile_tiff();
+            // strip_base has IFD0 @ 8 with 3 entries, SubIFD @ 64, strip_off @ 512.
+            // Relocate metadata blocks after the base image buffer so nothing collides.
+            std::vector<uint8_t> arw = strip_base;
+            if (arw.size() < 4096u) arw.resize(4096u, 0);
+            const size_t strip_sz = arw.size();
+            const size_t ifd0_off = strip_sz;
+            const size_t exif_ifd_off = ifd0_off + 64u;
+            const size_t mn_ifd_off = exif_ifd_off + 64u;
+            const size_t tag9402_off = mn_ifd_off + 32u;
+            const size_t fl_rat_off = tag9402_off + 64u;
+            arw.resize(fl_rat_off + 32u, 0);
+
+            // Point TIFF header IFD0 to new IFD0 @ ifd0_off
+            put_le32(arw, 4, static_cast<uint32_t>(ifd0_off));
+            // IFD0: 271 (Make), 272 (Model), 330 (SubIFDs -> 64), 34665 (ExifIFD)
+            put_le16(arw, ifd0_off, 4u);
+            auto put_ent = [&](size_t base, size_t idx, uint16_t tag, uint16_t dt, uint32_t cnt, uint32_t val) {
+                size_t o = base + 2u + idx * 12u;
+                put_le16(arw, o + 0, tag); put_le16(arw, o + 2, dt);
+                put_le32(arw, o + 4, cnt); put_le32(arw, o + 8, val);
+            };
+            put_ent(ifd0_off, 0, 271, 2, 5, 48);
+            put_ent(ifd0_off, 1, 272, 2, 9, 54);
+            put_ent(ifd0_off, 2, 330, 4, 1, 64);
+            put_ent(ifd0_off, 3, 34665, 4, 1, static_cast<uint32_t>(exif_ifd_off));
+
+            // ExifIFD: 37386 (FocalLength=50.0), 37500 (MakerNote -> mn_ifd_off)
+            put_le32(arw, fl_rat_off, 500u);
+            put_le32(arw, fl_rat_off + 4, 10u);
+            put_le16(arw, exif_ifd_off, 2u);
+            put_ent(exif_ifd_off, 0, 37386, 5, 1, static_cast<uint32_t>(fl_rat_off));
+            put_ent(exif_ifd_off, 1, 37500, 7, 0x60u, static_cast<uint32_t>(mn_ifd_off));
+
+            // MakerNote IFD @ mn_ifd_off: 1 entry (0x9402)
+            put_le16(arw, mn_ifd_off, 1u);
+            put_ent(mn_ifd_off, 0, 0x9402, 7, 0x30u, static_cast<uint32_t>(tag9402_off));
+
+            uint8_t dec9402[0x30] = {};
+            dec9402[0] = 0x07u; // valid Tag9402 header
+            // f_nom = 50.0 mm -> 500 = 0x01F4 LE
+            dec9402[0x24] = 0xF4u; dec9402[0x25] = 0x01u;
+            // f_opt = 52.0 mm -> 520 = 0x0208 LE
+            dec9402[0x28] = 0x08u; dec9402[0x29] = 0x02u;
+            dec9402[0x2D] = pos2;
+            for (size_t i = 0; i < 0x30u; ++i) {
+                uint32_t x = dec9402[i];
+                arw[tag9402_off + i] = static_cast<uint8_t>((x >= 249u) ? x : ((x * x * x) % 249u));
+            }
+            std::string path = temp_file_path(fname);
+            CHECK(write_bytes(path, arw));
+            return path;
+        };
+
+        std::string p_fin = build_sony_synth_arw(110u, "nijin_sony_focus_fin.arw");
+        nijinwvdc::NevClipInfo clip;
+        nijinwvdc::NevFrameMeta meta;
+        CHECK(nijinwvdc::parse_nev_clip(p_fin, clip, err));
+        CHECK(nijinwvdc::read_nev_frame_meta_and_codestream(clip, 0, meta, nullptr, err));
+        const double expected_d = (std::pow(2.0, 110.0 / 16.0 - 5.0) + 1.0) * (52.0 / 1000.0);
+        CHECK(!meta.focus_is_infinity);
+        CHECK(meta.focus_position == 110u);
+        CHECK(std::fabs(meta.focal_length_mm - 50.0f) < 1e-3f);
+        CHECK(std::fabs(meta.focal_length_opt_mm - 52.0f) < 1e-3f);
+        CHECK(std::fabs(meta.focus_distance_m - expected_d) < 1e-3);
+        CHECK(meta.focus_distance_low_m > 0.0f && meta.focus_distance_low_m < meta.focus_distance_m);
+        CHECK(meta.focus_distance_high_m > meta.focus_distance_m);
+        std::remove(p_fin.c_str());
+
+        std::string p_inf = build_sony_synth_arw(255u, "nijin_sony_focus_inf.arw");
+        nijinwvdc::NevClipInfo clip_inf;
+        nijinwvdc::NevFrameMeta meta_inf;
+        CHECK(nijinwvdc::parse_nev_clip(p_inf, clip_inf, err));
+        CHECK(nijinwvdc::read_nev_frame_meta_and_codestream(clip_inf, 0, meta_inf, nullptr, err));
+        CHECK(meta_inf.focus_is_infinity);
+        CHECK(meta_inf.focus_distance_m >= 999999.0f);
+        std::remove(p_inf.c_str());
+    }
+
+    // 3. Nikon LensData 0801 encryption/decryption (Z-mount finite + infinity)
+    {
+        std::vector<uint8_t> zeros(0x64u, 0u);
+        zeros[0] = '0'; zeros[1] = '8'; zeros[2] = '0'; zeros[3] = '1';
+        std::vector<uint8_t> ks;
+        CHECK(nijinwvdc::detail::decrypt_nikon_lens_data(
+            zeros.data(), zeros.size(), "8022671", 43092u, true, "NIKON Z 8", ks));
+        CHECK(ks.size() == zeros.size());
+
+        auto make_encrypted_0801 = [&](uint16_t u16_fd, uint8_t range_w, uint8_t drive_end,
+                                       uint8_t steps_from_inf, int32_t lpa) {
+            std::vector<uint8_t> pt(0x64u, 0u);
+            pt[0] = '0'; pt[1] = '8'; pt[2] = '0'; pt[3] = '1';
+            pt[0x35] = 1u;
+            pt[0x3C] = 50u; pt[0x3D] = 0u; // focal = 50mm
+            pt[0x4C] = range_w;
+            pt[0x4E] = static_cast<uint8_t>(u16_fd & 0xFFu);
+            pt[0x4F] = static_cast<uint8_t>((u16_fd >> 8) & 0xFFu);
+            pt[0x56] = drive_end;
+            pt[0x58] = steps_from_inf;
+            uint32_t u_lpa = static_cast<uint32_t>(lpa);
+            pt[0x5A] = static_cast<uint8_t>(u_lpa & 0xFFu);
+            pt[0x5B] = static_cast<uint8_t>((u_lpa >> 8) & 0xFFu);
+            pt[0x5C] = static_cast<uint8_t>((u_lpa >> 16) & 0xFFu);
+            pt[0x5D] = static_cast<uint8_t>((u_lpa >> 24) & 0xFFu);
+            for (size_t i = 4u; i < pt.size(); ++i) pt[i] ^= ks[i];
+            return pt;
+        };
+
+        const uint16_t fd_2p5m = static_cast<uint16_t>(std::llround((12.0 * std::log2(2.5) + 80.0) * 256.0));
+        auto enc_fin = make_encrypted_0801(fd_2p5m, 5u, 0u, 10u, 1234);
+        nijinwvdc::NevFrameMeta nm_fin;
+        nijinwvdc::detail::decode_nikon_lens_data(
+            enc_fin.data(), enc_fin.size(), "8022671", 43092u, true, "NIKON Z 8", nm_fin);
+        CHECK(!nm_fin.focus_is_infinity);
+        CHECK(std::fabs(nm_fin.focal_length_mm - 50.0f) < 1e-3f);
+        CHECK(std::fabs(nm_fin.focus_distance_m - 2.5f) < 0.02f);
+        CHECK(nm_fin.has_lens_position_abs && nm_fin.lens_position_abs == 1234);
+        CHECK(nm_fin.focus_position == fd_2p5m);
+
+        auto enc_inf = make_encrypted_0801(0u, 0u, 2u, 0u, 0);
+        nijinwvdc::NevFrameMeta nm_inf;
+        nijinwvdc::detail::decode_nikon_lens_data(
+            enc_inf.data(), enc_inf.size(), "8022671", 43092u, true, "NIKON Z 8", nm_inf);
+        CHECK(nm_inf.focus_is_infinity);
+        CHECK(nm_inf.focus_distance_m >= 999999.0f);
+    }
+
+    // 4. DNG SubjectDistance (37382) and FocalLength (37386) finite & infinity emission + IFD tag sorting
+    {
+        std::vector<uint16_t> px(16u * 16u, 1024u);
+        auto check_dng_focus = [&](const char* fname, float dist_m, bool is_inf, uint32_t exp_num, uint32_t exp_den) {
+            std::string p = temp_file_path(fname);
+            nijinwvdc::DngWriteOptions opts;
+            opts.width = 16; opts.height = 16; opts.bit_depth = 14; opts.white = 16383;
+            opts.focal_length_mm = 50.0f;
+            opts.focus_distance_m = dist_m;
+            opts.focus_is_infinity = is_inf;
+            CHECK(nijinwvdc::write_cfa_dng(p, px.data(), opts, err));
+            auto raw = read_bytes(p);
+            uint32_t ifd_off = rd_le32(&raw[4]);
+            uint16_t cnt = rd_le16(&raw[ifd_off]);
+            uint16_t prev_tag = 0;
+            bool saw_37382 = false, saw_37386 = false;
+            for (uint16_t i = 0; i < cnt; ++i) {
+                const uint8_t* ent = &raw[ifd_off + 2u + static_cast<size_t>(i) * 12u];
+                uint16_t tag = rd_le16(ent + 0);
+                uint16_t dt = rd_le16(ent + 2);
+                uint32_t tcnt = rd_le32(ent + 4);
+                uint32_t vo = rd_le32(ent + 8);
+                CHECK(i == 0 || tag > prev_tag);
+                prev_tag = tag;
+                if (tag == 37382u) {
+                    saw_37382 = true;
+                    CHECK(dt == 5u && tcnt == 1u);
+                    CHECK(rd_le32(&raw[vo]) == exp_num && rd_le32(&raw[vo + 4u]) == exp_den);
+                } else if (tag == 37386u) {
+                    saw_37386 = true;
+                    CHECK(dt == 5u && tcnt == 1u);
+                    CHECK(rd_le32(&raw[vo]) == 500u && rd_le32(&raw[vo + 4u]) == 10u);
+                }
+            }
+            CHECK(saw_37382 && saw_37386);
+            std::remove(p.c_str());
+        };
+        check_dng_focus("nijin_dng_focus_fin.dng", 3.25f, false, 3250u, 1000u);
+        check_dng_focus("nijin_dng_focus_inf.dng", 1000000.0f, true, 0xFFFFFFFFu, 1u);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1259,6 +1442,7 @@ int main() {
     test_dng_roundtrip_synthetic();
     test_session_reader_postproc_and_threading();
     test_optional_real_corpus();
+    test_focus_meta_parsing_and_dng_tags();
     std::printf("test_nijinWVDC: ALL PASSED\n");
     return 0;
 }

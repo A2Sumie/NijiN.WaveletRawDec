@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "focus_meta_internal.h"
 #include "tiff_internal.h"
 
 #include <algorithm>
@@ -26,6 +27,7 @@ void parse_arw_exif_ifd(
     if (!read_tiff_ifd(r, 0, be, exif_ifd_off, exif)) {
         return;
     }
+    uint64_t mn_file_off = 0u;
     for (const auto& tv : exif) {
         double rval = 0.0;
         if (tv.tag == 33434 && tag_as_rational(tv, be, rval)) {
@@ -34,11 +36,29 @@ void parse_arw_exif_ifd(
             meta.fnumber = static_cast<float>(rval);
         } else if ((tv.tag == 34855 || tv.tag == 34866) && meta.iso == 0) {
             meta.iso = tag_as_u32(tv, be);
+        } else if (tv.tag == 37382 && tv.dtype == 5 && tv.data.size() >= 8) {
+            uint32_t num = rd_u32_e(tv.data.data(), be);
+            uint32_t den = rd_u32_e(tv.data.data() + 4, be);
+            if (den > 0u && num > 0u) {
+                if (num == 0xFFFFFFFFu) {
+                    set_focus_infinity(meta);
+                } else {
+                    set_focus_distance_with_rel_sigma(
+                        meta, static_cast<double>(num) / static_cast<double>(den), 0.25);
+                }
+            }
         } else if (tv.tag == 37386 && tag_as_rational(tv, be, rval)) {
             meta.focal_length_mm = static_cast<float>(rval);
+        } else if (tv.tag == 37500 && tv.file_offset > 0u) {
+            mn_file_off = tv.file_offset;
+        } else if (tv.tag == 42033 && tv.dtype == 2 && !tv.data.empty() && clip.serial_number.empty()) {
+            clip.serial_number = rstrip_ascii(tv.data.data(), tv.data.size());
         } else if (tv.tag == 42036 && tv.dtype == 2 && !tv.data.empty()) {
             clip.lens_model = rstrip_ascii(tv.data.data(), tv.data.size());
         }
+    }
+    if (mn_file_off > 0u) {
+        parse_sony_makernote_focus(r, 0u, be, mn_file_off, clip.make, clip.model, meta);
     }
 }
 

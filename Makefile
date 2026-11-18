@@ -21,7 +21,8 @@ LIB_SRCS := src/nev_container.cpp src/arw_container.cpp src/ticoraw_dec.cpp \
 STATIC_OBJS := $(patsubst src/%.cpp,$(BUILD)/static/%.o,$(LIB_SRCS))
 SHARED_OBJS := $(patsubst src/%.cpp,$(BUILD)/shared/%.o,$(LIB_SRCS))
 HDRS := include/nijinWVDC.h include/nijinWVDC_c.h include/nijinWVDC_export.h \
-        src/tiff_internal.h src/worker_pool.h src/simd_platform.h src/codec_internal.h
+        src/tiff_internal.h src/worker_pool.h src/simd_platform.h src/codec_internal.h \
+        src/focus_meta_internal.h
 
 STATIC_LIB   := $(BUILD)/libnijinWVDC.a
 SHARED_LIB   := $(BUILD)/libnijinWVDC.$(SHLIB_EXT)

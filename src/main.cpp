@@ -267,6 +267,19 @@ void print_info_common_tail(const nijinwvdc::NevFrameMeta& m0) {
     std::printf("Orientation:   %u\n", m0.orientation);
     std::printf("Exposure:      %.4g s, f/%.2f, ISO %u, %.1f mm\n",
                 m0.exposure_time_s, m0.fnumber, m0.iso, m0.focal_length_mm);
+    if (m0.focus_is_infinity || m0.focus_distance_m > 0.0f) {
+        if (m0.focus_is_infinity || m0.focus_distance_m >= 999999.0f) {
+            std::printf("Focus:         inf (pos=%u)\n", m0.focus_position);
+        } else {
+            std::printf("Focus:         %.4f m [%.4f, %.4f] (pos=%u, abs=%d, f_opt=%.2f mm)\n",
+                        m0.focus_distance_m,
+                        m0.focus_distance_low_m,
+                        m0.focus_distance_high_m,
+                        m0.focus_position,
+                        m0.has_lens_position_abs ? m0.lens_position_abs : 0,
+                        m0.focal_length_opt_mm);
+        }
+    }
     if (!m0.picture_control_base.empty() || m0.nef_compression != 0) {
         std::printf("PictureCtrl:   base='%s' name='%s' NEFCompression=%u\n",
                     m0.picture_control_base.c_str(), m0.picture_control_name.c_str(), m0.nef_compression);
@@ -367,6 +380,24 @@ void print_info_json_prefix(
     std::printf("  \"iso\": %u,\n", m0.iso);
     std::printf("  \"exposure_time_s\": %.6f,\n", m0.exposure_time_s);
     std::printf("  \"fnumber\": %.2f,\n", m0.fnumber);
+    std::printf("  \"focal_length_mm\": %.4f,\n", m0.focal_length_mm);
+    std::printf("  \"focal_length_opt_mm\": %.4f,\n", m0.focal_length_opt_mm);
+    if (m0.focus_is_infinity) {
+        std::printf("  \"focus_distance_m\": 1000000.0000,\n");
+    } else if (m0.focus_distance_m > 0.0f) {
+        std::printf("  \"focus_distance_m\": %.4f,\n", m0.focus_distance_m);
+    } else {
+        std::printf("  \"focus_distance_m\": null,\n");
+    }
+    if (m0.focus_distance_low_m > 0.0f && m0.focus_distance_high_m > 0.0f) {
+        std::printf("  \"focus_distance_low_m\": %.4f,\n", m0.focus_distance_low_m);
+        std::printf("  \"focus_distance_high_m\": %.4f,\n", m0.focus_distance_high_m);
+    } else {
+        std::printf("  \"focus_distance_low_m\": null,\n");
+        std::printf("  \"focus_distance_high_m\": null,\n");
+    }
+    std::printf("  \"focus_is_infinity\": %s,\n", m0.focus_is_infinity ? "true" : "false");
+    std::printf("  \"focus_position\": %u,\n", m0.focus_position);
     std::printf("  \"black_level\": [%u, %u, %u, %u],\n", m0.black[0], m0.black[1], m0.black[2], m0.black[3]);
     std::printf("  \"wb_rggb\": [%.8f, %.8f, %.8f, %.8f],\n", m0.wb_rggb[0], m0.wb_rggb[1], m0.wb_rggb[2], m0.wb_rggb[3]);
     std::printf("  \"picture_control_base\": \"%s\",\n", json_escape(m0.picture_control_base).c_str());

@@ -87,6 +87,14 @@ struct NevFrameMeta {
     float fnumber = 0.0f;
     uint32_t iso = 0;
     float focal_length_mm = 0.0f;
+    float focal_length_opt_mm = 0.0f;
+    float focus_distance_m = 0.0f;
+    float focus_distance_low_m = 0.0f;
+    float focus_distance_high_m = 0.0f;
+    uint16_t focus_position = 0;
+    int32_t lens_position_abs = 0;
+    bool has_lens_position_abs = false;
+    bool focus_is_infinity = false;
     uint8_t cfa_pattern[4] = {0, 1, 1, 2};
 
     bool has_wb = false;
@@ -121,6 +129,10 @@ struct NevClipInfo {
     std::string lens_model;
     std::string picture_control_name;
     std::string picture_control_base;
+    std::string serial_number;
+    uint32_t shutter_count = 0;
+    bool has_shutter_count = false;
+    std::vector<uint8_t> nikon_lens_data;
     uint16_t nctg_active_w = 0;
     uint16_t nctg_active_h = 0;
     uint16_t nctg_kelvin = 0;
@@ -329,6 +341,9 @@ struct DngWriteOptions {
     std::string datetime;
     float exposure_time_s = 0.0f;
     float fnumber = 0.0f;
+    float focal_length_mm = 0.0f;
+    float focus_distance_m = 0.0f;
+    bool focus_is_infinity = false;
     double as_shot_neutral[3] = {1.0, 1.0, 1.0};
     double color_matrix1[9] = {
          1.1423, -0.4564, -0.1123,

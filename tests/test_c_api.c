@@ -211,6 +211,8 @@ int main(void) {
     C_CHECK(clip.codec_family == NIJIN_CODEC_ARW6);
     C_CHECK(clip.width == 16u && clip.height == 16u);
     C_CHECK(nijin_reader_get_frame_meta(reader, 0u, &fmeta) == NIJIN_OK);
+    C_CHECK(fmeta.focus_distance_m == 0.0f && fmeta.focus_is_infinity == 0u &&
+            fmeta.has_lens_position_abs == 0u);
     C_CHECK(nijin_reader_read_frame_packet(reader, 0u, NULL, 0u, &pkt_sz, NULL) == NIJIN_OK);
     C_CHECK(pkt_sz == cs_len);
     C_CHECK(nijin_reader_read_frame_packet(reader, 0u, pkt_buf, 4u, &pkt_sz, NULL) == NIJIN_ERR_BUFFER_TOO_SMALL);
@@ -282,6 +284,9 @@ int main(void) {
 
     nijin_dng_options_init(&dng_opts);
     C_CHECK(nijin_dng_options_from_clip(reader, 0u, &dinfo, 0, 1u, &dng_opts) == NIJIN_OK);
+    dng_opts.focal_length_mm = 35.0f;
+    dng_opts.focus_distance_m = 2.5f;
+    dng_opts.focus_is_infinity = 0u;
     C_CHECK(nijin_build_dng_header(&dng_opts, NULL, 0u, &hdr_sz) == NIJIN_OK);
     C_CHECK(hdr_sz > 100u && hdr_sz <= sizeof(hdr));
     C_CHECK(nijin_build_dng_header(&dng_opts, hdr, 16u, &hdr_sz) == NIJIN_ERR_BUFFER_TOO_SMALL);

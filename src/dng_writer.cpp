@@ -2,6 +2,7 @@
 #include "../include/nijinWVDC.h"
 #include "tiff_internal.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -184,6 +185,9 @@ void populate_dng_options_common(
     opts.datetime = clip.datetime;
     opts.exposure_time_s = meta.exposure_time_s;
     opts.fnumber = meta.fnumber;
+    opts.focal_length_mm = meta.focal_length_mm;
+    opts.focus_distance_m = meta.focus_distance_m;
+    opts.focus_is_infinity = meta.focus_is_infinity;
 
     if (meta.has_wb && meta.wb_rggb[0] > 0.0 && meta.wb_rggb[3] > 0.0) {
         double g_avg = 0.5 * (meta.wb_rggb[1] + meta.wb_rggb[2]);
@@ -403,6 +407,27 @@ bool build_cfa_dng_header(
         put_le32(rat, num);
         put_le32(rat + 4, den);
         b.add(33437, T_RATIONAL, 1, rat);                  // FNumber
+    }
+    if (opts.focus_is_infinity || opts.focus_distance_m > 0.0f) {
+        uint8_t rat[8];
+        if (opts.focus_is_infinity || opts.focus_distance_m >= 999999.0f) {
+            put_le32(rat, 0xFFFFFFFFu);
+            put_le32(rat + 4, 1u);
+        } else {
+            const double num_d = std::llround(static_cast<double>(opts.focus_distance_m) * 1000.0);
+            const uint32_t num = static_cast<uint32_t>(std::max(1.0, num_d));
+            put_le32(rat, num);
+            put_le32(rat + 4, 1000u);
+        }
+        b.add(37382, T_RATIONAL, 1, rat);                  // SubjectDistance
+    }
+    if (opts.focal_length_mm > 0.0f) {
+        uint8_t rat[8];
+        const double num_d = std::llround(static_cast<double>(opts.focal_length_mm) * 10.0);
+        const uint32_t num = static_cast<uint32_t>(std::max(1.0, num_d));
+        put_le32(rat, num);
+        put_le32(rat + 4, 10u);
+        b.add(37386, T_RATIONAL, 1, rat);                  // FocalLength
     }
     {
         const uint8_t ver[4] = {1, 4, 0, 0};

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "../include/nijinWVDC.h"
+#include "focus_meta_internal.h"
 #include "tiff_internal.h"
 
 #include <algorithm>
@@ -127,11 +128,18 @@ bool parse_nctg_buffer(const uint8_t* data, size_t len, NevClipInfo& clip) {
             clip.nctg_active_h = rd_be16(val);
         } else if (tag == 0x00001017 && dtype == 3 && count >= 1) {
             clip.nctg_kelvin = rd_be16(val);
+        } else if (tag == 0x0110a431 && dtype == 2) {
+            clip.serial_number = rstrip_ascii(val, blen);
         } else if (tag == 0x0110a434 && dtype == 2) {
             clip.lens_model = rstrip_ascii(val, blen);
         } else if (tag == 0x02000023 && dtype == 7 && blen >= 48) {
             clip.picture_control_name = rstrip_ascii(val + 8, 20);
             clip.picture_control_base = rstrip_ascii(val + 28, 20);
+        } else if (tag == 0x02000098 && dtype == 7 && blen >= 8) {
+            clip.nikon_lens_data.assign(val, val + blen);
+        } else if (tag == 0x020000a7 && dtype == 4 && blen >= 4) {
+            clip.shutter_count = rd_be32(val);
+            clip.has_shutter_count = true;
         }
         pos += 8 + blen;
     }
@@ -731,6 +739,9 @@ bool parse_tiff_raw_clip(
     if (exif_ifd_off > 0) {
         std::vector<TiffTagValue> exif;
         if (read_tiff_ifd(r, 0, be, exif_ifd_off, exif)) {
+            double exif_subj_dist_m = 0.0;
+            bool exif_subj_inf = false;
+            double mn_manual_dist_m = 0.0;
             for (const auto& tv : exif) {
                 double rval = 0.0;
                 if (tv.tag == 33434 && tag_as_rational(tv, be, rval)) {
@@ -739,8 +750,17 @@ bool parse_tiff_raw_clip(
                     meta.fnumber = static_cast<float>(rval);
                 } else if ((tv.tag == 34855 || tv.tag == 34866) && meta.iso == 0) {
                     meta.iso = tag_as_u32(tv, be);
+                } else if (tv.tag == 37382 && tv.dtype == 5 && tv.data.size() >= 8) {
+                    uint32_t num = rd_u32_e(tv.data.data(), be);
+                    uint32_t den = rd_u32_e(tv.data.data() + 4, be);
+                    if (den > 0u && num > 0u) {
+                        if (num == 0xFFFFFFFFu) exif_subj_inf = true;
+                        else exif_subj_dist_m = static_cast<double>(num) / static_cast<double>(den);
+                    }
                 } else if (tv.tag == 37386 && tag_as_rational(tv, be, rval)) {
                     meta.focal_length_mm = static_cast<float>(rval);
+                } else if (tv.tag == 42033 && tv.dtype == 2 && !tv.data.empty() && clip.serial_number.empty()) {
+                    clip.serial_number = rstrip_ascii(tv.data.data(), tv.data.size());
                 } else if (tv.tag == 42036 && tv.dtype == 2 && !tv.data.empty()) {
                     clip.lens_model = rstrip_ascii(tv.data.data(), tv.data.size());
                 } else if (tv.tag == 37500 && tv.file_offset > 0 && tv.data.size() >= 18 &&
@@ -756,10 +776,41 @@ bool parse_tiff_raw_clip(
                                 for (const auto& mt : mn_tags) {
                                     apply_makernote_tag(
                                         mt.tag, mt.dtype, mt.count, mt.data.data(), mt.data.size(), mn_be, meta);
+                                    double mr = 0.0;
+                                    if (mt.tag == 0x001D && mt.dtype == 2 && !mt.data.empty()) {
+                                        std::string s = rstrip_ascii(mt.data.data(), mt.data.size());
+                                        if (!s.empty()) clip.serial_number = s;
+                                    } else if (mt.tag == 0x0085 && tag_as_rational(mt, mn_be, mr) && mr > 0.0) {
+                                        mn_manual_dist_m = mr;
+                                    } else if (mt.tag == 0x0098 && !mt.data.empty()) {
+                                        clip.nikon_lens_data = mt.data;
+                                    } else if (mt.tag == 0x00A7 && (mt.dtype == 3 || mt.dtype == 4) && !mt.data.empty()) {
+                                        clip.shutter_count = tag_as_u32(mt, mn_be);
+                                        clip.has_shutter_count = true;
+                                    }
                                 }
                             }
                         }
                     }
+                }
+            }
+            if (!clip.nikon_lens_data.empty()) {
+                detail::decode_nikon_lens_data(
+                    clip.nikon_lens_data.data(),
+                    clip.nikon_lens_data.size(),
+                    clip.serial_number,
+                    clip.shutter_count,
+                    clip.has_shutter_count,
+                    clip.model,
+                    meta);
+            }
+            if (!meta.focus_is_infinity && meta.focus_distance_m <= 0.0f) {
+                if (mn_manual_dist_m > 0.0) {
+                    detail::set_focus_distance_with_rel_sigma(meta, mn_manual_dist_m, 0.25);
+                } else if (exif_subj_inf) {
+                    detail::set_focus_infinity(meta);
+                } else if (exif_subj_dist_m > 0.0) {
+                    detail::set_focus_distance_with_rel_sigma(meta, exif_subj_dist_m, 0.25);
                 }
             }
         }
@@ -824,7 +875,10 @@ void parse_nrfh(const uint8_t* buf, size_t len, NevFrameMeta& meta) {
                 else if (tag == 0x829d && vlen == 4) meta.fnumber = rd_be_f32(v);
                 else if (tag == 0x8832 && vlen == 4) meta.iso = rd_be32(v);
                 else if (tag == 0x920a && vlen == 4) meta.focal_length_mm = rd_be_f32(v);
-                else if (tag == 0xa302 && vlen == 8) {
+                else if (tag == 0x9206 && vlen == 4) {
+                    float fd = rd_be_f32(v);
+                    if (fd > 0.0f && fd < 10000.0f) detail::set_focus_distance_with_rel_sigma(meta, fd, 0.20);
+                } else if (tag == 0xa302 && vlen == 8) {
                     std::memcpy(meta.cfa_pattern, v + 4, 4);
                 }
             } else if (grp == 0x0200 && tag == 0x0001) {
@@ -1144,6 +1198,17 @@ bool read_nev_frame_meta_and_codestream_reader(
 
     meta.codestream_offset = loc.file_offset + jxs_rel_off;
     meta.codestream_size = jxs_len;
+
+    if (!clip.nikon_lens_data.empty() && !meta.focus_is_infinity && meta.focus_distance_m <= 0.0f) {
+        detail::decode_nikon_lens_data(
+            clip.nikon_lens_data.data(),
+            clip.nikon_lens_data.size(),
+            clip.serial_number,
+            clip.shutter_count,
+            clip.has_shutter_count,
+            clip.model,
+            meta);
+    }
 
     if (codestream_out) {
         codestream_out->resize(jxs_len);
