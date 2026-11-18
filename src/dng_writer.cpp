@@ -424,8 +424,8 @@ bool build_cfa_dng_header(
             put_le32(rat, 0xFFFFFFFFu);
             put_le32(rat + 4, 1u);
         } else {
-            const double num_d = std::llround(static_cast<double>(opts.focus_distance_m) * 1000.0);
-            const uint32_t num = static_cast<uint32_t>(std::max(1.0, num_d));
+            const long long num_ll = std::llround(static_cast<double>(opts.focus_distance_m) * 1000.0);
+            const uint32_t num = static_cast<uint32_t>(std::max<long long>(1LL, num_ll));
             put_le32(rat, num);
             put_le32(rat + 4, 1000u);
         }
@@ -433,8 +433,8 @@ bool build_cfa_dng_header(
     }
     if (opts.focal_length_mm > 0.0f) {
         uint8_t rat[8];
-        const double num_d = std::llround(static_cast<double>(opts.focal_length_mm) * 10.0);
-        const uint32_t num = static_cast<uint32_t>(std::max(1.0, num_d));
+        const long long num_ll = std::llround(static_cast<double>(opts.focal_length_mm) * 10.0);
+        const uint32_t num = static_cast<uint32_t>(std::max<long long>(1LL, num_ll));
         put_le32(rat, num);
         put_le32(rat + 4, 10u);
         b.add(37386, T_RATIONAL, 1, rat);                  // FocalLength

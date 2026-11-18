@@ -2647,7 +2647,15 @@ bool probe_arw6_strip(
     }
 
     const size_t n_tiles = static_cast<size_t>(tile_cnt);
-    std::sort(sorted_offs, sorted_offs + n_tiles);
+    for (size_t i = 1; i < n_tiles; ++i) {
+        const uint64_t v = sorted_offs[i];
+        size_t j = i;
+        while (j > 0 && sorted_offs[j - 1] > v) {
+            sorted_offs[j] = sorted_offs[j - 1];
+            --j;
+        }
+        sorted_offs[j] = v;
+    }
     for (size_t i = 1; i < n_tiles; ++i) {
         if (sorted_offs[i] <= sorted_offs[i - 1]) [[unlikely]] {
             err = "Duplicate ARW6 tile offsets";

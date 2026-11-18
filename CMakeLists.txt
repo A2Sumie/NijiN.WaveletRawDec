@@ -31,7 +31,7 @@ set(NIJINWVDC_LIB_SOURCES
 
 function(nijinwvdc_apply_target_options tgt)
     if(MSVC)
-        target_compile_options(${tgt} PRIVATE /W4 /WX /EHsc /MP /Zc:__cplusplus)
+        target_compile_options(${tgt} PRIVATE /W4 /WX /wd4324 /EHsc /MP /Zc:__cplusplus)
         target_compile_definitions(${tgt} PRIVATE
             _CRT_SECURE_NO_WARNINGS
             NOMINMAX

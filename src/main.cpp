@@ -251,7 +251,7 @@ bool read_file_bytes(const std::string& path, std::vector<uint8_t>& out, std::st
 }
 
 void print_info_common_header(const nijinwvdc::NevClipInfo& clip, const nijinwvdc::NevFrameMeta& m0) {
-    std::printf("File:          %s (%.2f MB)\n", clip.file_path.c_str(), clip.file_size / (1024.0 * 1024.0));
+    std::printf("File:          %s (%.2f MB)\n", clip.file_path.c_str(), static_cast<double>(clip.file_size) / (1024.0 * 1024.0));
     std::printf("Brand:         %s\n", clip.major_brand.c_str());
     std::printf("Camera:        %s / %s\n", clip.make.c_str(), clip.model.c_str());
     std::printf("Firmware:      %s\n", clip.firmware_version.c_str());
