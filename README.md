@@ -50,6 +50,9 @@ Designed with clean separation between container demuxing, parallel entropy/wave
   - Outputs linear sensor RGGB code values (e.g., Nikon `BlackLevel = 1008`, Sony `BlackLevel = 512`, `WhiteLevel = 16383`) cleanly separated from `.NEV` N-Log preview metadata (`NCTG 0x02000023 = N-LOG`, nominal `0x0025 = 12`).
   - `--active-crop` trims sensor margins to camera `CropArea` / `DefaultCrop` and recomputes the `2x2 CFAPattern` modulo phase (`(x0 & 1, y0 & 1)`).
   - Emits scalar `BlackLevel (50714) RATIONAL[1]` (omitting `BlackLevelRepeatDim`) when all four CFA channels share the same pedestal, ensuring consistent black-level parsing across `LibRaw`, `dcraw_emu`, `macOS sips`, and standard DNG 1.4 tools. Built-in D65 `ColorMatrix1` profiles cover Nikon (`Z 8`, `Z 9`, `Z6 III`, `ZR`, `Z f`, `Z50 II`, `Z5 II`) and Sony Alpha (`ILCE-7M5`, `ILCE-7RM6`, `ILCE-7RM5`, `ILCE-7M4`, `ILCE-7CR`, `ILCE-7CM2`, `ILCE-1M2`, `ILCE-1`, `ILCE-9M3`, `ZV-E1`, `ILME-FX3`).
+- **First-Principles Wavelet Quantization Telemetry & Optical Focus Metadata (`--quant`, [`src/quant_model_internal.h`](src/quant_model_internal.h), [`src/focus_meta_internal.h`](src/focus_meta_internal.h))**:
+  - Computes deterministic per-row code-domain luma/chroma quantization RMS (`q_luma_code_row`, `q_chroma_code_row`), 6-scale PSD (`luma_scale_psd` / `chroma_scale_psd`), 16-bin 4x4 Walsh-Hadamard spatial spectrum (`walsh16_luma_norm` / `walsh16_chroma_norm`), and 256-entry inverse-NLT derivative LUT (`nlt_slope_lut`) from exact 5/3 IDWT impulse synthesis gains (`WaveletQuantProfile`).
+  - Deterministically parses Sony (`0x9402` `(c ^ 55) % 249` with optical focal length at `+0x28`, `0x9404`/`0x9403`, `0x0020`/`0x09BB`) and Nikon (`LensData` `0100..0802` `kXlat0`/`kXlat1` stream decryption, Z-mount `0x35 == 1`, `0x0085` `ManualFocusDistance`) focus distance, diopter uncertainty bounds (`focus_distance_low_m` / `focus_distance_high_m`), and infinity state, emitting DNG `SubjectDistance (37382)` and `FocalLength (37386)`.
 
 ---
 
@@ -140,11 +143,11 @@ cmake --install cmake-build --prefix /usr/local
 ### CLI Quick Start
 
 ```sh
-# 1. Inspect .NEV / .NEF / .ARW / .jxs headers, timecode, audio, and codestream parameters
+# 1. Inspect .NEV / .NEF / .ARW / .jxs headers, focus telemetry, quantization profile, tracks, and codestream parameters
 ./build/nijinWVDC --version
 ./build/nijinWVDC --info clip.NEV
 ./build/nijinWVDC --info --json photo.NEF
-./build/nijinWVDC --info --json photo.ARW
+./build/nijinWVDC --info --quant --json photo.ARW
 
 # 2. Extract embedded LPCM audio from a .NEV clip as RIFF WAV
 ./build/nijinWVDC --extract-audio clip.NEV -o audio.wav
@@ -180,6 +183,7 @@ See [**`docs/CLI.md`**](docs/CLI.md) for all flags, JSON schema, C++17 `MediaRea
 | [`include/nijinWVDC_export.h`](include/nijinWVDC_export.h) | Portable symbol visibility (`dllexport`/`dllimport`/hidden), version macros, and SIMD flags |
 | [`src/simd_platform.h`](src/simd_platform.h) · [`src/worker_pool.h`](src/worker_pool.h) | Portable intrinsics, x86-64 `CPUID`/`XGETBV` runtime AVX2 detection, and work-stealing thread pool |
 | [`src/codec_internal.h`](src/codec_internal.h) · [`src/tiff_internal.h`](src/tiff_internal.h) | Internal persistent-arena strided decoder interfaces and thread-safe 64-bit `RandomAccessReader` |
+| [`src/quant_model_internal.h`](src/quant_model_internal.h) · [`src/focus_meta_internal.h`](src/focus_meta_internal.h) | First-principles 5/3 IDWT + 4x4 Walsh quantization telemetry (`WaveletQuantProfile`) and Sony/Nikon MakerNote focus/DoF parsers |
 | [`src/nev_container.cpp`](src/nev_container.cpp) | `.NEV` ISOBMFF/`NCTG`/`lpcm`/`tmcd`/`stts`/`NRFH` parser, `.NEF` TIFF/MakerNote, bare codestreams |
 | [`src/arw_container.cpp`](src/arw_container.cpp) | Sony `.ARW` (`ARW6` `Compressed HQ` / `Compressed`) TIFF `SubIFDs`, calibration tags, and JPEG preview parser |
 | [`src/ticoraw_dec.cpp`](src/ticoraw_dec.cpp) | SIMD-accelerated TicoRAW R0 parallel entropy decoder, L1-fused 5/3 IDWT, Star-Tetrix RCT, and Fliproot NLT |

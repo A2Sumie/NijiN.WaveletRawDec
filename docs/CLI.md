@@ -4,7 +4,7 @@
 
 ```sh
 nijinWVDC --version
-nijinWVDC --info [--json] <in.NEV | in.NEF | in.ARW | in.jxs>
+nijinWVDC --info [--quant] [--json] <in.NEV | in.NEF | in.ARW | in.jxs>
 nijinWVDC <in.NEV | in.NEF | in.ARW> [--frame <N|start-end|all>] -o <out.dng|out.raw|dir/> [options]
 nijinWVDC --raw-jxs <in.jxs> -o <out.raw|out.dng> [options]
 nijinWVDC --extract-jxs <in.NEV | in.NEF> [--frame <N>] -o <out.jxs>
@@ -24,6 +24,7 @@ nijinWVDC --bench <in.NEV | in.ARW> [--frames N] [--threads N]
 | `--format` | `dng \| raw` | Overrides extension inference when writing into a directory (`.raw` is 16-bit LE RGGB row-major) |
 | `--active-crop` | — | Crops decoded buffer to camera active crop (`CropArea` / `DefaultCrop`) and adjusts `2x2 CFAPattern` parity |
 | `--orientation` | `<1..8>` | Overrides TIFF Orientation tag in output DNG |
+| `--quant` | — | Include wavelet quantization profile in `--info` output (decodes frame 0) |
 | `--threads` | `<N>` | Worker thread count for slice/chunk entropy decode and 2D IDWT (`0` or omitted uses hardware concurrency) |
 | `--info` | — | Inspect container, camera metadata, tracks (including start SMPTE `timecode`), and codestream header without decoding pixels |
 | `--json` | — | Emits machine-readable JSON when combined with `--info` |
@@ -64,6 +65,13 @@ Example output on a Nikon Z 8 `.NEV` file (`Ver.03.12`):
   "iso": 4000,
   "exposure_time_s": 0.008000,
   "fnumber": 4.00,
+  "focal_length_mm": 120.0000,
+  "focal_length_opt_mm": 0.0000,
+  "focus_distance_m": 1.1619,
+  "focus_distance_low_m": 1.0758,
+  "focus_distance_high_m": 1.2629,
+  "focus_is_infinity": false,
+  "focus_position": 20977,
   "black_level": [1008, 1008, 1008, 1008],
   "wb_rggb": [1.91015625, 1.00000000, 1.00000000, 1.51171875],
   "picture_control_base": "N-LOG",
@@ -83,7 +91,7 @@ Example output on a Nikon Z 8 `.NEV` file (`Ver.03.12`):
 }
 ```
 
-For a Sony ARW6 (`.ARW`) still (`Compressed HQ` / `Compressed`, `Compression=32766`, `SonyRawFileType=6`), `--info --json` reports the `arw6` codec block alongside TIFF/Exif calibration fields:
+For a Sony ARW6 (`.ARW`) still (`Compressed HQ` / `Compressed`, `Compression=32766`, `SonyRawFileType=6`), `--info --quant --json` reports the `arw6` codec block alongside TIFF/Exif focus calibration fields and the optional `quant_profile` block:
 
 ```json
 {
@@ -95,6 +103,13 @@ For a Sony ARW6 (`.ARW`) still (`Compressed HQ` / `Compressed`, `Compression=327
   "codestream_width": 7040,
   "codestream_height": 4688,
   "active_crop": [12, 8, 7008, 4672],
+  "focal_length_mm": 24.0000,
+  "focal_length_opt_mm": 24.7000,
+  "focus_distance_m": 13.8157,
+  "focus_distance_low_m": 12.3354,
+  "focus_distance_high_m": 15.7000,
+  "focus_is_infinity": false,
+  "focus_position": 170,
   "black_level": [512, 512, 512, 512],
   "arw6": {
     "strip_bytes": 14540288,
@@ -104,6 +119,25 @@ For a Sony ARW6 (`.ARW`) still (`Compressed HQ` / `Compressed`, `Compression=327
     "decomp_levels": 3,
     "subsampling_mask": "0x0200",
     "sony_raw_file_type": 6
+  },
+  "quant_profile": {
+    "codec": "arw6",
+    "nlt_enabled": true,
+    "row_step": 8,
+    "num_rows": 586,
+    "black_ref": 512.00,
+    "white_ref": 16383.00,
+    "mean_luma_code_std": 0.00012345,
+    "mean_chroma_code_std": 0.00023456,
+    "max_luma_code_std": 0.00034567,
+    "max_chroma_code_std": 0.00045678,
+    "nlt_slope_shadow": 0.350000,
+    "nlt_slope_mid": 1.000000,
+    "nlt_slope_high": 2.400000,
+    "luma_scale_psd": [0.10, 0.15, 0.20, 0.25, 0.20, 0.10],
+    "chroma_scale_psd": [0.10, 0.15, 0.20, 0.25, 0.20, 0.10],
+    "walsh16_luma_norm": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+    "walsh16_chroma_norm": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
   }
 }
 ```
@@ -188,7 +222,7 @@ bool process_clip(const std::string& path, const std::string& out_wav, std::stri
 }
 ```
 
-> **Note**: Custom I/O sources (`.NEV`, `.NEF`, `.ARW`, bare `.jxs`/`"A000"`) can open via `reader.open_memory(...)` or `reader.open_callbacks(...)`, and callers can supply strided destination buffers via `session.decode_frame_into(...)` or split 2x2 Bayer planes via `split_bayer_cfa_planes(...)`. All legacy free functions (`parse_nev_clip`, `read_nev_frame_meta_and_codestream`, `decode_ticoraw_bayer`, `decode_arw6_bayer`, `apply_bayer_crop`, `write_cfa_dng`) remain preserved in [`include/nijinWVDC.h`](../include/nijinWVDC.h).
+> **Note**: Custom I/O sources (`.NEV`, `.NEF`, `.ARW`, bare `.jxs`/`"A000"`) can open via `reader.open_memory(...)` or `reader.open_callbacks(...)`, and callers can supply strided destination buffers via `session.decode_frame_into(...)` or split 2x2 Bayer planes via `split_bayer_cfa_planes(...)`. Setting `opts.want_quant_profile = true` populates `info.quant_profile` (`WaveletQuantProfile`), which can be rescaled or vertically cropped via `recalibrate_quant_profile_range(...)` and `crop_quant_profile_vertical(...)`; `info.meta` also exposes `focal_length_opt_mm`, `focus_distance_m`, `focus_distance_low_m`, `focus_distance_high_m`, `focus_position`, `lens_position_abs`, and `focus_is_infinity`. All legacy free functions (`parse_nev_clip`, `read_nev_frame_meta_and_codestream`, `decode_ticoraw_bayer`, `decode_arw6_bayer`, `apply_bayer_crop`, `write_cfa_dng`) remain preserved in [`include/nijinWVDC.h`](../include/nijinWVDC.h).
 
 ### 4.2 Pure C99 FFI Example (`include/nijinWVDC_c.h`)
 
@@ -226,3 +260,5 @@ done:
     return st;
 }
 ```
+
+When `dopts.want_quant_profile = 1` is set in C99, inspect the resulting telemetry with `nijin_wavelet_quant_summary_init`, `nijin_decoder_get_last_quant_profile`, and `nijin_decoder_recalibrate_last_quant_range` ([`include/nijinWVDC_c.h`](../include/nijinWVDC_c.h)), while focus distance fields (`focal_length_opt_mm`, `focus_distance_m`, `focus_distance_low_m`, `focus_distance_high_m`, `focus_position`, `focus_is_infinity`, `lens_position_abs`) are populated directly inside `nijin_frame_meta_t`.
