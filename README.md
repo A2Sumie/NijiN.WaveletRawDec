@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/lockup/nijin-lockup-transparent.svg" alt="NijiN" width="420">
+</p>
+
 # NijiN.WaveletRawDec
 
 **Clean-Room Multi-Threaded C++20 & C99 Decoder for Wavelet-Compressed Camera & Cinema RAW Formats**  
@@ -200,3 +204,11 @@ See [**`docs/CLI.md`**](docs/CLI.md) for all flags, JSON schema, C++20 `MediaRea
 ## License & Provenance
 
 All original source code is licensed under the [**Apache License, Version 2.0 (`Apache-2.0`)**](LICENSE). See [**`NOTICE`**](NOTICE) for copyright, interoperability, and patent scope notices.
+
+## Author & Support / 作者与支持
+
+- **Author**: A2Sumie · X [`@kA2Sumie`](https://x.com/kA2Sumie)
+- **Support this project**: Please follow [`@sally_amaki`](https://x.com/sally_amaki) · [`@sallyamakiofficial`](https://www.youtube.com/@sallyamakiofficial) · [`@227SMEJ`](https://x.com/227SMEJ) and [★ Star on GitHub](https://github.com/A2Sumie/NijiN.WaveletRawDec) — *Your goodwill is the greatest support.*
+
+- **作者**：A2Sumie · B站 [`@共星`](https://space.bilibili.com/3546931909364051) · [`@格子A2Si_苏和郡`](https://space.bilibili.com/2127237409) · 推特 [`@kA2Sumie`](https://x.com/kA2Sumie) · 小红书 kA2Sumie
+- **支持本项目**：可以关注 [`@227_Official`](https://space.bilibili.com/3546378326248411) 并 [Star 本项目](https://github.com/A2Sumie/NijiN.WaveletRawDec) —— *您的一点心意就是最好的支持。*

@@ -61,6 +61,7 @@ struct NevTrackSummary {
     uint32_t sample_count = 0;
     uint32_t width = 0;
     uint32_t height = 0;
+    uint16_t tkhd_orientation = 1;
     // Audio (QuickTime Sound v0/v1/v2 / LPCM)
     double audio_sample_rate = 0.0;
     uint32_t audio_channels = 0;

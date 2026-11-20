@@ -304,10 +304,26 @@ bool parse_container_recurse(
             size_t to_read = static_cast<size_t>(std::min<uint64_t>(sizeof(buf), pay_end - pay_off));
             if (r.read(pay_off, buf, to_read) && to_read >= 24) {
                 uint8_t ver = buf[0];
+                size_t mat_off = 0;
                 if (ver == 0 && to_read >= 84) {
                     tr.summary.track_id = rd_be32(buf + 12);
+                    mat_off = 40;
                 } else if (ver == 1 && to_read >= 96) {
                     tr.summary.track_id = rd_be32(buf + 20);
+                    mat_off = 52;
+                }
+                if (mat_off > 0 && mat_off + 36 <= to_read) {
+                    auto rd_i32 = [](const uint8_t* p) -> int32_t {
+                        return static_cast<int32_t>(rd_be32(p));
+                    };
+                    const int32_t m0 = rd_i32(buf + mat_off + 0);
+                    const int32_t m1 = rd_i32(buf + mat_off + 4);
+                    const int32_t m3 = rd_i32(buf + mat_off + 12);
+                    const int32_t m4 = rd_i32(buf + mat_off + 16);
+                    if (m0 == 0 && m4 == 0 && m1 > 0 && m3 < 0) tr.summary.tkhd_orientation = 6;
+                    else if (m0 == 0 && m4 == 0 && m1 < 0 && m3 > 0) tr.summary.tkhd_orientation = 8;
+                    else if (m0 < 0 && m4 < 0 && m1 == 0 && m3 == 0) tr.summary.tkhd_orientation = 3;
+                    else tr.summary.tkhd_orientation = 1;
                 }
             }
         } else if (std::strcmp(bh.type, "mdhd") == 0) {
@@ -1153,38 +1169,69 @@ bool read_nev_frame_meta_and_codestream_reader(
     meta.frame_index = frame_index;
     meta.sample_offset = loc.file_offset;
     meta.sample_size = loc.sample_size;
+    meta.orientation = 0;
     meta.picture_control_name = clip.picture_control_name;
     meta.picture_control_base = clip.picture_control_base;
+
+    auto parse_nrth_buf = [&](const uint8_t* p, size_t len, uint32_t& jlen_out) {
+        size_t p2 = 0;
+        while (p2 + 8 <= len) {
+            uint32_t s2 = rd_be32(p + p2);
+            if (s2 < 8 || p2 + s2 > len) break;
+            if (std::memcmp(p + p2 + 4, "NRTI", 4) == 0 && s2 >= 16) {
+                jlen_out = rd_be32(p + p2 + 12);
+            }
+            p2 += s2;
+        }
+    };
 
     uint32_t jxs_rel_off = 0;
     uint32_t jxs_len = 0;
     size_t pos = 8;
-    while (pos + 8 <= head_len) {
-        uint32_t sz = rd_be32(head_buf + pos);
-        const uint8_t* fcc = head_buf + pos + 4;
+    std::vector<uint8_t> dyn_box;
+    while (pos + 8 <= loc.sample_size) {
+        uint8_t hdr8[8];
+        if (pos + 8 <= head_len) {
+            std::memcpy(hdr8, head_buf + pos, 8);
+        } else if (!r.read(loc.file_offset + pos, hdr8, 8)) {
+            break;
+        }
+        uint32_t sz = rd_be32(hdr8);
+        const uint8_t* fcc = hdr8 + 4;
         if (sz >= 8 && pos + sz <= loc.sample_size &&
             (std::memcmp(fcc, "NRFM", 4) == 0 ||
              std::memcmp(fcc, "NRFH", 4) == 0 ||
              std::memcmp(fcc, "NRTH", 4) == 0)) {
-            if (std::memcmp(fcc, "NRFH", 4) == 0 && pos + sz <= head_len) {
-                parse_nrfh(head_buf + pos + 8, sz - 8, meta);
-            } else if (std::memcmp(fcc, "NRTH", 4) == 0 && pos + sz <= head_len) {
-                // NRTH wraps NRTI (16B) + NRTA
-                size_t p2 = pos + 8;
-                size_t e2 = pos + sz;
-                while (p2 + 8 <= e2) {
-                    uint32_t s2 = rd_be32(head_buf + p2);
-                    if (s2 < 8 || p2 + s2 > e2) break;
-                    if (std::memcmp(head_buf + p2 + 4, "NRTI", 4) == 0 && s2 >= 16) {
-                        jxs_len = rd_be32(head_buf + p2 + 12);
-                    }
-                    p2 += s2;
+            const uint8_t* pay_ptr = nullptr;
+            const size_t pay_len = sz - 8;
+            if (pos + sz <= head_len) {
+                pay_ptr = head_buf + pos + 8;
+            } else if (pay_len > 0 && pay_len <= (256u << 10)) {
+                dyn_box.resize(pay_len);
+                if (r.read(loc.file_offset + pos + 8, dyn_box.data(), pay_len)) {
+                    pay_ptr = dyn_box.data();
+                }
+            }
+            if (pay_ptr) {
+                if (std::memcmp(fcc, "NRFH", 4) == 0) {
+                    parse_nrfh(pay_ptr, pay_len, meta);
+                } else if (std::memcmp(fcc, "NRTH", 4) == 0) {
+                    parse_nrth_buf(pay_ptr, pay_len, jxs_len);
                 }
             }
             pos += sz;
         } else {
             break;
         }
+    }
+    if (meta.orientation == 0) {
+        uint16_t tk_ori = 1;
+        if (clip.video_track_index >= 0 &&
+            static_cast<size_t>(clip.video_track_index) < clip.tracks.size() &&
+            clip.tracks[clip.video_track_index].tkhd_orientation > 0) {
+            tk_ori = clip.tracks[clip.video_track_index].tkhd_orientation;
+        }
+        meta.orientation = tk_ori;
     }
 
     jxs_rel_off = static_cast<uint32_t>(pos);
